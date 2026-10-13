@@ -1,0 +1,68 @@
+# ══════════════════════════════════════════════════════════════════
+# 字迹开源仓库忽略表
+# 原则：代码进仓库；模型权重、训练数据、私钥、日志、运行时状态
+# 一律不进（模型经签名的 .zjpack 随安装包/Release 分发，不进 git）。
+# ══════════════════════════════════════════════════════════════════
+
+# 版本控制（本仓库用 git，SVN 工作副本元数据不进）
+.svn/
+
+# IDE 个人配置 / 内部进行中的开发计划
+.idea/
+NEXT_STEPS.md
+
+# Python 运行时
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Flutter / Dart 构建产物
+flutter_app/build/
+flutter_app/.dart_tool/
+flutter_app/windows/flutter/ephemeral/
+*.iml
+.flutter-plugins*
+.flutter-plugins-dependencies*
+
+# ── 模型与数据资产（不随仓库分发）────────────────────────────────
+# YOLO 权重（ultralytics 预训练模型训练时自动下载）
+*.pt
+# Kraken 识别模型（应用首次识别时自动下载）
+*.mlmodel
+# 发版模型包与注册表/激活副本
+*.zjpack
+python_service/models/
+python_service/kraken_models/
+# 训练数据集与逐项目墨迹模板（用户本地数据）
+python_service/datasets/
+python_service/verify_templates/
+# Kraken 微调积累的行级训练数据（用户本地数据）
+python_service/kraken_training/datasets/
+# 发版签名私钥（只留管理员机，绝不分发）
+python_service/release_keys/
+# 模型包物化缓存
+python_service/.model_cache/
+
+# ── 运行时状态 / 日志 / 崩溃转储 ─────────────────────────────────
+python_service/logs/
+crash_dumps/
+*.log
+*.log.old
+python_service/service_port.txt
+python_service/app_ui_settings.json
+# 朝代基准的运行记录（运行时生成）
+test_images/periods/runs/
+
+# ── 安装器产物与大型再分发件 ─────────────────────────────────────
+installer/output/
+installer/VC_redist.x64.exe
+# installer 里无引用的杂散截图
+installer/*.png
+
+# ── 开发残留 ─────────────────────────────────────────────────────
+flutter_app/_patch4.py
+diag_enable_crash_dumps.cmd
+*.zjpack.tmp
+Thumbs.db
+Desktop.ini
