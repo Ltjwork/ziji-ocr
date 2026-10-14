@@ -157,9 +157,11 @@ class DynastyBenchTest(unittest.TestCase):
                 next(c for c in on_disk["cases"] if c["id"] == "01_xianqin")["lines"],
                 detail,
             )
-            # 历史摘要不携带明细，保持轻量。
+            # 历史摘要不携带明细，保持轻量。按字段名（带引号）判定：
+            # 裸子串会被 backend_build 等无关文本（如 paddle-det-lines）
+            # 误伤。
             runs = dynasty_bench.list_runs(bench)
-            self.assertNotIn("lines", json.dumps(runs))
+            self.assertNotIn('"lines"', json.dumps(runs))
 
     def test_evaluate_pipeline_meta_passthrough(self):
         with TemporaryDirectory() as root:

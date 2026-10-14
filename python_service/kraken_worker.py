@@ -34,6 +34,164 @@ def _effective_rec_model() -> Path:
     override = os.environ.get("KRAKEN_REC_MODEL", "").strip()
     return Path(override) if override else REC_MODEL
 
+
+SEG_MODEL = MODEL_DIR / "chat_seg.mlmodel"
+
+
+def _effective_seg_model() -> Path:
+    """整页直读的分行模型（blla 类）：环境变量覆写 > 散文件。"""
+    override = os.environ.get("KRAKEN_SEG_MODEL", "").strip()
+    return Path(override) if override else SEG_MODEL
+
+
+# 分行模型懒加载缓存（首个 read_page 请求时加载并常驻，与识别模型同设备）。
+_SEG_MODEL_OBJ = None
+
+
+def _merge_line_rects_by_band(rects: list[dict], direction: str) -> list[dict]:
+    """把同行/同列的碎片段合并成整行/整列框（带状合并）。
+
+    blla 类分行模型在竖排小图上常把一列拆成单字级碎片（实测 284px 宽
+    的源图，chat_seg 与 kraken 默认 blla 都把 6 列正文拆成 28 个 15~42px
+    高的碎框，放大 2~4 倍也不恢复）——每片单独识别只有 1~2 字且无列语
+    境。按阅读轴的垂直轴中心贪心聚类（容差 = 该轴跨度中位数的一半，
+    与服务端 page_text 分列同款启发），每簇取联合框：得到整列（竖排）/
+    整行（横排）框，交给逐行识别路径读完整语境。"""
+    if len(rects) < 2:
+        return rects
+    vertical = direction.startswith("vertical")
+    axis_idx = 0 if vertical else 1
+    span_key = "w" if vertical else "h"
+
+    def center(r: dict) -> float:
+        return r["x"] + r["w"] / 2.0 if vertical else r["y"] + r["h"] / 2.0
+
+    tol = sorted(r[span_key] for r in rects)[len(rects) // 2] * 0.5
+    ordered = sorted(rects, key=center)
+    # 逐簇独立的运行均值（簇均值）：比较基准只能是当前簇的均值，用全局
+    # 累计均值会在第二簇起把比较点拖离当前簇、永远不并（实测 27 片只
+    # 并成 25 的根源）。
+    groups: list[list[dict]] = []
+    sums: list[float] = []
+    counts: list[int] = []
+    for r in ordered:
+        c = center(r)
+        if groups and abs(c - sums[-1] / counts[-1]) <= tol:
+            groups[-1].append(r)
+            sums[-1] += c
+            counts[-1] += 1
+        else:
+            groups.append([r])
+            sums.append(c)
+            counts.append(1)
+    merged: list[dict] = []
+    for group in groups:
+        x0 = min(r["x"] for r in group)
+        y0 = min(r["y"] for r in group)
+        x1 = max(r["x"] + r["w"] for r in group)
+        y1 = max(r["y"] + r["h"] for r in group)
+        merged.append({"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0})
+    return merged
+
+
+def _op_read_line(rec, payload: dict) -> dict:
+    """整行全文直读（全文对照用）：单行框直接走与标注识别完全相同的
+    逐行预处理+识别（_per_line_pipeline 单矩形），不经字框切分——行内
+    标点等没有字框的字符在这里也会被读出。返回 {text, conf}。"""
+    from PIL import Image
+
+    rect = payload["rect"]
+    direction = str(payload.get("text_direction", "vertical-rl"))
+    im = Image.open(payload["image_path"]).convert("L")
+    out = _per_line_pipeline(rec, im, [rect], direction, 2.0)
+    line = out[0] if out else {}
+    text = str(line.get("text") or "")
+    conf = float(line.get("conf") or 0.0)
+    tlog(f"line full read: {len(text)} chars conf={conf:.2f}")
+    return {"text": text, "conf": round(conf, 4)}
+
+
+def _op_read_page(rec, payload: dict) -> dict:
+    """整页直读：blla 分行出"行框"，识别走与标注管线完全相同的逐行
+    预处理路径（裁剪 + 窄轴 ≥100px 定倍 + 局部 nlbin + rpred + cuts
+    重建），不走主区/段落/单行/单字标注管线。
+
+    CHAT 模型对原始灰度/欠放大的整页直读会输出空文本（列宽不足 100px
+    且未二值化，见 _prepare_line 注释），因此不能把整页 seg 直接喂
+    rpred——blla 只负责检测（行框 = boundary 多边形外接矩形），每行
+    独立走 _per_line_pipeline。返回未排序行列表（阅读序由服务端
+    page_text 按方向参数重排；blla 自带行序对竖排不可靠）。"""
+    import warnings
+
+    from PIL import Image
+
+    from kraken import blla
+    from kraken.lib.vgsl import TorchVGSLModel
+
+    global _SEG_MODEL_OBJ
+    device = "cuda" if _DEVICE == "cuda" else "cpu"
+    if _SEG_MODEL_OBJ is None:
+        seg_path = _effective_seg_model()
+        tlog(f"load seg model: {seg_path}")
+        t0 = time.time()
+        # 分割模型必须用 TorchVGSLModel.load_model 加载：load_any 只适用于
+        # 识别模型（无条件包 TorchSeqRecognizer 并取 nn.codec——分割模型
+        # 没有该属性，kraken 7.1 实测 AttributeError 'TorchVGSLModel' object
+        # has no attribute 'codec'）。blla.segment 内部默认模型走的也是
+        # TorchVGSLModel.load_model（CPU 加载，device 由 segment 内部处理）。
+        _SEG_MODEL_OBJ = TorchVGSLModel.load_model(str(seg_path))
+        tlog(f"seg model loaded in {time.time() - t0:.1f}s")
+
+    image_path = payload["image_path"]
+    # 行方向与识别管线同源（竖排列旋转后进识别网络），由桥接层按书的
+    # 方向设置计算传入；blla 的行朝向兜底也依赖它。
+    direction = str(payload.get("text_direction", "vertical-rl"))
+    im = Image.open(image_path).convert("L")
+    tlog(f"page read (blla): {image_path}")
+    t0 = time.time()
+    with warnings.catch_warnings():
+        # blla.segment 弃用告警（kraken 8 起移除，本环境 7.1.1；替代 API 为
+        # kraken.tasks.segmentation.SegmentationTaskModel，升级 kraken 时换）。
+        warnings.simplefilter("ignore", DeprecationWarning)
+        seg = blla.segment(
+            im, text_direction=direction, model=_SEG_MODEL_OBJ, device=device
+        )
+    tlog(f"segment done: {len(seg.lines)} lines in {time.time() - t0:.1f}s")
+
+    # boundary 多边形外接矩形 → 行框；缺 boundary 用 baseline 外接并加
+    # 半个行高边距（baseline 只是中心线）。过小的框（<5px）是 blla 的
+    # 噪声检出，直接丢弃。
+    rects: list[dict] = []
+    for sline in seg.lines:
+        pts = [tuple(p) for p in (getattr(sline, "boundary", None) or [])]
+        if pts:
+            xs = [float(p[0]) for p in pts]
+            ys = [float(p[1]) for p in pts]
+        else:
+            bl = [tuple(p) for p in (getattr(sline, "baseline", None) or [])]
+            if not bl:
+                continue
+            xs = [float(p[0]) for p in bl]
+            ys = [float(p[1]) for p in bl]
+        x, y = min(xs), min(ys)
+        w, h = max(xs) - x, max(ys) - y
+        if not pts:
+            pad = max(4.0, h / 2.0)
+            x, y, w, h = x - pad, y - pad, w + pad * 2, h + pad * 2
+        if w < 5 or h < 5:
+            continue
+        rects.append(
+            {"x": int(x), "y": int(y), "w": int(w), "h": int(h)}
+        )
+    rects = _merge_line_rects_by_band(rects, direction)
+    tlog(f"{len(rects)} line rects to recognize (after band merge)")
+
+    # 逐行流水线：预处理（生产者线程）与推理重叠，参数与"本行单独
+    # 识别"完全同路径——空白行裁剪按空行返回（_prepare_line_safe）。
+    out_lines = _per_line_pipeline(rec, im, rects, direction, 2.0)
+    tlog(f"page read done: {len(out_lines)} lines in {time.time() - t0:.1f}s")
+    return {"lines": out_lines}
+
 _T0 = time.time()
 # 实例标签（KRAKEN_WORKER_ID，由 kraken_bridge 起 daemon 时注入）：多实例
 # 并行池下 stderr 日志可区分是哪个 daemon 打的。
@@ -557,7 +715,15 @@ def daemon_loop() -> int:
                 return 0
             else:
                 try:
-                    result = _recognize(rec, req.get("payload") or {})
+                    if op == "read_page":
+                        # 整页直读（blla 分行 + rpred）：不走标注切分管线。
+                        result = _op_read_page(rec, req.get("payload") or {})
+                    elif op == "read_line":
+                        # 整行全文直读（全文对照用）：单行框直接走逐行
+                        # 预处理+识别，不经字框切分。
+                        result = _op_read_line(rec, req.get("payload") or {})
+                    else:
+                        result = _recognize(rec, req.get("payload") or {})
                 finally:
                     # 成败都释放：失败请求的半途分配同样会占住峰值水位。
                     _release_vram_cache()

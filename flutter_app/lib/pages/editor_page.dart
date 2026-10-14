@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert' show jsonEncode;
 import 'dart:io';
 import 'dart:math';
 import 'dart:ui' as ui;
@@ -29,7 +30,9 @@ import '../services/page_state_markers.dart';
 import '../services/ollama_service.dart';
 import '../widgets/attached_scrollbar.dart';
 import '../widgets/backend_console_panel.dart';
+import '../widgets/char_rainbow.dart';
 import '../widgets/char_verify_common.dart';
+import '../widgets/direct_text_panel.dart';
 import '../widgets/engine_settings_section.dart';
 import '../widgets/excalidraw_export_dialog.dart';
 import 'ai_trace_panel.dart';
@@ -145,7 +148,7 @@ class _EditorPageState extends State<EditorPage> {
   String _reorderTarget = 'line'; // line | paragraph
   final Map<String, int> _pendingLineOrder = {};
   final Map<String, int> _pendingParagraphOrder = {};
-  String _viewMode = 'line'; // 'region' | 'paragraph' | 'line' | 'char'
+  String _viewMode = 'line'; // 'region' | 'paragraph' | 'line' | 'char' | 'text'（整页直读）
 
   /// 详细视图要滚动定位到的行 id（墨迹归类页「定位」设置）；
   /// 每次定位递增序号，保证定位到同一行的不同字时也会触发滚动。
@@ -568,7 +571,15 @@ class _EditorPageState extends State<EditorPage> {
         }
       });
       unawaited(_refreshBookProgress());
-    } catch (e) {
+    } catch (e, st) {
+      // 页面识别/载入异常把完整堆栈落进应用日志（后台控制台可见）：
+      // type cast 类错误只有一行 e.toString() 时无从定位（"type 'Null'
+      // is not a subtype of type 'String'" 反复出现而响应解析链逐段
+      // 实测均干净，需要堆栈锁定真正抛点）。
+      PythonService.addAppLog(
+        '[载入诊断] 页面识别/载入异常：$e\n$st',
+        isError: true,
+      );
       if (!mounted || loadGeneration != _loadGeneration) return;
       setState(() {
         _error = e is RecognitionBusyException
@@ -672,6 +683,7 @@ class _EditorPageState extends State<EditorPage> {
     final modelVersion = _annotation?.modelVersion ?? '';
     final (methodLabel, methodColor) = switch (modelVersion) {
       'hier' => ('投影划行·先划行后切字', Colors.teal.shade700),
+      'paddle-det' => ('PP-OCR 检测定行', Colors.blue.shade700),
       'yolo-char' => ('单字检测成行（旧）', Colors.teal.shade700),
       'opencv' => ('OpenCV投影兜底', Colors.orange.shade800),
       '' => ('未识别', Colors.grey),
@@ -1377,22 +1389,26 @@ class _EditorPageState extends State<EditorPage> {
   /// 标注不受影响（重识别才用新引擎读字）。
   Future<void> _showEngineSettingsDialog() async {
     final project = widget.project;
-    final choice = await showDialog<(String, String)>(
+    final choice = await showDialog<(String, String, ProjectSettings)>(
       context: context,
       builder: (ctx) => _EngineSettingsDialog(
         engine: project.settings.engine,
         paddleModel: project.settings.paddleModel,
+        vlSettings: project.settings,
       ),
     );
     if (!mounted || choice == null) return;
-    final (engine, paddleModel) = choice;
+    final (engine, paddleModel, vlSettings) = choice;
     if (engine == project.settings.engine &&
-        paddleModel == project.settings.paddleModel) {
+        paddleModel == project.settings.paddleModel &&
+        !_vlSettingsChanged(project.settings, vlSettings)) {
       return; // 未变化
     }
     final before = project.settings.engine == 'paddle' ? 'PaddleOCR' : 'Kraken';
-    project.settings =
-        project.settings.copyWith(engine: engine, paddleModel: paddleModel);
+    project.settings = vlSettings.copyWith(
+      engine: engine,
+      paddleModel: paddleModel,
+    );
     await ProjectStorage.save(project);
     final after = engine == 'paddle' ? 'PaddleOCR' : 'Kraken';
     PythonService.addAppLog(
@@ -2316,6 +2332,68 @@ class _EditorPageState extends State<EditorPage> {
       );
     } catch (_) {
       // 元素处于停用窗口（mounted 仍为 true 但不能查祖先）：放弃提示。
+    }
+  }
+
+  /// 整页直读完成且行记录落盘后，刷新标注行的整页对照标记
+  /// （/refresh_full_text_check，纯 CPU 不重识别）：紫色无框字片
+  /// （full_extras）与橙色不一致标记（full_diff）随最新直读行文本
+  /// 更新——对照标记只在识别时写入标注，直读更新后不刷新会让标记
+  /// 停在旧参照上（用户所见"看不到紫色字片"的时序坑）。增强路：
+  /// 无标注/无字行/请求失败全部静默跳过，不影响直读结果。
+  Future<void> _refreshFullTextMarks() async {
+    final ann = _annotation;
+    if (ann == null || ann.lines.isEmpty) return;
+    final withChars =
+        ann.lines.where((l) => l.chars.isNotEmpty).toList(growable: false);
+    if (withChars.isEmpty) return;
+    try {
+      final updates = await PythonService.refreshFullTextCheck(
+        imagePath: _imagePath,
+        lines: [
+          for (final l in withChars)
+            {
+              'id': l.id,
+              'x': l.x,
+              'y': l.y,
+              'w': l.w,
+              'h': l.h,
+              'char_texts': [for (final c in l.chars) c.text],
+            },
+        ],
+      );
+      if (!mounted || updates.isEmpty) return;
+      final byId = <String, Map<String, dynamic>>{
+        for (final u in updates) u['id'].toString(): u,
+      };
+      var changed = 0;
+      setState(() {
+        for (final line in withChars) {
+          final u = byId[line.id];
+          if (u == null) continue;
+          final text = (u['full_text'] as String?) ?? '';
+          line.fullText = text.isEmpty ? null : text;
+          line.fullExtras = [
+            for (final e in (u['full_extras'] as List? ?? const []))
+              e.toString(),
+          ];
+          final diffIdx = <int>{
+            for (final e in (u['diff_indices'] as List? ?? const []))
+              if (e is num) e.toInt(),
+          };
+          for (var i = 0; i < line.chars.length; i++) {
+            line.chars[i].fullDiff = diffIdx.contains(i);
+          }
+          changed++;
+        }
+      });
+      if (changed > 0) {
+        await _save();
+        _snack('整页对照已按最新直读刷新：$changed 行');
+      }
+    } catch (e) {
+      // 静默：对照是增强路，刷新失败不惊扰直读流程
+      debugPrint('刷新整页对照标记失败: $e');
     }
   }
 
@@ -4169,6 +4247,7 @@ class _EditorPageState extends State<EditorPage> {
                     columnGroup: 'dc_${line.id}',
                     parentLineId: line.id,
                     layoutConfidence: proposal.confidence,
+                    regionLabel: line.regionLabel,
                   );
                   chars.sort(
                     (a, b) => _charAxis(
@@ -5107,6 +5186,19 @@ class _EditorPageState extends State<EditorPage> {
                             '错误：$_error',
                             style: const TextStyle(color: Colors.red),
                           ),
+                        )
+                      : _viewMode == 'text'
+                      ? DirectTextPanel(
+                          // 翻页即换内容（key 变 → state 重建重载该页文本）
+                          key: ValueKey('direct-text-$_pageId'),
+                          project: widget.project,
+                          pageId: _pageId,
+                          imagePath: _imagePath,
+                          settings: _pageSettings,
+                          onSnackBar: _snack,
+                          // 直读落盘后刷新标注里的整页对照标记（见
+                          // _refreshFullTextMarks）。
+                          onReadComplete: _refreshFullTextMarks,
                         )
                       : _annotation == null
                       ? const SizedBox()
@@ -6417,6 +6509,8 @@ class _EditorToolbar extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 4),
+          // 视图切换：四个标注视图走分段按钮；「文本」视图单列整宽按钮
+          // （五个分段挤不进工具栏宽度——实测 RenderFlex 右溢 11px）。
           SegmentedButton<String>(
             segments: const [
               ButtonSegment(value: 'region', label: Text('主区')),
@@ -6424,8 +6518,28 @@ class _EditorToolbar extends StatelessWidget {
               ButtonSegment(value: 'line', label: Text('行')),
               ButtonSegment(value: 'char', label: Text('详细')),
             ],
-            selected: {viewMode},
-            onSelectionChanged: (s) => onViewModeChanged(s.first),
+            selected: viewMode == 'text' ? const <String>{} : {viewMode},
+            // 文本视图无对应分段：允许空选中（否则断言崩溃
+            // 'selected.length > 0 || emptySelectionAllowed'）
+            emptySelectionAllowed: true,
+            onSelectionChanged: (s) {
+              if (s.isNotEmpty) onViewModeChanged(s.first);
+            },
+          ),
+          const SizedBox(height: 6),
+          SizedBox(
+            width: double.infinity,
+            child: viewMode == 'text'
+                ? FilledButton.icon(
+                    onPressed: () => onViewModeChanged('line'),
+                    icon: const Icon(Icons.notes, size: 16),
+                    label: const Text('退出文本视图'),
+                  )
+                : OutlinedButton.icon(
+                    onPressed: () => onViewModeChanged('text'),
+                    icon: const Icon(Icons.notes, size: 16),
+                    label: const Text('整页文本（直读）'),
+                  ),
           ),
           const SizedBox(height: 12),
 
@@ -7549,22 +7663,8 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
 
 // ─── Painter：行视图 / 字视图 ──────────────────────────────────────────────────
 
-// ─── 行内单字彩虹色板 ──────────────────────────────────────────────────────────
-// 同一行内每个单字按行内序号（order）循环取色：字框填充/描边与对应文字
-// （chips、整行文字）使用同一颜色，方便对照"哪个框画得多大 ↔ 哪个文字"。
-
-const List<Color> kCharRainbow = [
-  Color(0xFFE53935), // red
-  Color(0xFFFB8C00), // orange
-  Color(0xFFF9A825), // yellow
-  Color(0xFF43A047), // green
-  Color(0xFF00897B), // teal
-  Color(0xFF039BE5), // light blue
-  Color(0xFF3949AB), // indigo
-  Color(0xFF8E24AA), // purple
-];
-
-Color charRainbowColor(int index) => kCharRainbow[index % kCharRainbow.length];
+// 行内单字彩虹色板（kCharRainbow/charRainbowColor）已抽出至
+// widgets/char_rainbow.dart 共享（直读对照字片复用同一套颜色语义）。
 
 /// [line] 是否与 [lines] 中其它行共享列带（竖排=横向范围重叠、横排=
 /// 纵向范围重叠，重叠超过两者中较窄者的 50%）。小字注释列被拆成多段
@@ -7840,9 +7940,16 @@ class _BlockPainter extends CustomPainter {
       final pendingOrder = pendingLineOrder[line.id];
       final hasPendingOrder = pendingOrder != null;
       final emphasized = isSel || hasPendingOrder;
+      // 版面类型行（det 定行打的页眉/页脚/页码/眉批）：按类型配色并
+      // 标注类型名（与区域视图同一套 RegionLabel 配色），不再混作正文。
+      final typedLabel = line.regionLabel.isEmpty
+          ? null
+          : RegionLabel.normalize(line.regionLabel);
+      final typed = typedLabel != null && typedLabel != RegionLabel.mainText;
+      final baseColor = typed ? RegionLabel.color(typedLabel) : Colors.indigo;
       final color = hasPendingOrder
           ? Colors.teal
-          : (isSel ? Colors.orange : Colors.indigo);
+          : (isSel ? Colors.orange : baseColor);
       // 半透明色块叠加：整个框在书页上呈现明显的同色覆盖层
       canvas.drawRect(
         r,
@@ -7856,7 +7963,15 @@ class _BlockPainter extends CustomPainter {
           canvas,
           '${i + 1}',
           r.topLeft,
-          isSel ? Colors.orange : Colors.indigo,
+          isSel ? Colors.orange : baseColor,
+        );
+      }
+      if (typed && !hasPendingOrder && !isSel) {
+        _drawLabel(
+          canvas,
+          RegionLabel.displayName(typedLabel),
+          r.bottomLeft + const Offset(0, -24),
+          baseColor,
         );
       }
       if (hasPendingOrder) {
@@ -12460,6 +12575,7 @@ class _CharChipColumnState extends State<_CharChipColumn> {
               cellHeight: cellHeight,
               color: charRainbowColor(display[i].order),
               isTall: isTallCharBox(display[i], medianH),
+              fullDiff: display[i].fullDiff == true,
             ),
           ),
         ),
@@ -12476,6 +12592,9 @@ class _CharChipColumnState extends State<_CharChipColumn> {
           children: [
             for (var i = 0; i < display.length; i++)
               _positionGeo(display[i], tile(i)),
+            // 全文对照多出的无框字符（标点等）：按标准字单元接在最后
+            // 一个字之后（越出列高的部分不画）。
+            ..._extraChipsGeo(display),
             // 拖拽插入位置指示线：几何锁定下 chip 不随拖动移动，
             // 用横线跟随指针显示落点。
             if (_dragIndex != null && _dragLocalY != null)
@@ -12498,9 +12617,44 @@ class _CharChipColumnState extends State<_CharChipColumn> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.center,
-        children: [for (var i = 0; i < display.length; i++) tile(i)],
+        children: [
+          for (var i = 0; i < display.length; i++) tile(i),
+          // 全文对照多出的无框字符（标点等）：接在字片序列尾部展示。
+          for (final extra in widget.line.fullExtras)
+            _FullExtraChip(ch: extra, fontSize: widget.fontPx),
+        ],
       ),
     );
+  }
+
+  /// 几何对齐布局下的全文对照无框字符：接在最后一个字之后、按标准
+  /// 字单元高顺序排（越出列高的不画——列高即行图高，溢出会糊到邻行）。
+  List<Widget> _extraChipsGeo(List<CharBlock> display) {
+    final extras = widget.line.fullExtras;
+    if (extras.isEmpty || display.isEmpty) return const [];
+    final (lastTop, lastH) = _verticalCharCell(
+      display.last,
+      widget.line,
+      widget.displayHeight,
+      widget.stdCell,
+    );
+    final step = widget.stdCell > 0 ? widget.stdCell : lastH;
+    if (step <= 0) return const [];
+    final out = <Widget>[];
+    for (var k = 0; k < extras.length; k++) {
+      final top = lastTop + lastH + k * step;
+      if (top + step > widget.displayHeight) break;
+      out.add(
+        Positioned(
+          top: top,
+          left: 0,
+          width: widget.columnWidth,
+          height: step,
+          child: _FullExtraChip(ch: extras[k], fontSize: widget.fontPx),
+        ),
+      );
+    }
+    return out;
   }
 
   /// 几何对齐模式的 chip 定位：与行图字框中心同位（_verticalCharCell
@@ -12733,6 +12887,7 @@ class _CharChipRowState extends State<_CharChipRow> {
               cellHeight: cellHeight,
               color: charRainbowColor(display[i].order),
               isTall: isTallCharBox(display[i], medianH),
+              fullDiff: display[i].fullDiff == true,
             ),
           ),
         ),
@@ -12788,6 +12943,28 @@ class _CharChipRowState extends State<_CharChipRow> {
         );
       }
 
+      // 全文对照多出的无框字符（标点等）：按标准槽宽接在最后一个字
+      // 之后（越出行宽的不画）。
+      final extras = widget.line.fullExtras;
+      final extraWidgets = <Widget>[];
+      if (extras.isNotEmpty && effSlots.isNotEmpty) {
+        var left = effSlots.last.$1 + effSlots.last.$2 + 2;
+        for (final extra in extras) {
+          if (left + effSlots.last.$2 > widget.displayWidth) break;
+          extraWidgets.add(
+            Positioned(
+              top: 0,
+              left: left,
+              width: effSlots.last.$2,
+              height: widget.rowHeight,
+              child: Center(
+                child: _FullExtraChip(ch: extra, fontSize: widget.fontPx),
+              ),
+            ),
+          );
+          left += effSlots.last.$2 + 2;
+        }
+      }
       return SizedBox(
         key: _rowKey,
         width: widget.displayWidth,
@@ -12795,6 +12972,7 @@ class _CharChipRowState extends State<_CharChipRow> {
         child: Stack(
           children: [
             for (var i = 0; i < display.length; i++) positionBySlot(i, tile(i)),
+            ...extraWidgets,
             // 拖拽插入位置指示线：几何锁定下 chip 不随拖动移动，
             // 用竖线跟随指针显示落点。
             if (_dragIndex != null && _dragLocalX != null)
@@ -12818,7 +12996,11 @@ class _CharChipRowState extends State<_CharChipRow> {
         spacing: 2,
         runSpacing: 2,
         crossAxisAlignment: WrapCrossAlignment.center,
-        children: [for (var i = 0; i < display.length; i++) tile(i)],
+        children: [
+          for (var i = 0; i < display.length; i++) tile(i),
+          for (final extra in widget.line.fullExtras)
+            _FullExtraChip(ch: extra, fontSize: widget.fontPx),
+        ],
       ),
     );
   }
@@ -12849,6 +13031,47 @@ String _charAgreeLabel(String agree) {
   }
 }
 
+/// 全文对照标记色（默认识别流程附加路）：fullDiff=与整行全文直读
+/// 不一致的字（深橙）；fullExtras=全文多出的无框字符（通常是标点，
+/// 紫）。与墨迹校验红/琥珀、行内彩虹色互相区分。
+const Color kFullDiffColor = Color(0xFFE65100);
+const Color kFullExtraColor = Color(0xFF8E24AA);
+
+/// 全文对照多出的无框字符 chip（识别栏展示，无字框、无手势）：紫字 +
+/// 淡紫底 + 紫描边虚线感（短划边框用 dotted 模拟）。
+class _FullExtraChip extends StatelessWidget {
+  final String ch;
+  final double fontSize;
+  const _FullExtraChip({required this.ch, required this.fontSize});
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: fontSize,
+      child: Container(
+        alignment: Alignment.center,
+        decoration: BoxDecoration(
+          color: kFullExtraColor.withValues(alpha: 0.10),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: kFullExtraColor.withValues(alpha: 0.55),
+            width: 1,
+            strokeAlign: BorderSide.strokeAlignInside,
+          ),
+        ),
+        child: Text(
+          ch,
+          style: TextStyle(
+            fontSize: fontSize * 0.82,
+            height: 1.0,
+            color: kFullExtraColor,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
 class _CharChip extends StatelessWidget {
   final CharBlock char;
   final bool selected;
@@ -12866,6 +13089,9 @@ class _CharChip extends StatelessWidget {
   /// 复查（字+标点同框/两字粘连等）。
   final bool isTall;
 
+  /// 全文对照：与整行全文直读的对位字符不一致（kFullDiffColor 标记）。
+  final bool fullDiff;
+
   const _CharChip({
     required this.char,
     this.selected = false,
@@ -12874,6 +13100,7 @@ class _CharChip extends StatelessWidget {
     this.cellHeight,
     this.color,
     this.isTall = false,
+    this.fullDiff = false,
   });
 
   @override
@@ -12893,13 +13120,17 @@ class _CharChip extends StatelessWidget {
         : isConfirmed
         ? Colors.green.shade200
         : Colors.blue.shade200;
+    final fullDiffColor = fullDiff && verifyColor == null
+        ? kFullDiffColor
+        : null;
     final borderColor = isTall && !selected
         ? kTallBoxRed
         : selected
         ? Colors.orange.shade700
-        : verifyColor ?? baseBorderColor;
+        : verifyColor ?? fullDiffColor ?? baseBorderColor;
     final textColor =
         verifyColor ??
+        fullDiffColor ??
         color ??
         (isEmpty
             ? Colors.red
@@ -13384,16 +13615,27 @@ class _PageDirectionDialogState extends State<_PageDirectionDialog> {
   }
 }
 
+/// VL 全量设置（构造器开关 + predict 参数）是否有变化（对话框"保存"
+/// 按钮的判据）：比较 vlConfig/vlPredict 两个请求体视图的 JSON。
+bool _vlSettingsChanged(ProjectSettings a, ProjectSettings b) =>
+    jsonEncode(a.vlConfig) != jsonEncode(b.vlConfig) ||
+    jsonEncode(a.vlPredict) != jsonEncode(b.vlPredict);
+
 /// 识别引擎设置对话框（书级）：复用 EngineSettingsSection（与任务创建
 /// 页同一套选项与文案），确认后由调用方写 project.settings 并落盘。
 class _EngineSettingsDialog extends StatefulWidget {
   const _EngineSettingsDialog({
     required this.engine,
     required this.paddleModel,
+    this.vlSettings,
   });
 
   final String engine;
   final String paddleModel;
+
+  /// VL 设置初始值（书级，承载全部构造器开关与 predict 参数）；
+  /// null = 不展示 VL 配置面板（任务创建页）。
+  final ProjectSettings? vlSettings;
 
   @override
   State<_EngineSettingsDialog> createState() => _EngineSettingsDialogState();
@@ -13402,16 +13644,21 @@ class _EngineSettingsDialog extends StatefulWidget {
 class _EngineSettingsDialogState extends State<_EngineSettingsDialog> {
   late String _engine;
   late String _paddleModel;
+  ProjectSettings? _vlSettings;
 
   @override
   void initState() {
     super.initState();
     _engine = widget.engine;
     _paddleModel = widget.paddleModel;
+    _vlSettings = widget.vlSettings?.copyWith();
   }
 
   bool get _changed =>
-      _engine != widget.engine || _paddleModel != widget.paddleModel;
+      _engine != widget.engine ||
+      _paddleModel != widget.paddleModel ||
+      (_vlSettings != null &&
+          _vlSettingsChanged(widget.vlSettings!, _vlSettings!));
 
   @override
   Widget build(BuildContext context) {
@@ -13435,6 +13682,10 @@ class _EngineSettingsDialogState extends State<_EngineSettingsDialog> {
                 paddleModel: _paddleModel,
                 onEngineChanged: (v) => setState(() => _engine = v),
                 onPaddleModelChanged: (v) => setState(() => _paddleModel = v),
+                vlSettings: _vlSettings,
+                onVlSettingsChanged: _vlSettings == null
+                    ? null
+                    : (s) => setState(() => _vlSettings = s),
               ),
             ],
           ),
@@ -13447,7 +13698,15 @@ class _EngineSettingsDialogState extends State<_EngineSettingsDialog> {
         ),
         FilledButton(
           onPressed: _changed
-              ? () => Navigator.pop(context, (_engine, _paddleModel))
+              ? () => Navigator.pop(
+                  context,
+                  (
+                    _engine,
+                    _paddleModel,
+                    // VL 面板未动时沿用原设置对象（copyWith 已复制）。
+                    _vlSettings ?? (widget.vlSettings!.copyWith()),
+                  ),
+                )
               : null,
           child: const Text('保存'),
         ),

@@ -229,7 +229,12 @@ class _KrakenDaemon:
             [self._python, self._worker_script, "--daemon"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=None,
+            # 必须 PIPE：下方 _stderr_reader 透传线程读 proc.stderr 把
+            # worker 的 tlog 进度日志 print 进服务 stdout（_Tee 落盘 +
+            # 应用后端控制台可见）。此前误为 None（继承父进程句柄）——
+            # proc.stderr 为 None，读线程首行即 AttributeError 静默死掉，
+            # worker 日志（含直读标点诊断 mark stats）全部不可见。
+            stderr=subprocess.PIPE,
             env=env,
             text=True,
             encoding="utf-8",
@@ -354,7 +359,15 @@ class _KrakenDaemon:
                 return obj.get("result") or {}
 
     def shutdown(self) -> None:
-        with self._lock:
+        # 正在加载模型/长请求的 daemon 其 request() 全程持锁（ping 首载
+        # 含模型下载，可达数分钟）——优雅关闭等锁会把池重建/换模型卡到
+        # 加载结束。限时拿锁，拿不到直接强杀：加载中途被杀无害（该进程
+        # 不再接客，池重建的新成员会重新加载），在途请求由调用方按失败
+        # 处理。
+        if not self._lock.acquire(timeout=15):
+            self._kill()
+            return
+        try:
             if not self._alive():
                 return
             try:
@@ -371,6 +384,8 @@ class _KrakenDaemon:
             except Exception:
                 pass
             self._kill()
+        finally:
+            self._lock.release()
 
 
 

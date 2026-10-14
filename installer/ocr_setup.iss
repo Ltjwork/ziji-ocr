@@ -67,6 +67,9 @@ Source: "..\python_service\*"; DestDir: "{app}\python_service"; \
 ; 未打包时跳过（开发/测试安装包）：Kraken 模型首次识别时在线下载兜底。
 Source: "..\python_service\models_release.zjpack"; DestDir: "{app}\python_service"; \
   Flags: ignoreversion skipifsourcedoesntexist
+; 更新日志（应用内「设置 → 说明 → 更新日志」读取；安装目录即
+; python_service 上级，与客户端的路径探测一致）
+Source: "..\CHANGELOG.md"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 ; （说明：墨迹校验用的楷体字形 resources\fonts\LXGWWenKai-Regular.ttf
 ; 约 24.7 MB，随上面 python_service\* 的递归拷贝一并进包，无需单列）
 

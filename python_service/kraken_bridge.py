@@ -86,6 +86,30 @@ class _KrakenEngineAdapter:
         # strip_read=False 的引擎不会走到这里（竖排整行读法直接可得）。
         raise NotImplementedError("kraken 整行读法无需字框拼条")
 
+    def read_line_full(
+        self,
+        image_path: str,
+        rect: dict,
+        orientation: str = "vertical",
+        horizontal_dir: str = "rtl",
+        vertical_dir: str = "ttb",
+    ) -> dict:
+        """整行全文直读（全文对照用）：单行框直接走与标注识别相同的逐行
+        预处理+识别，不经字框切分——标点等没有字框的字符也会被读出。
+        返回 {text, conf}。池未就绪时抛错（对照是增强路，调用方静默跳过；
+        绝不在这里懒起池——单元测试/未预热环境不该被拖起 daemon）。"""
+        pool = _pool
+        if pool is None or pool.size <= 0:
+            raise RuntimeError("kraken 池未就绪，跳过全文对照")
+        return pool.request(
+            "read_line",
+            {
+                "image_path": image_path,
+                "rect": rect,
+                "text_direction": text_direction(orientation, horizontal_dir),
+            },
+        )
+
     def pool_size(self) -> int:
         return pool_size()
 
@@ -239,6 +263,38 @@ def recognize_char(
         "conf": float(results[0].get("conf") or 0.0),
     }
 
+
+
+
+def read_page_text(
+    image_path: str,
+    orientation: str,
+    horizontal_dir: str,
+    vertical_dir: str = "ttb",
+) -> dict:
+    """整页直读（kraken：blla 分行 + rpred 读字），不走标注切分管线。
+
+    worker 返回未排序行列表，阅读序由 page_text 按方向参数重排后拼接。"""
+    from page_text import lines_to_page_text
+
+    pool = _ensure_pool()
+    # text_direction 同识别管线口径（竖排列旋转后进识别网络），blla 的
+    # 行朝向判定与 rpred 的竖排处理都依赖它。
+    direction = text_direction(orientation, horizontal_dir)
+    result = pool.request(
+        "read_page",
+        {"image_path": image_path, "text_direction": direction},
+    )
+    lines = result.get("lines", [])
+    text, ordered = lines_to_page_text(
+        lines, orientation, horizontal_dir, vertical_dir
+    )
+    return {
+        "text": text,
+        "lines": ordered,
+        "engine": "kraken",
+        "ocr": "kraken+chat_rec",
+    }
 
 
 
@@ -707,6 +763,120 @@ def _fuse_line_chars(
 
 
 
+def _align_full_text(full_text: str, char_texts: list[str]) -> tuple[list[str], list[bool]]:
+    """全文读法 vs 单字识别的序列对齐（全文对照的纯函数核心）。
+
+    返回 (extras, diff_flags)：
+    - extras：全文有而单字序列没有的字符（保序）——通常是标点等没有
+      字框、像素切分天然丢掉的字符；
+    - diff_flags：与对位全文字符不一致的单字标记（opcodes 的 replace
+      段；单字有而全文没有的 insert 段不标——融合层候选已覆盖分歧）。"""
+    import difflib
+
+    a = [ch for ch in str(full_text or "") if not ch.isspace()]
+    b = [str(t or "") for t in char_texts]
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    extras: list[str] = []
+    diff = [False] * len(b)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "delete":
+            extras.extend(a[i1:i2])
+        elif tag == "replace":
+            for j in range(j1, j2):
+                diff[j] = True
+    return extras, diff
+
+
+def _match_page_ref_line(ref_lines: list, rect: dict):
+    """行框 ↔ 整页直读行按 IoU 最优匹配（≥0.3 才算命中）。
+
+    det 定行后标注行与直读行同源（都是 PP-OCR det 的框，标注行仅沿
+    阅读轴墨迹外扩 ±25%），IoU 天然高；列间无重叠不会串列。"""
+    best = None
+    best_iou = 0.3
+    x, y = int(rect.get("x", 0)), int(rect.get("y", 0))
+    w, h = int(rect.get("w", 0)), int(rect.get("h", 0))
+    if w <= 0 or h <= 0:
+        return None
+    for ref in ref_lines or []:
+        if not isinstance(ref, dict):
+            continue
+        try:
+            rx, ry = int(ref.get("x", 0)), int(ref.get("y", 0))
+            rw, rh = int(ref.get("w", 0)), int(ref.get("h", 0))
+        except (TypeError, ValueError):
+            continue
+        if rw <= 0 or rh <= 0:
+            continue
+        ix = min(x + w, rx + rw) - max(x, rx)
+        iy = min(y + h, ry + rh) - max(y, ry)
+        if ix <= 0 or iy <= 0:
+            continue
+        inter = ix * iy
+        union = w * h + rw * rh - inter
+        iou = inter / union if union > 0 else 0.0
+        if iou > best_iou:
+            best, best_iou = ref, iou
+    return best
+
+
+def _apply_full_text_check(
+    adapter,
+    image_path: str,
+    rect: dict | None,
+    orientation: str,
+    horizontal_dir: str,
+    vertical_dir: str,
+    line: dict,
+    chars: list[dict],
+) -> None:
+    """全文对照（默认识别流程的附加路）：整页/整行全文直读（不经字框
+    切分）与单字识别序列对齐——全文多出的字符记 line["full_extras"]
+    （客户端以无框字片展示在识别栏），与对位全文字符不一致的单字标
+    full_diff（客户端特殊颜色）。对照是增强路：任何失败静默跳过，绝不
+    影响识别主流程；FULL_TEXT_CHECK=0 关闭。
+
+    参照优先级：① 整页直读行文本（adapter.page_text_lines，paddle 桥接
+    层挂载——与文本视图同一模型同一读法，VL 选择时带标点，按行框 IoU
+    匹配）；② 行框裁图整行直读（read_line_full，旧参照路径，页读不可
+    用/该行没匹配上时兜底）。"""
+    if os.environ.get("FULL_TEXT_CHECK", "1") == "0":
+        return
+    if not rect or not chars:
+        return
+    text = ""
+    source = ""
+    ref_lines = getattr(adapter, "page_text_lines", None)
+    if ref_lines:
+        ref = _match_page_ref_line(ref_lines, rect)
+        if ref is not None:
+            text = str(ref.get("text") or "")
+            source = "page"
+    if not text.strip():
+        try:
+            full = adapter.read_line_full(
+                image_path, rect, orientation, horizontal_dir, vertical_dir
+            )
+        except Exception as exc:
+            log(f"[full-check] 全文直读失败（跳过对照）: {exc}")
+            return
+        text = str((full or {}).get("text") or "")
+        source = "line"
+    if not text.strip():
+        return
+    extras, diffs = _align_full_text(text, [c.get("text") or "" for c in chars])
+    line["full_text"] = text
+    line["full_extras"] = extras
+    for c, d in zip(chars, diffs):
+        if d:
+            c["full_diff"] = True
+    if extras or any(diffs):
+        log(
+            f"[full-check] 全文对照({source}): extras={len(extras)} "
+            f"({''.join(extras)[:16]}), diff={sum(diffs)}"
+        )
+
+
 def apply_recognition(
     result: dict,
     image_path: str,
@@ -714,6 +884,7 @@ def apply_recognition(
     horizontal_dir: str,
     char_splitter=None,
     adapter=None,
+    vertical_dir: str = "ttb",
 ) -> dict:
     """/segment 结果后处理（引擎无关核心）：版面保持不变，行内单字文本与
     字框全部来自所选识别引擎（默认 kraken；paddle 见 paddle_bridge，
@@ -766,7 +937,8 @@ def apply_recognition(
                     (base_rect["x"], base_rect["y"], base_rect["w"], base_rect["h"]),
                     ink_mask, mask_w, mask_h, line_orientation,
                 )
-                # 整页 YOLO 已经提供了字框覆盖范围时，墨迹扩展只用于
+                # 整页检测已提供字框覆盖范围时（YOLO 行）与 det 行
+                # （PP-OCR 检测定行，chars 为空）同样适用：墨迹扩展只用于
                 # 找回边缘少量漏墨。栏线/邻列墨迹可能让旧算法一路扩到
                 # 整页高度，随后把空白切成大量小框；超过 25% 的扩展不
                 # 再视为“缺边”，保留检测到的列框几何。上限取 25%：20%
@@ -776,7 +948,7 @@ def apply_recognition(
                 # 回字框，但行框仍是短的（合回只换字框），字全部落在
                 # 行框外（用户所见“没有画进单行识别框”）；病态扩展
                 # （欄線链拉到整页，>100%）仍远超上限被挡。
-                if line.get("chars") and line_orientation != "horizontal":
+                if line_orientation != "horizontal":
                     base_axis = max(1, int(base_rect["h"]))
                     expanded_axis = max(1, int(expanded[3]))
                     growth = expanded_axis - base_axis
@@ -973,6 +1145,18 @@ def apply_recognition(
             flips,
             agrees,
         )
+        # 全文对照（增强路）：整行全文直读 vs 单字识别，标点等无框字符
+        # 与不一致字回填到 line/chars（失败静默，见 _apply_full_text_check）。
+        _apply_full_text_check(
+            adapter,
+            image_path,
+            split_rects[idx],
+            orientation,
+            horizontal_dir,
+            vertical_dir,
+            line,
+            chars,
+        )
         return chars
 
     use_task_threads = (
@@ -1015,10 +1199,12 @@ def apply_kraken_recognition(
     orientation: str,
     horizontal_dir: str,
     char_splitter=None,
+    vertical_dir: str = "ttb",
 ) -> dict:
     """apply_recognition 的 kraken 薄包装（历史入口，import 面保持不变）。"""
     return apply_recognition(
-        result, image_path, orientation, horizontal_dir, char_splitter
+        result, image_path, orientation, horizontal_dir, char_splitter,
+        vertical_dir=vertical_dir,
     )
 
 
@@ -1092,6 +1278,7 @@ def kraken_segment_rect(
             expected_char_count=expected_char_count,
             expand=expand,
             adapter=adapter,
+            vertical_dir=vertical_dir,
         )
         line.setdefault("layout_role", "body")
         line.setdefault("column_group", "")
@@ -1132,6 +1319,7 @@ def kraken_segment_rect(
                 strict_char_boxes=strict_char_boxes,
                 expand=False,
                 adapter=adapter,
+                vertical_dir=vertical_dir,
             )
         )
         # Keep the same layout metadata as full-page segmentation so manual
@@ -1175,6 +1363,7 @@ def segment_line_core(
     strict_char_boxes: bool = False,
     expected_char_count: int | None = None,
     adapter=None,
+    vertical_dir: str = "ttb",
 ) -> dict:
     """单行识别核心（引擎无关），返回与整页识别同构的 line dict（含 chars）。
 
@@ -1436,6 +1625,17 @@ def segment_line_core(
         agrees,
     )
     log(f"{adapter.name}_segment_line {line_id}: {len(chars)} chars")
+    # 全文对照（增强路，见 _apply_full_text_check）。
+    _apply_full_text_check(
+        adapter,
+        image_path,
+        read_rect,
+        orientation,
+        horizontal_dir,
+        vertical_dir,
+        line,
+        chars,
+    )
     return line
 
 
@@ -1452,6 +1652,7 @@ def kraken_segment_line(
     expand: bool = True,
     strict_char_boxes: bool = False,
     expected_char_count: int | None = None,
+    vertical_dir: str = "ttb",
 ) -> dict:
     """segment_line_core 的 kraken 薄包装（历史入口，import 面保持不变）。"""
     return segment_line_core(
@@ -1466,6 +1667,7 @@ def kraken_segment_line(
         expand=expand,
         strict_char_boxes=strict_char_boxes,
         expected_char_count=expected_char_count,
+        vertical_dir=vertical_dir,
     )
 
 

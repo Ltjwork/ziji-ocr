@@ -7,8 +7,8 @@ import '../models/models.dart';
 import '../services/python_service.dart';
 import '../services/ollama_service.dart';
 import '../services/page_recognition.dart';
-import 'editor_page.dart'
-    show InteractiveLineCrop, charRainbowColor, lineSharesColumnBand;
+import '../widgets/char_rainbow.dart' show charRainbowColor;
+import 'editor_page.dart' show InteractiveLineCrop, lineSharesColumnBand;
 
 /// 行内重切（全屏，从全书墨迹归类页双击字格进入）：展示该字所在行的
 /// 行图与行内单字识别区，可重新划分——

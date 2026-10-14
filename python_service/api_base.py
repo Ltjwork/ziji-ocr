@@ -41,7 +41,7 @@ from segmenter import (
 
 
 
-BACKEND_BUILD = "paddle-engine-2026-10-13-v134"
+BACKEND_BUILD = "fulltext-auto-refresh-2026-10-15-v152"
 
 
 
@@ -81,14 +81,25 @@ def install_console_log(log_path: Path) -> None:
                     self._handle.flush()
             except Exception:
                 pass
-            return self._original.write(text)
+            # 控制台/管道写失败绝不向业务传播：App 侧管道消费端异常时
+            # write/flush 抛 OSError（实测 Errno 22 Invalid argument，
+            # 从端点里的 print(flush=True) 一路炸穿成纯文本 500
+            # "Internal Server Error"，识别根本没开始就失败）——控制台
+            # 输出丢了无所谓，业务不能陪葬。
+            try:
+                return self._original.write(text)
+            except Exception:
+                return len(text)
 
         def flush(self):
             try:
                 self._handle.flush()
             except Exception:
                 pass
-            self._original.flush()
+            try:
+                self._original.flush()
+            except Exception:
+                pass
 
         def isatty(self):
             return False
@@ -107,8 +118,35 @@ def install_console_log(log_path: Path) -> None:
 
 
 
+def _quiet_connection_lost(loop, context) -> None:
+    """asyncio 异常处理器：静默 Windows Proactor 的良性断连噪音。
+
+    客户端断开连接时 _ProactorBasePipeTransport._call_connection_lost 对
+    已关闭的 socket 再 shutdown 会抛 WinError 10022（CPython 已知问题，
+    无害），asyncio 默认处理器把它整段 traceback 打到 stderr——App 端
+    每个轮询连接关闭都触发一次（7 行栈 × 每 3 秒），后端控制台被刷屏、
+    有用的日志（worker mark stats 等）被淹没。只静默这一类，其余仍走
+    默认处理器（真实异常照常报告）。
+    """
+    handle = str(context.get("handle") or "")
+    exc = context.get("exception")
+    if (
+        "_call_connection_lost" in handle
+        and isinstance(exc, OSError)
+        and getattr(exc, "winerror", None) == 10022
+    ):
+        return
+    loop.default_exception_handler(context)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # 装在 uvicorn 服务所用的循环上（lifespan 在该循环内运行）：
+    # 见 _quiet_connection_lost 注释。
+    import asyncio
+
+    asyncio.get_running_loop().set_exception_handler(_quiet_connection_lost)
+
     # 后台预热线：启动常驻 Kraken daemon 并加载模型（GPU 繁忙时也要几十
     # 秒），用户首次识别不必再等冷启动。
     def _prewarm() -> None:

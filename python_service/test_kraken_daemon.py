@@ -302,5 +302,49 @@ class DaemonPoolTests(unittest.TestCase):
         pool.shutdown()
 
 
+class ConsoleNoiseHandlerTests(unittest.TestCase):
+    """api_base._quiet_connection_lost：只静默 Windows Proactor 的良性
+    断连噪音（_call_connection_lost + WinError 10022），其余异常照走
+    默认处理器（conda 缓冲修掉后该噪音每 3 秒刷 7 行栈淹没控制台）。"""
+
+    class _FakeLoop:
+        def __init__(self):
+            self.forwarded = []
+
+        def default_exception_handler(self, context):
+            self.forwarded.append(context)
+
+    @staticmethod
+    def _context(winerror=None, handle="<Handle _ProactorBasePipeTransport._call_connection_lost(None)>"):
+        exc = None
+        if winerror is not None:
+            exc = OSError(winerror, "fake")
+            exc.winerror = winerror
+        return {"handle": handle, "exception": exc, "message": "test"}
+
+    def test_benign_connection_lost_is_silenced(self):
+        from api_base import _quiet_connection_lost
+
+        loop = self._FakeLoop()
+        _quiet_connection_lost(loop, self._context(winerror=10022))
+        self.assertEqual(loop.forwarded, [])
+
+    def test_other_winerror_is_forwarded(self):
+        from api_base import _quiet_connection_lost
+
+        loop = self._FakeLoop()
+        _quiet_connection_lost(loop, self._context(winerror=10054))
+        self.assertEqual(len(loop.forwarded), 1)
+
+    def test_other_callback_is_forwarded(self):
+        from api_base import _quiet_connection_lost
+
+        loop = self._FakeLoop()
+        _quiet_connection_lost(
+            loop, self._context(winerror=10022, handle="<Handle other_callback()>")
+        )
+        self.assertEqual(len(loop.forwarded), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 
+import '../models/models.dart';
 import '../services/python_service.dart';
 
 /// PaddleOCR 识别模型清单——后端 paddle_proc.PP_OCRV6_MODELS 的 Dart 镜像
@@ -11,9 +12,13 @@ class PaddleModelChoice {
     required this.requirement,
   });
 
-  final String name; // 后端模型名（PP-OCRv6_*_rec）
+  final String name; // 后端模型名（PP-OCRv6_*_rec / PaddleOCR-VL-1.6）
   final String label; // 下拉展示名（含体积）
   final String requirement; // 配置要求文案（用户按此选档）
+
+  /// 选项标题：模型名在前（用户要知道"用的到底是哪个模型"，只看
+  /// "轻量/小模型"这类昵称分不清），友好描述跟在后面。
+  String get displayLabel => '$name · $label';
 }
 
 const List<PaddleModelChoice> kPaddleModelChoices = [
@@ -32,6 +37,16 @@ const List<PaddleModelChoice> kPaddleModelChoices = [
     label: '中等 73.3MB',
     requirement: '建议 NVIDIA 独立显卡（显存 ≥4GB）+ GPU 版 paddlepaddle；精度最高、最慢',
   ),
+  PaddleModelChoice(
+    name: 'PP-OCRv3_mobile_rec',
+    label: 'v3 轻量 9.8MB',
+    requirement: 'CPU 即可运行；老一代模型（2022），精度低于 v5/v6；整页直读不支持竖排（v5 起原生支持），适合横排书籍或引擎对照',
+  ),
+  PaddleModelChoice(
+    name: 'PaddleOCR-VL-1.6',
+    label: '视觉语言模型 0.9B · 古籍最强',
+    requirement: '需 NVIDIA 独立显卡（建议显存 ≥8GB）+ GPU 版 paddlepaddle，首次下载约 1.9GB；古籍竖排、标点、复杂版式显著更强；CPU 极慢不建议；仅整页直读（文本视图）可用，行/字识别请选 PP-OCR 系模型',
+  ),
 ];
 
 const String kDefaultPaddleModel = 'PP-OCRv6_small_rec';
@@ -45,12 +60,18 @@ class EngineSettingsSection extends StatefulWidget {
     required this.paddleModel,
     required this.onEngineChanged,
     required this.onPaddleModelChanged,
+    this.vlSettings,
+    this.onVlSettingsChanged,
   });
 
   final String engine; // 'kraken' | 'paddle'
   final String paddleModel;
   final ValueChanged<String> onEngineChanged;
   final ValueChanged<String> onPaddleModelChanged;
+
+  /// VL 解析配置（书级，选 VL 模型时展示面板）；null = 不展示。
+  final ProjectSettings? vlSettings;
+  final ValueChanged<ProjectSettings>? onVlSettingsChanged;
 
   @override
   State<EngineSettingsSection> createState() => _EngineSettingsSectionState();
@@ -144,7 +165,7 @@ class _EngineSettingsSectionState extends State<EngineSettingsSection> {
           for (final choice in kPaddleModelChoices)
             _optionRow(
               selected: widget.paddleModel == choice.name,
-              title: choice.label,
+              title: choice.displayLabel,
               subtitle: choice.requirement,
               onTap: () => widget.onPaddleModelChanged(choice.name),
             ),
@@ -155,7 +176,169 @@ class _EngineSettingsSectionState extends State<EngineSettingsSection> {
               onReady: _refreshPaddleStatus,
             ),
           ),
+          if (_vlPanelVisible) _buildVlPanel(),
         ],
+      ],
+    );
+  }
+
+  bool get _vlPanelVisible =>
+      widget.engine == 'paddle' &&
+      widget.paddleModel.startsWith('PaddleOCR-VL') &&
+      widget.vlSettings != null &&
+      widget.onVlSettingsChanged != null;
+
+  /// VL 配置面板（PaddleOCR-VL 选中时展示，官网演示同款全参数）：
+  /// 构造器开关（池绑定）+ predict 级参数（Prompt 类型/生成参数/辅助
+  /// 内容解析，随每次请求不换池）。
+  Widget _buildVlPanel() {
+    final st = widget.vlSettings!;
+    void upd(ProjectSettings next) => widget.onVlSettingsChanged!(next);
+
+    Widget row(String title, String subtitle, bool value, void Function(bool v) fn) =>
+        SwitchListTile(
+          value: value,
+          onChanged: fn,
+          title: Text(title, style: const TextStyle(fontSize: 13.5)),
+          subtitle: Text(
+            subtitle,
+            style: const TextStyle(fontSize: 11.5, color: Colors.grey),
+          ),
+          dense: true,
+          contentPadding: const EdgeInsets.symmetric(horizontal: 16),
+        );
+
+    Widget header(String text) => Padding(
+          padding: const EdgeInsets.only(left: 16, top: 10, bottom: 2),
+          child: Text(
+            text,
+            style:
+                const TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600),
+          ),
+        );
+
+    Widget numFieldTyped(
+      String label,
+      Object? initial,
+      String hint,
+      void Function(num? v) fn,
+      bool asInt,
+    ) =>
+        Padding(
+          padding: const EdgeInsets.only(left: 16, right: 8, top: 2),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 130,
+                child: Text(label, style: const TextStyle(fontSize: 12.5)),
+              ),
+              Expanded(
+                child: TextField(
+                  controller: TextEditingController(
+                    text: initial?.toString() ?? '',
+                  ),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    hintText: hint,
+                    border: const OutlineInputBorder(),
+                    contentPadding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 6,
+                    ),
+                  ),
+                  style: const TextStyle(fontSize: 12.5),
+                  onChanged: (v) {
+                    final t = v.trim();
+                    if (t.isEmpty) {
+                      fn(null);
+                      return;
+                    }
+                    final d = double.tryParse(t);
+                    if (d == null) return;
+                    if (asInt) {
+                      fn(d.toInt());
+                    } else {
+                      fn(d);
+                    }
+                  },
+                ),
+              ),
+            ],
+          ),
+        );
+
+    const promptLabels = {
+      'ocr': '文本（默认）',
+      'formula': '公式',
+      'table': '表格',
+      'chart': '图表',
+      'seal': '印章',
+      'spotting': '文本检测与识别（逐行）',
+    };
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        header('模型参数（改动后首次直读会重建进程池）'),
+        row('图片方向矫正', '自动检测页面旋转（扫描件歪斜时开）',
+            st.vlUseDocOrientation,
+            (v) => upd(st.copyWith(vlUseDocOrientation: v))),
+        row('图片扭曲矫正', '弯曲页面展平（拍照件开，扫描件一般不用）',
+            st.vlUseDocUnwarping,
+            (v) => upd(st.copyWith(vlUseDocUnwarping: v))),
+        row('版面分析', '按版面块输出（标题/表格/图片分区）；古籍竖排推荐关——关闭时 VL 按列输出逐行文本，与行文对照对齐更好',
+            st.vlUseLayoutDetection,
+            (v) => upd(st.copyWith(vlUseLayoutDetection: v))),
+        row('图表识别', '图表内容解析', st.vlUseChartRecognition,
+            (v) => upd(st.copyWith(vlUseChartRecognition: v))),
+        row('印章识别', '印章文字识别', st.vlUseSealRecognition,
+            (v) => upd(st.copyWith(vlUseSealRecognition: v))),
+        row('图片文字识别', '对图片类版面块做文字识别', st.vlUseOcrForImageBlock,
+            (v) => upd(st.copyWith(vlUseOcrForImageBlock: v))),
+        header('Prompt 类型（仅关闭版面分析时生效）'),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          // spotting 在超大图上可能触发底层原生崩溃（实测），提示保留在
+          // 选项说明里由用户自行斟酌。
+          child: DropdownButtonFormField<String>(
+            // ignore: deprecated_member_use
+            value: promptLabels.containsKey(st.vlPromptLabel)
+                ? st.vlPromptLabel
+                : 'ocr',
+            items: [
+              for (final e in promptLabels.entries)
+                DropdownMenuItem(value: e.key, child: Text(e.value)),
+            ],
+            onChanged: (v) => upd(st.copyWith(vlPromptLabel: v ?? 'ocr')),
+            decoration: const InputDecoration(isDense: true),
+          ),
+        ),
+        header('生成参数（留空 = 模型默认；本地推理暂由模型忽略这三项采样参数）'),
+        numFieldTyped('重复抑制强度', st.vlRepetitionPenalty, '默认 1.0',
+            (v) => upd(st.copyWith(vlRepetitionPenalty: v?.toDouble())), false),
+        numFieldTyped('识别稳定性', st.vlTemperature, '默认 0.0',
+            (v) => upd(st.copyWith(vlTemperature: v?.toDouble())), false),
+        numFieldTyped('结果可信范围', st.vlTopP, '默认 1.0',
+            (v) => upd(st.copyWith(vlTopP: v?.toDouble())), false),
+        numFieldTyped('图像最小总像素数', st.vlMinPixels, '默认 147384',
+            (v) => upd(st.copyWith(vlMinPixels: v?.toInt())), true),
+        numFieldTyped('图像最大总像素数', st.vlMaxPixels, '留空 = 不限',
+            (v) => upd(st.copyWith(vlMaxPixels: v?.toInt())), true),
+        header('辅助内容解析（默认过滤；开启后恢复解析）'),
+        row('页眉', '页眉文字', st.vlParseHeader,
+            (v) => upd(st.copyWith(vlParseHeader: v))),
+        row('页眉图片', '页眉区域图片', st.vlParseHeaderImage,
+            (v) => upd(st.copyWith(vlParseHeaderImage: v))),
+        row('页脚', '页脚文字', st.vlParseFooter,
+            (v) => upd(st.copyWith(vlParseFooter: v))),
+        row('页脚图片', '页脚区域图片', st.vlParseFooterImage,
+            (v) => upd(st.copyWith(vlParseFooterImage: v))),
+        row('页码', '页码数字', st.vlParsePageNumber,
+            (v) => upd(st.copyWith(vlParsePageNumber: v))),
+        row('脚注', '脚注内容', st.vlParseFootnote,
+            (v) => upd(st.copyWith(vlParseFootnote: v))),
+        row('旁注文本', '旁批/边栏文字', st.vlParseAsideText,
+            (v) => upd(st.copyWith(vlParseAsideText: v))),
       ],
     );
   }

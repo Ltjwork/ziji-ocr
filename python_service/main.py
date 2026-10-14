@@ -238,6 +238,11 @@ from api_paddle import (  # noqa: E402,F401
     paddle_pool_resize,
 )
 
+from api_page_text import (  # noqa: E402,F401
+    ReadPageTextRequest,
+    read_page_text,
+)
+
 from api_bench import (  # noqa: E402,F401
     BenchPredItem,
     BenchEvalRequest,
@@ -351,4 +356,13 @@ if __name__ == "__main__":
         f"(port written to {port_file})",
         flush=True,
     )
-    uvicorn.run(app, host="127.0.0.1", port=chosen_port)
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=chosen_port,
+        # 访问日志（每请求一行 INFO）对 App 场景纯噪音：App 自己在客户端
+        # 侧带计时记录每个请求，且 /process_stats 每 3 秒被轮询两次——
+        # conda 缓冲修掉后这些行实时涌进控制台刷屏。错误日志（500 的
+        # traceback 等）不走访问日志，保留。
+        access_log=False,
+    )

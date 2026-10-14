@@ -744,9 +744,13 @@ class _CaseCard extends StatelessWidget {
         _ => 'AI ${ai['status']}',
       };
     }
-    final engineLabel = engine == 'hier'
-        ? (fallback == null ? '版面 hier（自训 YOLO）' : '版面 hier（部分回退：$fallback）')
-        : '版面 opencv（回退${fallback == null ? '' : '：$fallback'}）';
+    final engineLabel = switch (engine) {
+      'hier' => fallback == null
+          ? '版面 hier（自训 YOLO）'
+          : '版面 hier（部分回退：$fallback）',
+      'paddle-det' => '版面 PP-OCR 检测定行',
+      _ => '版面 opencv（回退${fallback == null ? '' : '：$fallback'}）',
+    };
     return '$engineLabel'
         '${yoloInit == null ? '' : ' · YOLO 字模${yoloInit ? '已加载' : '未加载'}'}'
         ' · $aiLabel';

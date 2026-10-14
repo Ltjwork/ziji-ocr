@@ -46,14 +46,17 @@ from api_base import (Block, _acquire_recognition_slot, app, _gated_recognition,
 class GateRegion(BaseModel):
     """重识别时随请求带入的人工已确认版面区（区域门控输入）。
 
-    字段与标注里 main_regions 的子集对齐；多余字段（id/uid 等）由
-    pydantic 忽略，不回传。"""
+    字段与标注里 main_regions 的子集对齐；id 透传——门控区会作为结果的
+    main_regions 原样回显（确认身份不丢），客户端 MainRegion.fromJson
+    对缺失 id 会抛 type cast（实测踩坑），id 必须全程在场；
+    缺省由 seg_pipeline 补 mr_gate_NNN。"""
     x: int
     y: int
     w: int
     h: int
     label: str = "main_text"
     status: str = "confirmed"
+    id: Optional[str] = None
 
 
 class SegmentRequest(BaseModel):
@@ -170,6 +173,20 @@ class SegmentRegionRequest(BaseModel):
     expand: bool = True
     engine: str = "kraken"
     paddle_model: Optional[str] = None
+    # 行的版面类型（det 定行打的 region_label，如 header/footer/
+    # page_number）：单行重识别回包沿用传入类型——行类型是页级识别
+    # 成果，重识别只换文字不该丢。空 = 正文行（不回盖）。
+    region_label: str = ""
+
+
+def _stamp_region_label(lines: list, region_label: str) -> None:
+    """单行重识别回包回盖行版面类型（非正文类型同时标 annotation）。"""
+    if not region_label:
+        return
+    for ln in lines:
+        ln["region_label"] = region_label
+        if region_label in ("header", "footer", "page_number", "margin_note"):
+            ln["layout_role"] = "annotation"
 
 
 
@@ -222,6 +239,15 @@ def segment(req: SegmentRequest):
         print(f"[segment] imread result: {None if img_test is None else img_test.shape}", flush=True)
         layout_t0 = time.time()
         print(f"[segment] layout detection start ...", flush=True)
+        # engine=paddle：行框改用 PP-OCR det（官网演示同款检测，实测行框
+        # 质量远超 YOLO 字框分组；OCR_PADDLE_DET_LINES=0 停用回退 YOLO）。
+        line_detector = (
+            functools.partial(
+                paddle_bridge.detect_page_lines, model=req.paddle_model
+            )
+            if req.engine == "paddle"
+            else None
+        )
         result = segment_image_with_metadata(
             req.image_path,
             layout_mode=req.layout_mode,
@@ -229,6 +255,7 @@ def segment(req: SegmentRequest):
             horizontal_dir=req.horizontal_dir,
             vertical_dir=req.vertical_dir,
             gate_regions=[g.model_dump() for g in req.gate_regions],
+            line_detector=line_detector,
         )
         print(
             f"[segment] layout done in {time.time() - layout_t0:.1f}s, "
@@ -250,11 +277,12 @@ def segment(req: SegmentRequest):
             result = paddle_bridge.apply_paddle_recognition(
                 result, req.image_path, req.orientation, req.horizontal_dir,
                 char_splitter=char_splitter, model=req.paddle_model,
+                vertical_dir=req.vertical_dir,
             )
         else:
             result = kraken_bridge.apply_kraken_recognition(
                 result, req.image_path, req.orientation, req.horizontal_dir,
-                char_splitter=char_splitter,
+                char_splitter=char_splitter, vertical_dir=req.vertical_dir,
             )
         print(
             f"[segment] {req.engine} recognition done in {time.time() - rec_t0:.1f}s, "
@@ -393,6 +421,7 @@ def segment_region(req: SegmentRegionRequest):
             f"chars={sum(len(l['chars']) for l in lines)} in {time.time() - kraken_t0:.1f}s",
             flush=True,
         )
+        _stamp_region_label(lines, req.region_label)
         return {
             "lines": lines,
             "line": lines[0],
@@ -422,6 +451,7 @@ def segment_lines_in_region_endpoint(req: SegmentLinesInRegionRequest):
         # 区域重识别与整页重识别对同一行产出一致；识别完成后再按区域
         # 过滤。此前先过滤再识别会让批内最窄行宽变化带动 Kraken 放大
         # 倍数与二值化改变，同一行的读法在两条链路间漂移、文字错乱。
+        # engine=paddle 时行框同样走 PP-OCR det（与 /segment 同源）。
         result = segment_image_with_metadata(
             req.image_path,
             layout_mode=req.layout_mode,
@@ -429,6 +459,13 @@ def segment_lines_in_region_endpoint(req: SegmentLinesInRegionRequest):
             horizontal_dir=req.horizontal_dir,
             vertical_dir=req.vertical_dir,
             gate_regions=[g.model_dump() for g in req.gate_regions],
+            line_detector=(
+                functools.partial(
+                    paddle_bridge.detect_page_lines, model=req.paddle_model
+                )
+                if req.engine == "paddle"
+                else None
+            ),
         )
         # 用户画的区域是行归属意图：与区域相交的行先沿自身列带扩到区域
         # 内墨迹再识别——夹注小字列的检测行框常被字距空白截短（0.85×
@@ -454,11 +491,12 @@ def segment_lines_in_region_endpoint(req: SegmentLinesInRegionRequest):
             result = paddle_bridge.apply_paddle_recognition(
                 result, req.image_path, req.orientation, req.horizontal_dir,
                 char_splitter=char_splitter, model=req.paddle_model,
+                vertical_dir=req.vertical_dir,
             )
         else:
             result = kraken_bridge.apply_kraken_recognition(
                 result, req.image_path, req.orientation, req.horizontal_dir,
-                char_splitter=char_splitter,
+                char_splitter=char_splitter, vertical_dir=req.vertical_dir,
             )
         result = segmenter.filter_result_to_region(
             result,
@@ -481,6 +519,73 @@ def segment_lines_in_region_endpoint(req: SegmentLinesInRegionRequest):
         return result
     except Exception as e:
         print(f"[segment_lines_in_region] error: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+class RefreshFullTextLine(BaseModel):
+    """待刷新对照标记的行：标注里的当前行框 + 逐字文本（只读不写回）。"""
+    id: str
+    x: int
+    y: int
+    w: int
+    h: int
+    char_texts: List[str] = []
+
+
+class RefreshFullTextCheckRequest(BaseModel):
+    image_path: str
+    lines: List[RefreshFullTextLine] = []
+
+
+@app.post("/refresh_full_text_check")
+def refresh_full_text_check(req: RefreshFullTextCheckRequest):
+    """用文本视图整页直读的行记录（direct_text 侧车）刷新标注行的对照
+    标记——纯 CPU（读侧车 + IoU 匹配 + 序列对齐），不跑任何模型。
+
+    背景：对照标记在"识别当前页"时随识别写入标注；之后用户重新整页
+    直读（行记录更新，如版面模式切换/模型更换/AI 校对后）标注里的旧
+    标记不会跟着变——编辑器在直读完成后调这里即时刷新，识别不用重跑。
+    返回逐行 {id, full_text, full_extras, diff_indices}；行没匹配上/无
+    侧车时对应字段为空（客户端按空值覆盖，清掉过期标记）。"""
+    t0 = time.time()
+    if os.environ.get("FULL_TEXT_CHECK", "1") == "0":
+        return {"updates": [], "ref_lines": 0, "disabled": True}
+    if not os.path.exists(req.image_path):
+        raise HTTPException(status_code=400, detail="image not found")
+    try:
+        ref_lines = paddle_bridge._sidecar_page_lines(req.image_path) or []
+        updates = []
+        for line in req.lines:
+            update = {"id": line.id, "full_text": "", "full_extras": [],
+                      "diff_indices": []}
+            if ref_lines and line.w > 0 and line.h > 0:
+                ref = kraken_bridge._match_page_ref_line(
+                    ref_lines,
+                    {"x": line.x, "y": line.y, "w": line.w, "h": line.h},
+                )
+                if ref is not None:
+                    text = str(ref.get("text") or "")
+                    if text.strip():
+                        extras, diffs = kraken_bridge._align_full_text(
+                            text, list(line.char_texts)
+                        )
+                        update["full_text"] = text
+                        update["full_extras"] = extras
+                        update["diff_indices"] = [
+                            i for i, d in enumerate(diffs) if d
+                        ]
+            updates.append(update)
+        matched = sum(1 for u in updates if u["full_text"])
+        print(
+            f"[refresh_full_text_check] lines={len(updates)} matched={matched} "
+            f"ref={len(ref_lines)} in {time.time() - t0:.2f}s",
+            flush=True,
+        )
+        return {"updates": updates, "ref_lines": len(ref_lines)}
+    except Exception as e:
+        print(f"[refresh_full_text_check] error: {e}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

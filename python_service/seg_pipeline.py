@@ -498,6 +498,127 @@ def _apply_sort_and_renumber(
 
 
 
+def _lines_from_det_rects(
+    det_rects: list[tuple[int, int, int, int]],
+    image_w: int,
+    image_h: int,
+    orientation: str = "vertical",
+) -> list[dict[str, Any]]:
+    """PP-OCR det 行框 → 管线行结构（chars 空：切字/识别由识别阶段按行
+    完成，与 YOLO 行的下游链路一致）。
+
+    det 框是整条文本行的紧致外接框（非字框碎片），长宽比可判行方向：
+    竖排页上的横排落款/页脚行（w>1.3h）标 horizontal，切字/外扩沿
+    正确轴向进行——整页排版声明仍主导（与 YOLO 行同规则），只对几何
+    上明显反向的行放行。"""
+    lines: list[dict[str, Any]] = []
+    for idx, (x, y, w, h) in enumerate(det_rects):
+        x = max(0, int(x))
+        y = max(0, int(y))
+        w = min(int(w), image_w - x)
+        h = min(int(h), image_h - y)
+        if w < 3 or h < 6:
+            continue
+        line_orientation = (
+            orientation
+            if orientation in ("horizontal", "vertical")
+            else ("horizontal" if w > h else "vertical")
+        )
+        if line_orientation == "vertical" and w > h * 1.3:
+            line_orientation = "horizontal"
+        elif line_orientation == "horizontal" and h > w * 1.3:
+            line_orientation = "vertical"
+        lines.append({
+            "id": f"det_l_{idx:03d}",
+            "x": x,
+            "y": y,
+            "w": w,
+            "h": h,
+            "line_no": idx,
+            "orientation": line_orientation,
+            "text": "",
+            "chars": [],
+        })
+    return lines
+
+
+# det 行可打的版面类型标签（与客户端 RegionLabel 词表同源；正文/眉批
+# 之外的排除类 + 眉批本身）。
+_DET_TYPE_LABELS = {"header", "footer", "page_number", "margin_note"}
+
+
+def _det_line_position_label(
+    ln: dict[str, Any], image_w: int, image_h: int
+) -> str:
+    """无门控区时的几何兜底：页眉/页脚 = 页顶/页底边带内的短行（正文
+    列高占版心大半，25% 上限保证主列永不被误标）；页码 = 页脚带内的
+    极短行（约 ≤5 字）。其余不猜——正文/眉批误标的代价高于漏标。"""
+    h_page = max(1, image_h)
+    vertical = ln.get("orientation") != "horizontal"
+    read_ext = ln["h"] if vertical else ln["w"]
+    cross_ext = ln["w"] if vertical else ln["h"]
+    read_page = h_page if vertical else max(1, image_w)
+    if read_ext <= 0 or read_ext > read_page * 0.25:
+        return ""
+    cy = ln["y"] + ln["h"] / 2.0
+    if cy < h_page * 0.12:
+        return "header"
+    if cy > h_page * 0.88:
+        if read_ext <= max(1, cross_ext) * 5.5:
+            return "page_number"
+        return "footer"
+    return ""
+
+
+def _type_det_lines(
+    lines: list[dict[str, Any]],
+    image_w: int,
+    image_h: int,
+    main_regions: list[dict[str, Any]] | None,
+) -> None:
+    """det 行打版面类型标签（region_label + layout_role=annotation）。
+
+    用户需求：det 检出的页眉/页脚/页码内容用对应类型的识别框展示，
+    不再混作正文行。归属优先人工已确认门控区（行中心落在页眉/页脚/
+    页码/眉批区内即该类；门控区已在检测前抹像素，这是边缘残留的兜底）；
+    无区时按几何位置判定。正文字行不打标签（客户端按缺省正文色）。"""
+    regions = [
+        r
+        for r in (main_regions or [])
+        if isinstance(r, dict)
+        and str(r.get("label") or "") in _DET_TYPE_LABELS
+        and r.get("status") != "rejected"
+    ]
+    typed = 0
+    for ln in lines:
+        label = ""
+        cx = ln["x"] + ln["w"] / 2.0
+        cy = ln["y"] + ln["h"] / 2.0
+        for r in regions:
+            if (
+                r.get("x", 0) <= cx <= r.get("x", 0) + r.get("w", 0)
+                and r.get("y", 0) <= cy <= r.get("y", 0) + r.get("h", 0)
+            ):
+                label = str(r.get("label"))
+                break
+        if not label:
+            label = _det_line_position_label(ln, image_w, image_h)
+        if label:
+            ln["region_label"] = label
+            ln["layout_role"] = "annotation"
+            typed += 1
+    if typed:
+        counts: dict[str, int] = {}
+        for ln in lines:
+            k = str(ln.get("region_label") or "")
+            if k:
+                counts[k] = counts.get(k, 0) + 1
+        _log(
+            "[segment] det 行类型化："
+            + "，".join(f"{k}={v}" for k, v in counts.items())
+        )
+
+
 def segment_image_with_metadata(
     image_path: str,
     layout_mode: str = "all_text",
@@ -505,6 +626,7 @@ def segment_image_with_metadata(
     horizontal_dir: str = "ltr",
     vertical_dir: str = "ttb",
     gate_regions: list[dict[str, Any]] | None = None,
+    line_detector=None,
 ) -> dict[str, Any]:
     img = _imread(image_path)
     if img is None:
@@ -525,7 +647,13 @@ def segment_image_with_metadata(
     # 页脚/页码门控。
     human_regions = [r for r in (gate_regions or []) if isinstance(r, dict)]
     if human_regions:
-        main_regions = human_regions
+        # 门控区直接作为结果 main_regions 回显：id 必须全程在场——旧
+        # 请求不带 id 时补齐（客户端 MainRegion.fromJson 对缺失 id 抛
+        # type cast，实测"重新识别当前页"type 'Null' 错误的根因）。
+        main_regions = [
+            dict(r, id=r.get("id") or f"mr_gate_{i:03d}")
+            for i, r in enumerate(human_regions)
+        ]
     else:
         main_regions = detect_main_regions(image_path, w, h)
     gated_path = build_body_gated_image(image_path, main_regions)
@@ -554,6 +682,30 @@ def segment_image_with_metadata(
             model_version=model_version, layout_mode=layout_mode), w, h)
 
     try:
+        # PP-OCR det 行框优先（engine=paddle 时由调用方注入 line_detector，
+        # paddle_bridge.detect_page_lines）：官网演示同款文本检测，行框
+        # 质量远超 YOLO 字框分组（实测同页 17 列全检出 vs YOLO 碎片/漏检）。
+        # 失败/空产出静默回退下方 YOLO 链路——det 是行框增强，不是硬依赖。
+        if line_detector is not None:
+            try:
+                det_rects = line_detector(detect_source)
+            except Exception as exc:
+                det_rects = []
+                _log(
+                    "[segment] PP-OCR det 行检测失败，回退 yolo-char："
+                    f"{_exception_summary(exc)}"
+                )
+            if det_rects:
+                det_lines = _lines_from_det_rects(det_rects, w, h, orientation)
+                _type_det_lines(det_lines, w, h, main_regions)
+                _apply_sort_and_renumber(
+                    det_lines, [], horizontal_dir, vertical_dir, orientation
+                )
+                _log(
+                    f"[segment] engine selected: paddle-det, lines: {len(det_lines)}"
+                )
+                return _finish("paddle-det", det_lines, [], None, "paddle-det")
+            _log("[segment] PP-OCR det 无行框产出，回退 yolo-char")
         _log(
             f"[segment] trying engine: yolo-char detector "
             f"layout={layout_mode} orientation={orientation} "

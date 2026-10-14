@@ -11,7 +11,9 @@ rem   cmd /c start /D <python_service_dir> run_backend_console.cmd
 rem The launch command must live in this batch file: compound commands
 rem passed directly as start arguments break (Dart auto-quotes arguments
 rem containing spaces; cmd quote-stripping fails on metacharacters).
-conda run -n paddle python main.py
+rem --no-capture-output: conda run buffers child stdout until exit, so
+rem the console window would stay empty until the backend stops.
+conda run --no-capture-output -n paddle python main.py
 echo.
 echo ===== backend exited (window kept for inspection, press any key to close) =====
 pause >nul

@@ -20,7 +20,7 @@ String _base = 'http://127.0.0.1:$_kBasePort';
 // Keep the client gate in lock-step with the backend build string: accepting
 // an older build silently leaves the app talking to an older segmenter (and
 // makes the new layout/ink rules appear to have no effect).
-const _expectedBackendBuild = 'paddle-engine-2026-10-13-v134';
+const _expectedBackendBuild = 'fulltext-auto-refresh-2026-10-15-v152';
 
 /// 测试专用：把服务基地址指到别处（如一个已关闭的本地端口，模拟
 /// 「后端未启动/被关闭」时的连接被拒）。不落盘、不写端口文件；调用方
@@ -644,12 +644,27 @@ class PythonService {
       }
     }
     if (!_consoleWindowMode) {
-      _addLog('app', '正在启动 Python 后端：conda run -n paddle python main.py');
+      _addLog(
+        'app',
+        '正在启动 Python 后端：conda run --no-capture-output -n paddle python main.py',
+      );
       _addLog('app', '工作目录：$pythonServiceDir');
       debugPrint('[py] starting backend with conda environment: paddle');
       final process = await Process.start(
         'conda',
-        ['run', '-n', 'paddle', 'python', 'main.py'],
+        [
+          'run',
+          // conda run 默认捕获子进程 stdout 直到退出才整体吐出（实测
+          // LINE-A 与 3 秒后的 LINE-B 同刻到达）——服务日志（含 worker
+          // 透传的 mark stats 标点诊断）全部被扣在缓冲里，控制台一条
+          // 服务行都看不到。--no-capture-output 让子进程直连管道，
+          // 逐行实时到达（实测 A 立刻、B 3 秒后）。
+          '--no-capture-output',
+          '-n',
+          'paddle',
+          'python',
+          'main.py',
+        ],
         workingDirectory: pythonServiceDir,
         runInShell: true,
         environment: {
@@ -1615,6 +1630,134 @@ class PythonService {
     return Map<String, dynamic>.from(decoded as Map);
   }
 
+  /// PaddleOCR-VL 视觉语言模型（仅整页直读可用）的判断：超时等差异化
+  /// 处理用。
+  static bool _isVlModel(ProjectSettings settings) =>
+      settings.engine == 'paddle' &&
+      settings.paddleModel.startsWith('PaddleOCR-VL');
+
+  /// 刷新整页对照标记（/refresh_full_text_check）：用文本视图整页直读
+  /// 落盘的行记录（direct_text 侧车）对已有标注行重算全文对照——纯
+  /// CPU（不跑模型、不重识别），返回逐行
+  /// {id, full_text, full_extras, diff_indices}。直读完成后编辑器调用，
+  /// 让紫色无框字片/橙色不一致标记跟最新直读文本同步。
+  static Future<List<Map<String, dynamic>>> refreshFullTextCheck({
+    required String imagePath,
+    required List<Map<String, dynamic>> lines,
+  }) async {
+    _addLog(
+      'http',
+      'POST /refresh_full_text_check lines=${lines.length}',
+    );
+    final r = await _post(
+          Uri.parse('$_base/refresh_full_text_check'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'image_path': imagePath, 'lines': lines}),
+        )
+        .timeout(
+          const Duration(seconds: 60),
+          onTimeout: () => throw TimeoutException('刷新整页对照超时（1 分钟）'),
+        );
+    if (r.statusCode != 200) {
+      _addLog(
+        'http',
+        'POST /refresh_full_text_check failed status=${r.statusCode} body=${r.body}',
+        isError: true,
+      );
+      throw Exception('refresh_full_text_check failed: ${r.body}');
+    }
+    final data = jsonDecode(r.body) as Map<String, dynamic>;
+    final raw = data['updates'];
+    if (raw is! List) return [];
+    return [
+      for (final u in raw)
+        if (u is Map) Map<String, dynamic>.from(u.cast<String, dynamic>()),
+    ];
+  }
+
+  /// 整页直读（/read_page_text）：引擎自己分行读字（PaddleOCR det+rec
+  /// 全管线 / Kraken blla 分行 + rpred），返回按阅读序拼接的整页文本
+  /// ——不走主区/段落/单行/单字标注管线，供「文本」视图快速通读与
+  /// AI 校对。返回 {text, lines, engine, ocr, elapsed_s}。
+  static Future<Map<String, dynamic>> readPageText({
+    required String imagePath,
+    required ProjectSettings settings,
+  }) async {
+    _addLog(
+      'http',
+      'POST /read_page_text image_path=$imagePath '
+          'orientation=${settings.orientation} engine=${settings.engine}',
+    );
+    final r = await _post(
+          Uri.parse('$_base/read_page_text'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'image_path': imagePath,
+            'orientation': settings.orientation,
+            'horizontal_dir': settings.horizontalDir,
+            'vertical_dir': settings.verticalDir,
+            'engine': settings.engine,
+            if (settings.engine == 'paddle')
+              'paddle_model': settings.paddleModel,
+            // VL 解析配置（官网演示同款开关；后端对非 VL 模型忽略）。
+            if (settings.engine == 'paddle' &&
+                settings.paddleModel.startsWith('PaddleOCR-VL'))
+              'vl_config': settings.vlConfig,
+            // VL predict 级参数（Prompt 类型/生成参数/辅助内容；不换池）。
+            if (settings.engine == 'paddle' &&
+                settings.paddleModel.startsWith('PaddleOCR-VL'))
+              'vl_predict': settings.vlPredict,
+          }),
+        )
+        .timeout(
+          // VL 0.9B 首次推理含权重编译、且常与 kraken 池共享显存（被挤时
+          // 退 CPU 会到分钟级）——后端单请求超时已放宽到 15 分钟，客户端
+          // 必须不短于它，否则先被这里掐断报超时。
+          Duration(minutes: _isVlModel(settings) ? 15 : 10),
+          onTimeout: () {
+            throw TimeoutException(
+              '整页直读超时——首次使用会先下载模型，显存紧张时 VL 首读可达'
+              '数分钟，请稍后重试',
+            );
+          },
+        );
+    // 错误体先于 JSON 解析检查：后端未捕获异常时 uvicorn 返回纯文本
+    // "Internal Server Error"（非 JSON）——先 jsonDecode 会抛
+    // FormatException 把真实状态/响应体盖掉（实测踩坑）。
+    if (r.statusCode != 200) {
+      _addLog(
+        'http',
+        'POST /read_page_text failed status=${r.statusCode} body=${r.body}',
+        isError: true,
+      );
+      final detail = r.body.startsWith('{')
+          ? (() {
+              try {
+                return (jsonDecode(r.body) as Map)['detail']?.toString();
+              } catch (_) {
+                return null;
+              }
+            })()
+          : null;
+      throw Exception(
+        detail ??
+            (r.body.trim().isEmpty
+                ? '整页直读失败（HTTP ${r.statusCode}）'
+                : '整页直读失败（HTTP ${r.statusCode}）：${r.body.trim()}'),
+      );
+    }
+    final decoded = jsonDecode(r.body);
+    final data = Map<String, dynamic>.from(decoded as Map);
+    _addLog(
+      'http',
+      'POST /read_page_text ok engine=${data['engine']} '
+          'lines=${(data['lines'] as List?)?.length ?? 0} '
+          'chars=${(data['text'] as String?)?.length ?? 0} '
+          'in ${data['elapsed_s']}s',
+    );
+    return data;
+  }
+
   /// 下载/校验 PaddleOCR 指定识别模型（/paddle/download，设置页逐档下载
   /// 按钮）：一次性临时进程加载该模型（首载自动从官方源下载），完成后
   /// 进程即关，不影响正在使用的进程池。缺档时含下载（视网速数分钟），
@@ -1948,6 +2091,10 @@ class PythonService {
             'engine': settings.engine,
             if (settings.engine == 'paddle')
               'paddle_model': settings.paddleModel,
+            // 行的版面类型（det 定行的页眉/页脚/页码标签）：重识别回包
+            // 沿用——行类型是页级识别成果，重识别只换文字不该丢。
+            if (lineStub.regionLabel.isNotEmpty)
+              'region_label': lineStub.regionLabel,
             if (charBoxes != null && charBoxes.isNotEmpty) ...{
               'char_boxes': [
                 for (final b in charBoxes)

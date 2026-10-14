@@ -57,7 +57,8 @@ if /i "%PADDLE_PADDLE%"=="cpu" (
 )
 
 echo [paddle-install] Installing paddleocr ^(^>=3.7, ships PP-OCRv6 models^)...
-call "%CONDA_CMD%" run -n %ENV_NAME% python -m pip install "paddleocr>=3.7" %PIP_OPTIONS%
+rem paddlex[ocr] extra: PaddleOCR-VL (vision-language model) pipeline deps
+call "%CONDA_CMD%" run -n %ENV_NAME% python -m pip install "paddleocr>=3.7" "paddlex[ocr]>=3.7" %PIP_OPTIONS%
 if errorlevel 1 goto failed
 
 echo [paddle-install] Verifying paddleocr...

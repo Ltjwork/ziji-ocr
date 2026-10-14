@@ -17,6 +17,8 @@ paddle_recognize_char）。
 """
 from __future__ import annotations
 
+import json
+import os
 import time
 
 import kraken_bridge
@@ -81,7 +83,9 @@ class PaddleEngineAdapter:
     paddle_proc.ensure_pool(model) 按模型懒建/重建。"""
 
     def __init__(self, model: str | None = None):
-        self.model = paddle_proc.normalize_model(model)
+        # 行/字识别适配器统一走 line_model：VL 选择在此回退 small
+        # （VL 仅整页直读；read_page_text 不经适配器、仍用 VL）。
+        self.model = paddle_proc.line_model(model)
         self.name = "paddle"
         self.ocr_tag = f"paddle+{self.model}"
         self.char_source = self.ocr_tag
@@ -90,6 +94,30 @@ class PaddleEngineAdapter:
         self.vertical_line_read = False  # 竖排无域：序列由字框拼条补读
         self.strip_read = True
         self.skip_note = "PP-OCR 无竖排域"
+
+    def read_line_full(
+        self,
+        image_path: str,
+        rect: dict,
+        orientation: str = "vertical",
+        horizontal_dir: str = "rtl",
+        vertical_dir: str = "ttb",
+    ) -> dict:
+        """整行全文直读（全文对照用）：行框裁图整体识别，不经字框切分
+        ——标点等无框字符也会被读出。竖排旋转进 PP-OCR 横排域（v5/v6
+        原生支持，rotate 90/270 对应 ttb/btt 列首方向）。池未就绪时抛错
+        （对照是增强路，绝不懒起池）。"""
+        if paddle_proc.pool_size() <= 0:
+            raise RuntimeError("paddle 池未就绪，跳过全文对照")
+        rotate = 0
+        if orientation != "horizontal":
+            rotate = 270 if vertical_dir == "btt" else 90
+        pool = paddle_proc.ensure_pool(self.model)
+        return pool.request(
+            "read_line",
+            {"image_path": image_path, "rect": rect, "rotate": rotate},
+            timeout=paddle_proc.read_timeout(),
+        )
 
     def pool_size(self) -> int:
         return paddle_proc.pool_size()
@@ -203,6 +231,133 @@ class PaddleEngineAdapter:
         return _synthesize_seq_chars(rect, text, conf, orientation)
 
 
+def detect_page_lines(
+    image_path: str,
+    model: str | None = None,
+) -> list[tuple[int, int, int, int]]:
+    """PP-OCR det 行检测（engine=paddle 的行框来源，官网演示同款检测）。
+
+    自训 YOLO 字框分组在部分影印本上碎片/粘连/漏检严重（整列漏检、句号
+    成独立行、夹注并进正文）；PP-OCR det 对同一页面行框准确。池跟随行
+    识别档位（line_model：VL 选择回退 small）。OCR_PADDLE_DET_LINES=0
+    可整体停用（回退 YOLO 行框）。返回未排序 (x,y,w,h) 列表；空列表/
+    异常由调用方回退 YOLO 链路。"""
+    if os.environ.get("OCR_PADDLE_DET_LINES", "1").strip() == "0":
+        return []
+    adapter_model = paddle_proc.line_model(model)
+    result = paddle_proc.ensure_pool(adapter_model).request(
+        "detect_lines",
+        {"image_path": image_path},
+        timeout=paddle_proc.read_timeout(),
+    )
+    return [
+        (int(l["x"]), int(l["y"]), int(l["w"]), int(l["h"]))
+        for l in result.get("lines", [])
+        if isinstance(l, dict)
+    ]
+
+
+# ── 整页直读参照（全文对照的页级参照源）──────────────────────────────
+# 单字识别与整页直读（文本视图）对不上是常态（切字框漏标点、逐字读法
+# 误读）——对照参照改用整页直读的行文本：与用户在文本视图所见同一份
+# （VL 选择时带标点），标注行按行框 IoU 对齐取文本。参照读文本视图
+# 直读时落盘的行记录（direct_text/<pageId>.meta.json 的 line_records，
+# 零额外推理）；不做后端自动页读——VL 冷读在显存被挤时可达分钟级，
+# 进识别请求会拖垮整体耗时（实测 300s/900s 预算都被超时掐断），参照
+# 缺位时全文对照自动回退逐行直读（read_line_full）。
+def _sidecar_page_lines(image_path: str) -> list | None:
+    """direct_text 侧车 → 行记录 [{x,y,w,h,text}]（页面图同目录的
+    direct_text/<stem>.meta.json）。缺文件/坏 JSON/无记录返回 None。"""
+    folder = os.path.dirname(image_path) or "."
+    stem = os.path.splitext(os.path.basename(image_path))[0]
+    meta_path = os.path.join(folder, "direct_text", f"{stem}.meta.json")
+    try:
+        with open(meta_path, encoding="utf-8") as fh:
+            meta = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    records = meta.get("line_records") if isinstance(meta, dict) else None
+    lines: list = []
+    if isinstance(records, list):
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            try:
+                x, y = int(rec.get("x", 0)), int(rec.get("y", 0))
+                w, h = int(rec.get("w", 0)), int(rec.get("h", 0))
+            except (TypeError, ValueError):
+                continue
+            if w <= 0 or h <= 0:
+                continue
+            lines.append(
+                {"x": x, "y": y, "w": w, "h": h, "text": str(rec.get("text") or "")}
+            )
+    return lines or None
+
+
+def attach_page_text_ref(adapter, image_path: str) -> None:
+    """给适配器挂整页直读行参照（adapter.page_text_lines，无值则全文
+    对照自动回退逐行直读）。增强路：读取失败静默跳过。"""
+    if os.environ.get("FULL_TEXT_CHECK", "1") == "0":
+        return
+    try:
+        lines = _sidecar_page_lines(image_path)
+    except Exception as exc:
+        log(f"[page-ref] 整页参照读取失败（回退逐行直读）: {exc}")
+        return
+    if not lines:
+        return
+    adapter.page_text_lines = lines
+    log(f"[page-ref] 整页参照就绪: 侧车 {len(lines)} 行")
+
+
+def read_page_text(
+    image_path: str,
+    orientation: str,
+    horizontal_dir: str,
+    vertical_dir: str = "ttb",
+    model: str | None = None,
+    vl_config: dict | None = None,
+    vl_predict: dict | None = None,
+) -> dict:
+    """整页直读（PaddleOCR det+rec 全管线），不走标注切分管线。
+
+    PP-OCRv5 起检测+识别原生支持竖排文本，页面无需旋转；worker 返回未
+    排序行列表，阅读序由 page_text 按方向参数重排后拼接。vl_config 是
+    VL 模型的解析配置（池绑定开关，书级设置）；vl_predict 是 predict
+    级参数（Prompt 类型/生成参数/辅助内容忽略清单，随每次请求），非
+    VL 模型两者都忽略。"""
+    from page_text import lines_to_page_text
+
+    adapter_model = paddle_proc.normalize_model(model)
+    pool = paddle_proc.ensure_pool(adapter_model, vl_config=vl_config)
+    payload: dict = {
+        "image_path": image_path,
+        # 方向参数给 VL 混合合并做段落切片的阅读序（版面分析开启时 VL
+        # 块是整段段落，需按阅读序切回行；旧 worker 忽略该字段）。
+        "orientation": orientation,
+        "horizontal_dir": horizontal_dir,
+        "vertical_dir": vertical_dir,
+    }
+    if vl_predict:
+        payload["vl_predict"] = vl_predict
+    result = pool.request(
+        "read_page",
+        payload,
+        timeout=paddle_proc.read_timeout(),
+    )
+    lines = result.get("lines", [])
+    text, ordered = lines_to_page_text(
+        lines, orientation, horizontal_dir, vertical_dir
+    )
+    return {
+        "text": text,
+        "lines": ordered,
+        "engine": "paddle",
+        "ocr": f"paddle+{adapter_model}",
+    }
+
+
 def apply_paddle_recognition(
     result: dict,
     image_path: str,
@@ -210,15 +365,19 @@ def apply_paddle_recognition(
     horizontal_dir: str,
     char_splitter=None,
     model: str | None = None,
+    vertical_dir: str = "ttb",
 ) -> dict:
     """/segment 结果后处理（PaddleOCR）：复用 apply_recognition 引擎无关核心。"""
+    adapter = PaddleEngineAdapter(model)
+    attach_page_text_ref(adapter, image_path)
     return kraken_bridge.apply_recognition(
         result,
         image_path,
         orientation,
         horizontal_dir,
         char_splitter,
-        adapter=PaddleEngineAdapter(model),
+        adapter=adapter,
+        vertical_dir=vertical_dir,
     )
 
 
@@ -237,7 +396,12 @@ def paddle_segment_rect(
     expand: bool = True,
     model: str | None = None,
 ) -> list[dict]:
-    """行框级识别入口（kraken_segment_rect 的 paddle 版，参数同构）。"""
+    """行框级识别入口（kraken_segment_rect 的 paddle 版，参数同构）。
+
+    整页参照读文本视图直读的侧车行记录：单行重识别与整页识别用同一
+    份参照，对照标记口径一致。"""
+    adapter = PaddleEngineAdapter(model)
+    attach_page_text_ref(adapter, image_path)
     return kraken_bridge.kraken_segment_rect(
         image_path,
         rect,
@@ -251,7 +415,7 @@ def paddle_segment_rect(
         strict_char_boxes=strict_char_boxes,
         expected_char_count=expected_char_count,
         expand=expand,
-        adapter=PaddleEngineAdapter(model),
+        adapter=adapter,
     )
 
 

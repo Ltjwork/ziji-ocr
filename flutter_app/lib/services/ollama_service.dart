@@ -358,6 +358,8 @@ class OllamaSettings {
       'PP-OCRv6_tiny_rec',
       'PP-OCRv6_small_rec',
       'PP-OCRv6_medium_rec',
+      'PP-OCRv3_mobile_rec',
+      'PaddleOCR-VL-1.6',
     };
     final v = (value ?? '').trim();
     return known.contains(v) ? v : 'PP-OCRv6_small_rec';
@@ -1264,6 +1266,105 @@ class OllamaService {
     );
     trace?.elapsedMs = sw.elapsedMilliseconds;
     return _parseLineAnalysis(content);
+  }
+
+  /// 整页直读文本的 AI 校对（「文本」视图）：以页图（视觉模型时）+
+  /// OCR 全文为输入，让模型按原行结构逐行校对误识/断句，返回校对后
+  /// 文本。与 analyzeLine 同一条请求通道（限流/追踪/400 去图重试）。
+  static Future<String> proofreadPageText({
+    required OllamaSettings settings,
+    required String pageText,
+    String? pageImageBase64,
+    required String orientation,
+    String horizontalDir = 'ltr',
+    String verticalDir = 'ttb',
+    bool wantThinking = false,
+    OllamaTrace? trace,
+    bool interactive = true,
+  }) async {
+    final model = settings.activeVisionModel.isNotEmpty
+        ? settings.activeVisionModel
+        : settings.activeTextModel;
+    if (model.isEmpty) {
+      throw OllamaException('未选择文本/视觉模型——请在「AI 辅助设置」中选择');
+    }
+    final horizontal = orientation == 'horizontal';
+    final buf = StringBuffer()
+      ..write('你是古籍 OCR 校对器。这是一页${horizontal ? '横排' : '竖排'}古籍的'
+          '整页 OCR 文本（按阅读序、每行一段）。\n')
+      ..write('阅读方向：')
+      ..write(horizontal
+          ? (horizontalDir == 'rtl' ? '从右到左' : '从左到右')
+          : '列${horizontalDir == 'rtl' ? '从右到左' : '从左到右'}、'
+              '${verticalDir == 'btt' ? '从下到上' : '从上到下'}。\n');
+    if (pageImageBase64 != null && pageImageBase64.isNotEmpty) {
+      buf.write('随消息发送 1 张图片：整页原图（无任何标注）。\n');
+    }
+    buf
+      ..write('\n【OCR 全文，每行一段】：\n')
+      ..write(pageText)
+      ..write('\n\n请校对：以图像字形为准（未附图时按文意），改正明显的'
+          '误识字与断句/标点错误；异体字、繁体写法保持原样，没有把握的'
+          '地方一律保留 OCR 原字，不要增删行、不要补充内容。')
+      ..write('古籍影印本的标点多为印在字旁的小号符号，OCR 整行识别时'
+          '常整页丢失——若 OCR 文本整行/整页几乎没有标点，请按文意用'
+          '标准中文标点（，。、；：「」）为全文断句补全；原文已有的'
+          '标点保持原样，不要在同一位置堆叠或改写。')
+      ..write('输出行数必须与输入一致（每行对应）。\n')
+      ..write('只输出 JSON，不要输出其他任何内容，格式：'
+          '{"text":"校对后的整页文本，每行一段"}。');
+    final prompt = buf.toString();
+    final images = (pageImageBase64 != null && pageImageBase64.isNotEmpty)
+        ? [pageImageBase64]
+        : const <String>[];
+    trace
+      ?..model = model
+      ..prompt = prompt
+      ..images = images
+      ..imageBase64 = images.isEmpty ? null : images.first;
+    final chars = pageText.length;
+    final content = await _chat(
+      settings: settings,
+      model: model,
+      prompt: prompt,
+      images: images,
+      // 整页文本可达数千字：按 2 token/字预算并钳在 8192。
+      numPredict: math.min(8192, math.max(2048, chars * 2)),
+      jsonFormat: true,
+      wantThinking: wantThinking,
+      trace: trace,
+      interactive: interactive,
+      // 整页（视觉）校对远慢于单行：放宽到 10 分钟。
+      timeout: const Duration(minutes: 10),
+    );
+    return _parseProofreadText(content);
+  }
+
+  /// 解析 proofreadPageText 的 JSON 输出；解析失败时把原文原样返回
+  /// （校对失败不该丢掉 OCR 文本）。
+  static String _parseProofreadText(String content) {
+    try {
+      final decoded = jsonDecode(content);
+      if (decoded is Map && decoded['text'] is String) {
+        final text = decoded['text'] as String;
+        if (text.trim().isNotEmpty) return text;
+      }
+    } catch (_) {}
+    // 模型偶尔在 JSON 外包一层 ```json 围栏：剥掉再试一次。
+    final stripped = content.trim();
+    if (stripped.startsWith('```')) {
+      final inner = stripped
+          .replaceFirst(RegExp(r'^```[a-zA-Z]*\s*'), '')
+          .replaceFirst(RegExp(r'\s*```$'), '');
+      try {
+        final decoded = jsonDecode(inner);
+        if (decoded is Map && decoded['text'] is String) {
+          final text = decoded['text'] as String;
+          if (text.trim().isNotEmpty) return text;
+        }
+      } catch (_) {}
+    }
+    throw OllamaException('AI 校对输出无法解析（未得到 {"text": ...}）');
   }
 
   /// 整行三步分析 prompt（analyzeLine 与压测探针共用同一口径——抽出来

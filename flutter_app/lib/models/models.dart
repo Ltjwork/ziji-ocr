@@ -46,6 +46,34 @@ class ProjectSettings {
   String engine; // 识别引擎：'kraken'（默认）| 'paddle'（PaddleOCR）
   String paddleModel; // paddle 引擎的识别模型（PP-OCRv6_*_rec），kraken 时忽略
 
+  // PaddleOCR-VL 解析配置（官网演示同款开关，仅 engine=paddle 且模型为
+  // VL 时用于整页直读；书级设置，池按模型+配置绑定）。默认值 = 历史行为。
+  bool vlUseDocOrientation; // 文档方向分类
+  bool vlUseDocUnwarping; // 文档矫正
+  bool vlUseLayoutDetection; // 版面检测（开=按版面块输出；古籍竖排推荐关）
+  bool vlUseChartRecognition; // 图表识别
+  bool vlUseSealRecognition; // 印章识别
+  bool vlUseOcrForImageBlock; // 图片块 OCR
+  bool vlMergeLayoutBlocks; // 合并版面块
+
+  // ── VL predict 级参数（随每次直读请求传入，不换池；官网演示同款）──
+  /// Prompt 类型：ocr 文本 | formula 公式 | table 表格 | chart 图表 |
+  /// seal 印章 | spotting 文本检测与识别（逐行点读）。仅无版面模式生效。
+  String vlPromptLabel;
+  double? vlRepetitionPenalty; // 重复抑制强度（默认 1.0）
+  double? vlTemperature; // 识别稳定性（默认 0.0）
+  double? vlTopP; // 结果可信范围（默认 1.0）
+  int? vlMinPixels; // 图像最小总像素数
+  int? vlMaxPixels; // 图像最大总像素数
+  // 辅助内容解析：默认忽略（false）＝模型自动过滤；开启＝恢复解析。
+  bool vlParseHeader; // 页眉
+  bool vlParseHeaderImage; // 页眉图片
+  bool vlParseFooter; // 页脚
+  bool vlParseFooterImage; // 页脚图片
+  bool vlParsePageNumber; // 页码
+  bool vlParseFootnote; // 脚注
+  bool vlParseAsideText; // 旁注文本
+
   ProjectSettings({
     this.layoutMode = 'all_text',
     this.orientation = 'vertical',
@@ -53,7 +81,68 @@ class ProjectSettings {
     this.verticalDir = 'ttb',
     this.engine = 'kraken',
     this.paddleModel = 'PP-OCRv6_small_rec',
+    this.vlUseDocOrientation = false,
+    this.vlUseDocUnwarping = false,
+    this.vlUseLayoutDetection = false,
+    this.vlUseChartRecognition = false,
+    this.vlUseSealRecognition = false,
+    this.vlUseOcrForImageBlock = false,
+    this.vlMergeLayoutBlocks = true,
+    this.vlPromptLabel = 'ocr',
+    this.vlRepetitionPenalty,
+    this.vlTemperature,
+    this.vlTopP,
+    this.vlMinPixels,
+    this.vlMaxPixels,
+    this.vlParseHeader = false,
+    this.vlParseHeaderImage = false,
+    this.vlParseFooter = false,
+    this.vlParseFooterImage = false,
+    this.vlParsePageNumber = false,
+    this.vlParseFootnote = false,
+    this.vlParseAsideText = false,
   });
+
+  /// VL 解析配置的请求体（/read_page_text 的 vl_config 字段）。
+  /// VL predict 级参数的请求体（/read_page_text 的 vl_predict 字段）。
+  /// 辅助内容 7 开关 → markdown_ignore_labels 忽略清单（开启=移出清单）。
+  Map<String, dynamic> get vlPredict => {
+    if (vlPromptLabel != 'ocr') 'prompt_label': vlPromptLabel,
+    if (vlRepetitionPenalty != null)
+      'repetition_penalty': vlRepetitionPenalty,
+    if (vlTemperature != null) 'temperature': vlTemperature,
+    if (vlTopP != null) 'top_p': vlTopP,
+    if (vlMinPixels != null) 'min_pixels': vlMinPixels,
+    if (vlMaxPixels != null) 'max_pixels': vlMaxPixels,
+    // 辅助内容默认全关 = 模型默认忽略清单，不传键；任一开启传"仍忽略"
+    // 子集（全开 = 空清单，即全部恢复解析——worker 端空清单有效）。
+    if (vlParseHeader ||
+        vlParseHeaderImage ||
+        vlParseFooter ||
+        vlParseFooterImage ||
+        vlParsePageNumber ||
+        vlParseFootnote ||
+        vlParseAsideText)
+      'markdown_ignore_labels': [
+        if (!vlParsePageNumber) 'number',
+        if (!vlParseFootnote) 'footnote',
+        if (!vlParseHeader) 'header',
+        if (!vlParseHeaderImage) 'header_image',
+        if (!vlParseFooter) 'footer',
+        if (!vlParseFooterImage) 'footer_image',
+        if (!vlParseAsideText) 'aside_text',
+      ],
+  };
+
+  Map<String, dynamic> get vlConfig => {
+    'use_doc_orientation_classify': vlUseDocOrientation,
+    'use_doc_unwarping': vlUseDocUnwarping,
+    'use_layout_detection': vlUseLayoutDetection,
+    'use_chart_recognition': vlUseChartRecognition,
+    'use_seal_recognition': vlUseSealRecognition,
+    'use_ocr_for_image_block': vlUseOcrForImageBlock,
+    'merge_layout_blocks': vlMergeLayoutBlocks,
+  };
 
   factory ProjectSettings.fromJson(Map<String, dynamic>? j) {
     if (j == null) {
@@ -69,7 +158,34 @@ class ProjectSettings {
       verticalDir: j['vertical_dir'] as String? ?? 'ttb',
       engine: engine,
       paddleModel: j['paddle_model'] as String? ?? 'PP-OCRv6_small_rec',
+      vlUseDocOrientation: j['vl_use_doc_orientation_classify'] == true,
+      vlUseDocUnwarping: j['vl_use_doc_unwarping'] == true,
+      vlUseLayoutDetection: j['vl_use_layout_detection'] == true,
+      vlUseChartRecognition: j['vl_use_chart_recognition'] == true,
+      vlUseSealRecognition: j['vl_use_seal_recognition'] == true,
+      vlUseOcrForImageBlock: j['vl_use_ocr_for_image_block'] == true,
+      vlMergeLayoutBlocks: j['vl_merge_layout_blocks'] != false,
+      vlPromptLabel: _normalizeVlPromptLabel(j['vl_prompt_label'] as String?),
+      vlRepetitionPenalty: (j['vl_repetition_penalty'] as num?)?.toDouble(),
+      vlTemperature: (j['vl_temperature'] as num?)?.toDouble(),
+      vlTopP: (j['vl_top_p'] as num?)?.toDouble(),
+      vlMinPixels: (j['vl_min_pixels'] as num?)?.toInt(),
+      vlMaxPixels: (j['vl_max_pixels'] as num?)?.toInt(),
+      vlParseHeader: j['vl_parse_header'] == true,
+      vlParseHeaderImage: j['vl_parse_header_image'] == true,
+      vlParseFooter: j['vl_parse_footer'] == true,
+      vlParseFooterImage: j['vl_parse_footer_image'] == true,
+      vlParsePageNumber: j['vl_parse_page_number'] == true,
+      vlParseFootnote: j['vl_parse_footnote'] == true,
+      vlParseAsideText: j['vl_parse_aside_text'] == true,
     );
+  }
+
+  /// VL Prompt 类型归一：非法值回落 ocr（与后端白名单同口径）。
+  static String _normalizeVlPromptLabel(String? value) {
+    const known = {'ocr', 'formula', 'table', 'chart', 'seal', 'spotting'};
+    final v = (value ?? '').trim().toLowerCase();
+    return known.contains(v) ? v : 'ocr';
   }
 
   Map<String, dynamic> toJson() => {
@@ -79,6 +195,26 @@ class ProjectSettings {
     'vertical_dir': verticalDir,
     'engine': engine,
     'paddle_model': paddleModel,
+    if (vlUseDocOrientation) 'vl_use_doc_orientation_classify': true,
+    if (vlUseDocUnwarping) 'vl_use_doc_unwarping': true,
+    if (vlUseLayoutDetection) 'vl_use_layout_detection': true,
+    if (vlUseChartRecognition) 'vl_use_chart_recognition': true,
+    if (vlUseSealRecognition) 'vl_use_seal_recognition': true,
+    if (vlUseOcrForImageBlock) 'vl_use_ocr_for_image_block': true,
+    if (!vlMergeLayoutBlocks) 'vl_merge_layout_blocks': false,
+    if (vlPromptLabel != 'ocr') 'vl_prompt_label': vlPromptLabel,
+    if (vlRepetitionPenalty != null) 'vl_repetition_penalty': vlRepetitionPenalty,
+    if (vlTemperature != null) 'vl_temperature': vlTemperature,
+    if (vlTopP != null) 'vl_top_p': vlTopP,
+    if (vlMinPixels != null) 'vl_min_pixels': vlMinPixels,
+    if (vlMaxPixels != null) 'vl_max_pixels': vlMaxPixels,
+    if (vlParseHeader) 'vl_parse_header': true,
+    if (vlParseHeaderImage) 'vl_parse_header_image': true,
+    if (vlParseFooter) 'vl_parse_footer': true,
+    if (vlParseFooterImage) 'vl_parse_footer_image': true,
+    if (vlParsePageNumber) 'vl_parse_page_number': true,
+    if (vlParseFootnote) 'vl_parse_footnote': true,
+    if (vlParseAsideText) 'vl_parse_aside_text': true,
   };
 
   ProjectSettings copyWith({
@@ -88,6 +224,26 @@ class ProjectSettings {
     String? verticalDir,
     String? engine,
     String? paddleModel,
+    bool? vlUseDocOrientation,
+    bool? vlUseDocUnwarping,
+    bool? vlUseLayoutDetection,
+    bool? vlUseChartRecognition,
+    bool? vlUseSealRecognition,
+    bool? vlUseOcrForImageBlock,
+    bool? vlMergeLayoutBlocks,
+    String? vlPromptLabel,
+    double? vlRepetitionPenalty,
+    double? vlTemperature,
+    double? vlTopP,
+    int? vlMinPixels,
+    int? vlMaxPixels,
+    bool? vlParseHeader,
+    bool? vlParseHeaderImage,
+    bool? vlParseFooter,
+    bool? vlParseFooterImage,
+    bool? vlParsePageNumber,
+    bool? vlParseFootnote,
+    bool? vlParseAsideText,
   }) => ProjectSettings(
     layoutMode: layoutMode ?? this.layoutMode,
     orientation: orientation ?? this.orientation,
@@ -95,6 +251,26 @@ class ProjectSettings {
     verticalDir: verticalDir ?? this.verticalDir,
     engine: engine ?? this.engine,
     paddleModel: paddleModel ?? this.paddleModel,
+    vlUseDocOrientation: vlUseDocOrientation ?? this.vlUseDocOrientation,
+    vlUseDocUnwarping: vlUseDocUnwarping ?? this.vlUseDocUnwarping,
+    vlUseLayoutDetection: vlUseLayoutDetection ?? this.vlUseLayoutDetection,
+    vlUseChartRecognition: vlUseChartRecognition ?? this.vlUseChartRecognition,
+    vlUseSealRecognition: vlUseSealRecognition ?? this.vlUseSealRecognition,
+    vlUseOcrForImageBlock: vlUseOcrForImageBlock ?? this.vlUseOcrForImageBlock,
+    vlMergeLayoutBlocks: vlMergeLayoutBlocks ?? this.vlMergeLayoutBlocks,
+    vlPromptLabel: vlPromptLabel ?? this.vlPromptLabel,
+    vlRepetitionPenalty: vlRepetitionPenalty ?? this.vlRepetitionPenalty,
+    vlTemperature: vlTemperature ?? this.vlTemperature,
+    vlTopP: vlTopP ?? this.vlTopP,
+    vlMinPixels: vlMinPixels ?? this.vlMinPixels,
+    vlMaxPixels: vlMaxPixels ?? this.vlMaxPixels,
+    vlParseHeader: vlParseHeader ?? this.vlParseHeader,
+    vlParseHeaderImage: vlParseHeaderImage ?? this.vlParseHeaderImage,
+    vlParseFooter: vlParseFooter ?? this.vlParseFooter,
+    vlParseFooterImage: vlParseFooterImage ?? this.vlParseFooterImage,
+    vlParsePageNumber: vlParsePageNumber ?? this.vlParsePageNumber,
+    vlParseFootnote: vlParseFootnote ?? this.vlParseFootnote,
+    vlParseAsideText: vlParseAsideText ?? this.vlParseAsideText,
   );
 }
 
@@ -226,6 +402,10 @@ class CharBlock implements _RectBox {
   /// （status）——标记/取消标记不改变确认与训练数据口径。
   bool marked;
 
+  /// 全文对照（默认识别流程附加路）：整行全文直读与本字不一致时为
+  /// true（客户端以特殊颜色标记）；null = 旧数据/未对照。
+  bool? fullDiff;
+
   CharBlock({
     required this.id,
     required this.x,
@@ -255,6 +435,7 @@ class CharBlock implements _RectBox {
     this.aiBoxIssue,
     this.aiBoxNote,
     this.marked = false,
+    this.fullDiff,
   }) : candidates = candidates ?? [];
 
   factory CharBlock.fromJson(Map<String, dynamic> j) => CharBlock(
@@ -296,6 +477,7 @@ class CharBlock implements _RectBox {
     aiBoxIssue: j['ai_box_issue'] as String?,
     aiBoxNote: j['ai_box_note'] as String?,
     marked: j['marked'] == true,
+    fullDiff: j['full_diff'] == true,
   );
 
   Map<String, dynamic> toJson() => {
@@ -329,6 +511,7 @@ class CharBlock implements _RectBox {
     if (aiBoxIssue != null && aiBoxIssue!.isNotEmpty) 'ai_box_issue': aiBoxIssue,
     if (aiBoxNote != null && aiBoxNote!.isNotEmpty) 'ai_box_note': aiBoxNote,
     if (marked) 'marked': true,
+    if (fullDiff == true) 'full_diff': true,
   };
 
   CharBlock copyWith({
@@ -421,6 +604,17 @@ class LineBlock implements _RectBox {
   String parentLineId;
   double layoutConfidence;
 
+  /// 行的版面类型（det 定行打的 region_label：header/footer/page_number/
+  /// margin_note；空 = 正文行）。与 RegionLabel 词表同源——行视图按类型
+  /// 配色画框，页眉/页脚/页码不再混作正文行。
+  String regionLabel;
+
+  /// 全文对照（默认识别流程附加路）：整行全文直读的文本，与单字识别
+  /// 序列对齐后——全文多出的字符（标点等无框字符）存 fullExtras，
+  /// 不一致的单字各自标 fullDiff。null/空 = 旧数据或未对照。
+  String? fullText;
+  List<String> fullExtras;
+
   LineBlock({
     required this.id,
     required this.x,
@@ -441,7 +635,11 @@ class LineBlock implements _RectBox {
     this.columnGroup = '',
     this.parentLineId = '',
     this.layoutConfidence = 0,
-  }) : chars = chars ?? [];
+    this.regionLabel = '',
+    this.fullText,
+    List<String>? fullExtras,
+  })  : fullExtras = fullExtras ?? [],
+        chars = chars ?? [];
 
   factory LineBlock.fromJson(Map<String, dynamic> j) {
     final rawChars = (j['chars'] as List?) ?? const [];
@@ -467,6 +665,11 @@ class LineBlock implements _RectBox {
       columnGroup: j['column_group'] as String? ?? '',
       parentLineId: j['parent_line_id'] as String? ?? '',
       layoutConfidence: (j['layout_confidence'] as num?)?.toDouble() ?? 0,
+      regionLabel: j['region_label'] as String? ?? '',
+      fullText: j['full_text'] as String?,
+      fullExtras: (j['full_extras'] as List?)
+          ?.map((e) => e.toString())
+          .toList(),
     );
     for (final c in rawChars) {
       final block = CharBlock.fromJson(c as Map<String, dynamic>);
@@ -496,6 +699,9 @@ class LineBlock implements _RectBox {
     if (columnGroup.isNotEmpty) 'column_group': columnGroup,
     if (parentLineId.isNotEmpty) 'parent_line_id': parentLineId,
     if (layoutConfidence > 0) 'layout_confidence': layoutConfidence,
+    if (regionLabel.isNotEmpty) 'region_label': regionLabel,
+    if (fullText != null && fullText!.isNotEmpty) 'full_text': fullText,
+    if (fullExtras.isNotEmpty) 'full_extras': fullExtras,
   };
 
   Rect get rect =>
@@ -619,7 +825,12 @@ class MainRegion implements _RectBox {
       Rect.fromLTWH(x.toDouble(), y.toDouble(), w.toDouble(), h.toDouble());
 
   factory MainRegion.fromJson(Map<String, dynamic> j) => MainRegion(
-    id: j['id'] as String,
+    // id 缺失防御：旧后端的门控区回显不带 id（GateRegion 曾忽略 id
+    // 字段）——按坐标生成确定性回退 id，而不是抛 type cast（实测
+    // "重新识别当前页"type 'Null' 错误的根因）。
+    id: (j['id'] as String?)?.isNotEmpty == true
+        ? j['id'] as String
+        : 'mr_gate_${j['x']}_${j['y']}',
     x: j['x'] as int,
     y: j['y'] as int,
     w: j['w'] as int,
@@ -680,14 +891,22 @@ class Paragraph implements _RectBox {
       Rect.fromLTWH(x.toDouble(), y.toDouble(), w.toDouble(), h.toDouble());
 
   factory Paragraph.fromJson(Map<String, dynamic> j) => Paragraph(
-    id: j['id'] as String,
+    id: (j['id'] as String?)?.isNotEmpty == true
+        ? j['id'] as String
+        : 'mp_gate_${j['x']}_${j['y']}',
     x: j['x'] as int,
     y: j['y'] as int,
     w: j['w'] as int,
     h: j['h'] as int,
     mainRegionId: j['main_region_id'] as String? ?? '',
     lineIds:
-        (j['line_ids'] as List?)?.map((e) => e as String).toList() ??
+        // 元素级 null 防御：后端数组里的 null 会让 `e as String` 抛
+        // "type 'Null' is not a subtype of type 'String'"（识别响应的
+        // paragraphs 反哺路径），转字符串并过滤空值。
+        (j['line_ids'] as List?)
+            ?.map((e) => e?.toString() ?? '')
+            .where((e) => e.isNotEmpty)
+            .toList() ??
         // 可增长空列表（不能用 const []）：主区/段级联会 removeWhere 改写。
         <String>[],
     type: j['type'] as String? ?? 'body',

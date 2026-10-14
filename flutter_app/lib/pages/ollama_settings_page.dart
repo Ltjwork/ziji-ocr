@@ -19,6 +19,7 @@ import '../services/setup_service.dart';
 import '../services/storage.dart';
 import '../widgets/attached_scrollbar.dart';
 import '../widgets/engine_settings_section.dart';
+import 'changelog_page.dart';
 import 'ollama_compare_page.dart';
 import '../widgets/ollama_port_reclaim_panel.dart';
 
@@ -2893,7 +2894,7 @@ class _OllamaSettingsPageState extends State<OllamaSettingsPage> {
       messenger.showSnackBar(
         SnackBar(
           content: Text(
-            '${choice.label} ${cached ? '已在本机缓存，自检通过' : '下载完成'}'
+            '${choice.displayLabel} ${cached ? '已在本机缓存，自检通过' : '下载完成'}'
             '${device.isEmpty ? '' : '（$device）'}'
             '${elapsed.isEmpty ? '' : '，用时 ${elapsed}s'}',
           ),
@@ -2902,7 +2903,7 @@ class _OllamaSettingsPageState extends State<OllamaSettingsPage> {
       await _loadPaddleStatus();
     } catch (e) {
       messenger.showSnackBar(
-        SnackBar(content: Text('下载 ${choice.label} 失败：$e')),
+        SnackBar(content: Text('下载 ${choice.displayLabel} 失败：$e')),
       );
     } finally {
       if (mounted) setState(() => _paddleDownloading.remove(choice.name));
@@ -3012,7 +3013,7 @@ class _OllamaSettingsPageState extends State<OllamaSettingsPage> {
                       ? Theme.of(context).colorScheme.primary
                       : null,
                 ),
-                title: Text(choice.label),
+                title: Text(choice.displayLabel),
                 subtitle: Text(
                   choice.requirement,
                   style: const TextStyle(fontSize: 12),
@@ -3027,7 +3028,7 @@ class _OllamaSettingsPageState extends State<OllamaSettingsPage> {
               padding: EdgeInsets.only(left: 4, top: 2),
               child: Text(
                 '默认档只影响新建任务的初始选择；已建书籍用各自的设置（编辑器'
-                '里可随时改）。下载模型约 4~73MB，来自 PaddleOCR 官方源',
+                '里可随时改）。下载体积 4MB~73MB（VL 档约 1.9GB），来自 PaddleOCR 官方源',
                 style: TextStyle(fontSize: 11, color: Colors.grey),
               ),
             ),
@@ -3082,6 +3083,19 @@ class _OllamaSettingsPageState extends State<OllamaSettingsPage> {
                 fontSize: 12,
                 height: 1.6,
                 color: Colors.grey.shade700,
+              ),
+            ),
+            const SizedBox(height: 10),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: OutlinedButton.icon(
+                onPressed: () => Navigator.of(context).push(
+                  MaterialPageRoute<void>(
+                    builder: (_) => const ChangelogPage(),
+                  ),
+                ),
+                icon: const Icon(Icons.history_edu, size: 18),
+                label: const Text('更新日志（本版本更新内容，可复制 GitHub 发布说明）'),
               ),
             ),
           ],
