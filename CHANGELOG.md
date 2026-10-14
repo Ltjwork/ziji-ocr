@@ -2,195 +2,29 @@
 
 ## 1.0.0+208
 
-- **修复：看不到整页对照标记/紫色无框字片——标记只在"识别当前页"时写入标注，直读更新后不跟随**（用户实测："上一步制作的单字识别与整页识别对照功能我没看到，我也没看到紫色无框字片"；v207 标点恢复后用户重读了文本视图，但标注里的对照数据仍是直读修复前识别时写入的空/旧值）。三处：
-  **① 新端点 `/refresh_full_text_check`**：用文本视图整页直读落盘的行记录（direct_text 侧车）对**已有标注行**重算全文对照——纯 CPU（读侧车 + 行框 IoU 匹配 + 序列对齐，不跑任何模型不重识别），逐行返回 {full_text, full_extras, diff_indices}；行没匹配上/无侧车返回空值（客户端按空覆盖，清掉过期标记）；`FULL_TEXT_CHECK=0` 同样生效。引擎无关（kraken 书只要有直读侧车也能刷新）。
-  **② 客户端自动刷新**：文本面板新增 `onReadComplete` 回调（直读文本+行记录落盘后触发）→ 编辑器 `_refreshFullTextMarks`：取当前标注有字行（框+逐字文本）调①，回写 fullText/fullExtras/逐字 fullDiff 并保存，SnackBar 提示"整页对照已按最新直读刷新：N 行"；增强路静默失败（不影响直读本身）。
-  **③ python_service.refreshFullTextCheck** 服务方法（60s 超时）。
-  实弹 e2e（page_005 真实数据：侧车=用户重读后的带标点行记录，标注行=模拟无标点+错字逐字序列）：22/22 行 **14ms** 全部匹配，**72 个标点落为紫色字片数据、34 个错字精确标橙**（注入的错位 [4,9] 分毫不差）；顺带发现用户侧车已是 v207 修复后的带标点行记录（重读已生效）。测试：后端 RefreshFullTextCheckTests 4 条（extras+diff_indices/未匹配清空/无侧车/总开关），全量 **602 过**（2 存量失败与本次无关）；flutter analyze 零问题。BACKEND_BUILD v151→**v152**（fulltext-auto-refresh，Dart 握手同步）。pubspec 1.0.0+207→1.0.0+208。
-  使用：升级重启后**在文本视图对该页重新点一次整页直读**——落盘后自动刷新标注标记并提示；切回标注视图打开单行即可见紫色无框字片（整页有而单字无框的字符，多为标点）与橙色不一致标记。识别当前页重跑（20s+）不再是刷新标记的必要条件。
+本版本汇集自 1.0.0+180 以来的全部改动，按对使用的影响整理（逐项技术明细与排障过程见 git 历史：提交 eab5918 中 1.0.0+181 ~ 1.0.0+208 各条目）。
 
-## 1.0.0+207
+### 新增
 
-- **修复：整页直读（文本视图）VL 不再输出标点——"版面分析"开启后 VL 块变整段段落，逐行合并全部失配**（用户实测："在整页识别的时候 vl 模型为什么识别不出标点了，之前是可以的"）。诊断：侧车数据显示 VL 其实读出了全部标点（2 个整段块共 91 个标点），但 v204 面板暴露的"版面分析"开关被打开后，VL 的 parsing_res_list 块是**整段段落文本**（几十上百字、无逐行 \n），混合直读的合并器按"逐行文本相似度 ≥0.55"设计——整段 vs 单列（~30 字）相似度全落空 → 22 条行全部保留无标点的 PP-OCR 文本，带标点整段掉进零框兜底堆在页尾（用户所见=标点消失）。修复（worker `_vl_merge_texts` 双路径）：
-  **① 逐行匹配保留**（无版面模式的逐列输出，历史行为与测试不变）；
-  **② 段落切片新增**：逐行对不上的 leftovers 中纯文本长于 max(48, 2×行中位字数) 的按**段落**处理——未占用 PP 行按阅读序粗排（`_order_geo_reading`，竖排列序/列内按方向参数），逐行在段落纯文本里 difflib 定位（覆盖率 ≥0.55），相邻定位之间的标点归属前一行、段首残余并入首行、段尾残余并入末行——标点精确落回各行，不再产生整段零框副本；切片一行没中才走零框兜底（文本不丢）。
-  **③ 方向透传**：`/read_page_text` 请求体新增 orientation/horizontal_dir/vertical_dir → worker 段落切片阅读序（旧 worker 忽略）。
-  **用户真实失败数据回放**（page_005 侧车：22 条无标点 PP 行 + 2 条 VL 整段 374/183 字，rtl）：新合并器 22/22 行全部换上带标点 VL 文本（88 个标点落回行内）、零框副本 0、页码行保留原文——与"之前可以"时的输出一致，且此后版面分析开/关都能正确产出。
-  测试：VlParagraphMergeTests 4 条（切片标点归属/段落外行保留/不可配段落不丢/行级+段落混合）+ ReadPageTextPayloadTests 1 条（方向透传）；既有 4 条合并测试零改动通过（逐行路径行为不变）；后端全量 **598 过**（2 存量失败与本次无关）。BACKEND_BUILD v150→**v151**（vl-para-merge，Dart 握手同步）。pubspec 1.0.0+206→1.0.0+207。
-  使用：升级后**在文本视图重新点一次整页直读**即恢复带标点输出（顺带落盘带标点的 line_records，默认识别流程的整页对照参照也随之带标点）。古籍竖排仍推荐版面分析保持关闭（更快；开启现在也能正确切回行）。
+- **整页直读对照（单字 ↔ 整页）**：识别后每行自动与整页直读的文本比对——整页读出、但单字没有字框的字符（主要是标点）以**紫色无框字片**显示在识别栏末尾；单字与整页不一致的字以**橙色**标记。在文本视图重新直读后，这些标记会自动按最新文本刷新（瞬间完成，不需要重新识别整页）。
+- **PP-OCR 检测定行**：Paddle 引擎识别整页时，行框改用与 PaddleOCR 官网演示相同的文本检测模型。此前频繁出现的整列漏检、句号被框成独立一行、夹注小字并进正文等行框问题基本消除（实测整页 17 列全部准确检出、约 1 秒）；万一检测失败会自动回退旧方式，不影响识别。
+- **页眉 / 页脚 / 页码识别框**：自动识别这些内容并按类型着色标注（页眉青色、页脚蓝灰、页码绿色），不再混在正文行里；重新识别单行时类型不丢失。
+- **PaddleOCR-VL 大模型**：新增 PaddleOCR-VL-1.6（视觉语言模型，约 1.9GB，需独立显卡）和 PP-OCRv3 轻量档，可在设置页查看说明并逐档下载。VL 对古籍竖排、小号标点、复杂版式的识别明显强于普通模型（实测同一页标点 86 个 vs 3 个），用于"文本视图"的整页直读；并提供与官网一致的完整参数面板（版面分析、图表 / 印章识别、Prompt 类型、生成参数、页眉页脚页码等辅助内容解析）。
+- **文本视图改版**：左右分栏——左侧书页、右侧识别文本；每行识别的文字以彩色小字叠加在书页对应行旁，与页面文字逐字对齐，方便边看原文边校对。
+- **应用内更新日志**：设置 → 说明 → 更新日志，本版本更新了什么就地可看，可一键复制为 GitHub 发布说明。
 
-## 1.0.0+206
+### 改进
 
-- **新增：det 行版面类型框（页眉/页脚/页码）+ 全文对照参照升级为整页直读行文本**（用户需求：det 检出的页眉/页脚/页码内容应使用对应类型的识别框；单字识别与整页文本不一致处、整页有而单字无框的字符要在单字识别页面用特殊颜色标记展示）。三块：
-  **① det 行类型化**：det 定行的页眉/页脚/页码内容不再混作正文行——seg_pipeline 新增 `_type_det_lines`：行中心落在人工已确认门控区（页眉/页脚/页码/眉批）内即该类（门控区已抹像素，此为边缘残留兜底）；无区时几何判定（页顶/页底边带内的短行——25% 版高上限保证主列永不误标；页脚带内 ≤5 字的极短行判页码）。命中行带 `region_label` + `layout_role=annotation`；客户端 `LineBlock.regionLabel` 新字段（JSON 往返），行视图按区域视图同款 `RegionLabel` 配色画框（页眉青/页脚蓝灰/页码绿/眉批黄棕）并在框底标注类型名；单行重识别请求带 `region_label` 原样回盖（`_stamp_region_label`，重识别只换文字不丢类型），双列拆分子行继承。
-  **② 全文对照参照 = 文本视图整页直读的行文本**（旧参照是行框裁图逐行二次识别——PP-OCR 系对古籍标点本就盲，紫色无框字片几乎不出现；且与用户在文本视图看到的整页文本对不上）。实现为**零额外推理**：文本视图直读落盘的行记录（`direct_text/<pageId>.meta.json` 新增 `line_records`：逐行框+文本）即参照源——paddle_bridge `attach_page_text_ref` 读侧车挂到适配器，`_apply_full_text_check` 优先按行框 IoU（≥0.3，det 定行后标注行与直读行同源 PP-OCR det、天然高 IoU）匹配行文本做对照：**整页有而单行无框的字符（标点等）→ 紫色无框字片；单字与整页文本不一致 → 深橙标记**（客户端 v203 起已渲染，此前缺高质量参照数据）。侧车缺位/无记录/行未命中 → 静默回退旧逐行参照，识别不受影响。**踩坑记录（决定架构）**：首版做成后端自动页读（按本书模型现读一页），实弹两轮在 9 路 kraken 常驻挤显存的机器上 VL 冷读 300s/900s 预算双双超时、拖垮 /segment（334s/935s），回退链虽正常接管但主路径不可接受——改为读已落盘行记录后同样请求 **20.2s**（含全新后端首建 daemon+det+19 行识别），且参照与用户所见严格同一份。
-  **③ API**：`/segment_region` 追加可选 `region_label`（客户端重识别带行类型回盖）；`/segment`/`/segment_lines_in_region`/`/segment_region` 无新增必带字段。
-  实弹 e2e（page_005 隔离副本，engine=paddle + VL 书级模型）：侧车 19 行即时挂载（日志"整页参照就绪: 侧车 19 行"），19/19 行对照命中；构造带注入标点/字符的行文本后 extras 精确命中注入字符（紫色字片数据），单字序列错位处逐字标 diff（前两轮实弹 51 字）；底部页码行 `region_label=page_number`。测试：后端 test_paddle_det_lines 重写+新增共 **30 条**（类型化几何/区域归属/拒绝区、IoU 匹配、页读参照 extras+diff/未命中回退、侧车解析/缺位/坏 JSON/退化过滤/总开关、请求缺省值、region_label 回盖），全量 **593 过**（2 存量失败与本次无关；test_zjpack ed25519 出现过一次孤立偶发、单跑即过）；客户端新增 line_region_label 3 条（解析/往返/配色同源），analyze 零问题、test **603 过**（1 存量失败）。BACKEND_BUILD v149→**v150**（det-typed-pagecheck，Dart 握手同步）。pubspec 1.0.0+205→1.0.0+206。
-  注意：**要得到整页对照标记，先在文本视图对当前页做一次整页直读**（行记录随直读落盘；旧侧车无 line_records，重读一次即有）；升级后需重新执行"识别当前页"才会得到带类型与整页对照的新数据；类型化行仍保留在识别结果里（视觉与导出按批注类处理）。
+- 模型选择直接显示真实模型名，不再只有"轻量 / 小模型"这类昵称；文本视图状态栏区分"本书配置的模型"与"实际读出文本的模型"，两者不一致时会提醒。
+- AI 校对支持整页标点补全：直读文本缺标点时按文意断句补出。
+- 后台控制台日志治理：访问日志不再刷屏，识别过程与诊断日志完整可见。
 
-## 1.0.0+205
+### 修复
 
-- **新增：engine=paddle 时行框来源切换为 PP-OCR det 文本检测（官网演示同款，单行识别框质量问题治本）**（用户反馈："我在 paddle 官方网站测试同样的页面单行识别准确，文字也准确，现在软件中单行识别到的识别框就有很多问题"——截图可见整列漏检、单个句号成独立行框、列首尾框外扩、夹注小字并进正文列）。此前行框全部来自**自训 YOLO 字框分组**（碎片/粘连/漏检高发）；本次在 `/segment` 与 `/segment_lines_in_region` 两条链路上，engine=paddle 时行框改用 **PP-OCR det**（与官网演示同一检测模型）：
-  **① worker**（paddle_worker）：新增 `detect_lines` op——daemon 内懒建 `TextDetection` 单模（检测档位跟随识别档位 `PP-OCRv6_<tier>_rec → _det`，不可用退回 small；与识别模型同进程共存），返回未排序行框；实测 paddleocr 3.7 输出键 `dt_polys(N,4,2)`，解析兼容 det_boxes/rec_boxes/det_polys 多通道。
-  **② 桥接**（paddle_bridge）：`detect_page_lines`——池跟随行识别档位（VL 选择自动回退 small），`OCR_PADDLE_DET_LINES=0` 可整体停用（回退 YOLO 行框）。
-  **③ 切分管线**（seg_pipeline）：`segment_image_with_metadata` 新增 `line_detector` 注入参数——det 框→行结构（钳制界内/退化丢弃/竖排页上 w>1.3h 的横排落款行放行 horizontal），走统一阅读序重排；**det 失败/空产出静默回退既有 YOLO 链路**（det 是行框增强，不是硬依赖）；下游（逐行像素切字/识别/融合/全文对照）零改动复用。
-  **④ 扩张帽**（kraken_bridge）：行框沿阅读轴墨迹外扩的 25% 上限原本只对带 chars 的 YOLO 行生效，改为对全部竖排行生效——det 行（chars 空）同样受帽，栏线链式扩到整页的病态扩张对 det 行也挡住；kraken 链路行为不变（其竖排行恒有 chars）。
-  **⑤ 客户端**：识别信息脚注新增 `paddle-det → "PP-OCR 检测定行"`（蓝色），王朝基准页版面标签同款；无请求字段变化（服务端按 engine 自行决策）。
-  实弹 e2e（用户 page_005，6034×8534 竖排 17 列）：det 0.7s 检出 **19 行**（17 主列全部紧致 ~207×5500px + 页底横排落款自动判横 + 左缘小列），阅读序右→左正确，逐行像素切字+逐字+拼条识别 570 字框填满、首列文字与直读文本一致，整页 28.9s（含首次起 daemon+模型加载）；后端日志零异常。测试：新增 test_paddle_det_lines **15 条**（det 结果解析/行构建与方向放行/注入与回退/池请求与 kill-switch/engine 分发），后端全量 **578 过**（2 存量失败与本次无关）；flutter analyze 零问题、flutter test **600 过**（1 存量失败）。test_dynasty_bench 的明细泄露断言由裸子串改为字段级（`'"lines"'`，避免被 build 串误伤）。BACKEND_BUILD v148→**v149**（paddle-det-lines，Dart 握手同步）。pubspec 1.0.0+204→1.0.0+205。
-  注意：**升级后需对已有页面重新执行"识别当前页"**，存量标注里的旧 YOLO 行框不会被自动替换；kraken 引擎书的行框链路完全不变。
-
-## 1.0.0+204
-
-- **新增：VL 配置面板补齐官网演示同款全参数（Prompt 类型 / 生成参数 / 辅助内容解析）**（用户需求：模型设置缺少 prompt 类型等参数）。API 落点全部查证后实现——**新增参数全部是 predict 级**（随每次直读请求传入，不换池、改动即生效）：
-  **① Prompt 类型**（`prompt_label`，仅关闭版面分析时生效）：文本 ocr（默认）/ 公式 formula / 表格 table / 图表 chart / 印章 seal / **文本检测与识别 spotting（逐行点读）**——下拉选择。
-  **② 生成参数**：重复抑制强度（repetition_penalty，默认 1.0）/ 识别稳定性（temperature，默认 0.0）/ 结果可信范围（top_p，默认 1.0）/ 图像最小总像素数（min_pixels，默认 147384）/ 图像最大总像素数（max_pixels）。留空=模型默认。**实测注记**：paddlex 本地推理对前三个采样参数会告警"暂不支持、将忽略"（vllm-server 后端才生效）——面板已注明，字段保留（无害）。
-  **③ 辅助内容解析**（`markdown_ignore_labels`，7 开关）：页眉/页眉图片/页脚/页脚图片/页码/脚注/旁注文本——默认过滤（模型默认忽略全部 7 类），开启=恢复解析；客户端把开关转换为"仍忽略"清单（全开=空清单，worker 端空清单有效=全恢复）。
-  链路：客户端 `ProjectSettings` 新增 12 字段（vlPromptLabel/3 采样/2 像素/7 辅助开关，JSON 往返）+ `vlPredict` 请求体 getter → `/read_page_text.vl_predict` → worker `_vl_predict_kwargs` 白名单归一 → `pipe.predict(**kwargs)`。实弹验证参数到达 predict（日志 `VL predict params: {...}`）。**已知限制**（实测）：spotting 模式在超大整页上可能触发底层原生崩溃（进程直接退出无 Python 栈，paddlex 原生层问题）；默认 ocr 模式不受影响（混合直读的逐行能力由 PP-OCR 几何承担）。官网面板的"跨页表格合并"（多页 PDF 场景）与"段落标题级别识别"（markdown 后处理层）与单页直读无关，未接入。
-  测试：客户端 vlPredict 5 条（默认空/透传/辅助开关→忽略清单/全开空清单/JSON 往返+非法归一）；worker kwargs 3 条（白名单与类型/空清单有效/清单过滤），后端全量 **563 过**（2 存量失败）；flutter analyze 零问题、flutter test **600 过**（1 存量失败）。BACKEND_BUILD v147→**v148**（vl-predict-params，Dart 握手同步）。pubspec 1.0.0+203→1.0.0+204。
-
-## 1.0.0+203
-
-- **修复："重新识别当前页"报 type 'Null' is not a subtype of type 'String'（v202 堆栈插桩一击定位）**。堆栈指到 `MainRegion.fromJson` 的 `j['id'] as String`——完整根因链：书的标注里有**已确认的门控区**（页眉/页脚/页码）时，重识别请求携带 gate_regions（日志特征"页眉/页脚/页码门控：N 个排除类区已抹除"）；后端 `GateRegion` 模型**没有 id 字段**（旧注释"id/uid 由 pydantic 忽略，不回传"），门控区作为结果 `main_regions` **原样回显**时条目无 id → 客户端严格转换炸掉。此前复现不出来的原因：测试请求从未带过 gate_regions。修复三处：
-  **① 后端 GateRegion 增加 `id` 字段**（透传，客户端发的区域 id 全程在场）；
-  **② seg_pipeline 门控区回显前补 id**（缺失时 `mr_gate_NNN`，与 `mr_model_NNN` 命名同族）；
-  **③ 客户端 MainRegion/Paragraph.fromJson 的 id 防御**（缺失/null 时按坐标生成确定性回退 id，不再抛 type cast；防御老后端/历史数据）。
-  实弹闭环验证：带 2 个无 id 门控区的完整 /segment 请求 → 响应 `main_regions` 带回 `mr_gate_000/001` → 客户端解析测试通过。测试：新增 gate_region_id（客户端回退 id/正常 id/null id + line_ids null 元素过滤）与 gate_resp_parse（真实带门控区响应解析）；后端 GateRegion id 透传 2 条；后端全量 **560 过**（2 存量失败与本次无关）；flutter analyze 零问题、flutter test **594 过**（1 存量失败）。BACKEND_BUILD v146→**v147**（gate-region-id，Dart 握手同步）。pubspec 1.0.0+202→1.0.0+203。
-
-## 1.0.0+202
-
-- **诊断加固：页面识别/载入异常现在把完整 Dart 堆栈落进应用日志**（用户持续遇到 "type 'Null' is not a subtype of type 'String' in type cast"，v146 后端已恢复正常返回仍报）。本轮把该错误的可疑链路逐段实弹验证：真实 `main_text_only` 整页响应（用户完整参数复现）扫 null 干净；完整客户端链（响应解析 → PageAnnotation → inferHierarchy → rebuildBlocks → 存取往返）测试通过；**`ensurePageAnnotation` 全流程决定性测试**（本地假后端回放真实响应 + 真实项目落盘）通过；用户真实 SharedPreferences 的 Ollama 设置扫 null 干净、`OllamaSettings.fromJson` 全字段 null 安全；`Project.fromJson` 方向/模型覆盖解析 null 安全。既有静态审计未再找到可疑强转——**编辑器页面载入的 catch 块加 `StackTrace` 落日志**（`[载入诊断] 页面识别/载入异常：…+堆栈`，后台控制台可见），下次复现即给出精确抛点文件与行号，一击定位。测试：新增 `mto_parse_test`（main_text_only 真实响应全链）与 `ensure_page_annotation_test`（假后端+真流程+落盘断言，响应文件缺失时自动跳过）；flutter analyze 零问题。纯客户端改动，BACKEND_BUILD 不变 v146。pubspec 1.0.0+201→1.0.0+202。
-
-## 1.0.0+201
-
-- **修复：v200 引入的回归——Paddle 首个识别请求 500 `'NoneType' object has no attribute 'shutdown'`**（用户实测 v145 后端日志：切到 VL 模型后首个 `/segment_region` 与整页 `/segment` 均 500，行重识别的 strip 补读也报同一错误）。根因：v200 重写 `ensure_pool` 支持池按（模型+VL 配置）绑定时，把"后台关闭旧池"的线程启动移出了 `if old is not None` 保护——**首次建池**（`_pool=None`，old 即 None）时取 `old.shutdown` 直接 AttributeError，从识别链路上抛成 500。修复：线程启动收回保护内（只在确有旧池时后台关闭）。测试：test_paddle_engine 新增首次建池回归测试（`_pool=None` 时 `ensure_pool` 不抛，36 过）；实弹 e2e（用户完整参数：engine=paddle + VL 模型、干净后端首次建池）——`paddle daemon p1 ready`（VL 行/字识别自动回退 PP-OCRv6_small_rec）、整页识别 313 字/19 行成功无错；后端全量 **559 过**（2 存量失败与本次无关）。BACKEND_BUILD v145→**v146**（pool-firstbuild-fix，Dart 握手同步）。pubspec 1.0.0+200→1.0.0+201。
-
-## 1.0.0+200
-
-- **修复：重新识别当前页 500 "Internal Server Error"（真凶：控制台管道错误炸穿端点）+ 新增：PaddleOCR-VL 解析配置面板（官网演示同款开关）**。两块：
-  **① 500 根因（用户后端日志 service_console.log 抓到完整堆栈）**——`api_base._Tee.flush()` 里 `self._original.flush()` 无保护：App 侧 stdout 管道异常（实测 `OSError: [Errno 22] Invalid argument`，如换代时旧后端进程成孤儿、管道对端已死）时，端点里**第一行 print(flush=True) 就炸穿** `/segment` → Starlette 兜底纯文本 "Internal Server Error"，识别根本没开始。修复：_Tee 的 write/flush 对 original 通路全部 try 吞掉（控制台输出丢了无所谓，业务走 HTTP socket 不受管道影响）；curl 直打复现不了的原因即我的管道健康。
-  **② VL 解置配置面板**——选 PaddleOCR-VL 模型时（书内引擎对话框）展开"VL 解析配置"面板：文档方向分类/文档矫正/版面检测/图表识别/印章识别/图片块 OCR/合并版面块 7 个官网演示同款开关（默认=历史行为）。书级设置（project.json `settings.vl_*`），随 /read_page_text 的 `vl_config` 透传；后端 `paddle_proc.normalize_vl_config` 白名单归一，**池按（模型+VL配置）共同绑定**（改配置=换池重建，首次直读稍慢），worker 经 `PADDLE_VL_CONFIG` 注入 PaddleOCRVL 构造参数。面板带说明文案（古籍竖排推荐保持版面检测关闭——关闭时 VL 按列输出逐行文本、与行文对照对齐更好；开版面检测按版面块输出，用户可按官网实测自行实验）。
-  测试：test_paddle_engine 新增 VL 配置 3 条（默认值=历史行为/白名单与 bool 归一/池签名随配置变化且 None=默认不重建），共 35 过；后端全量 **558 过**（2 存量失败）；flutter analyze 零问题、flutter test 589 过（1 存量失败）。BACKEND_BUILD v144→**v145**（tee-flush-vl-config，Dart 握手同步——Tee 修复在后端进程内，重启自动换新）。pubspec 1.0.0+199→1.0.0+200。
-
-## 1.0.0+199
-
-- **修复：段落反哺 `line_ids` 元素级 null 防御 + 排查"重新识别当前页报 type 'Null' is not a subtype of type 'String'"**（用户实测报错）。排查记录：本机实弹复现（v144 后端 + paddle/VL 回退路径对用户实际页面跑 /segment），真实整页响应喂给客户端解析全链路（LineBlock/MainRegion/Paragraph/CharBlock.fromJson → PageAnnotation → inferHierarchy → rebuildBlocks → 存取往返）**全部通过**（新增 3 个回归测试，带响应文件守卫、无文件环境自动跳过）；全仓扫描识别链路的严格 `as String` 转换——响应中唯一 null 字段（`fallback_reason`/`yolo.error`）均为历史字段且解析处 null 安全。防御性加固：`Paragraph.fromJson` 的 `line_ids` 元素转换 `e as String` → null 安全转换并过滤空值（整页响应 paragraphs 反哺是唯一数据触达型列表元素强转，后端数组含 null 时正是用户所见错误形态）。**未能本地复现**——请用户遇错时贴后台控制台"未捕获 Flutter 异常"的完整多行堆栈（带 package: 行号），一行即可精确定位。测试：flutter analyze 零问题、三个真实响应回归测试过。纯客户端改动，BACKEND_BUILD 不变 v144。pubspec 1.0.0+198→1.0.0+199。
-
-## 1.0.0+198
-
-- **新增：默认识别流程的"全文对照"——VL 单行重识别自动回退 + 每行全文直读与单字识别比对，标点等无框字符与不一致字特殊标记**（用户需求：默认流程加全文识别，全文多出/不一致的字用特殊颜色，无框字符显示在识别栏；及 VL 单行重识别报错修复）。两块：
-  **① VL 单行/单字识别不再报错**——`paddle_proc.line_model()` 统一收口：PaddleOCR-VL 仅支持整页直读，行/字识别请求（`PaddleEngineAdapter` 构造处）自动回退 PP-OCRv6_small_rec，客户端保持 VL 选择（直读仍走 VL）。
-  **② 全文对照（默认开，`FULL_TEXT_CHECK=0` 关）**——单行/整页识别的每行在融合完成后追加一次**整行全文直读**（新 worker op `read_line`：kraken 单矩形走既有逐行预处理+识别；paddle 行框裁图整体识别，竖排旋转 90/270 进 v5/v6 原生竖排域），与单字识别序列 `difflib` 对齐（`_align_full_text` 纯函数）：全文多出的字符（标点等像素切分天然无框的字符）记 `line.full_extras`（客户端识别栏以**紫色无框字片**展示，竖排接在字片序列尾/几何定位最后字之后，横排同理），与对位全文字符不一致的单字标 `full_diff`（客户端字片**深橙**标记，墨迹校验色优先级更高）。模型新增 `LineBlock.fullText/fullExtras`、`CharBlock.fullDiff`（JSON 只追加字段）。对照是增强路：**池未就绪绝不懒起 daemon**（首版曾致测试套件 465s/误报——已改为就绪检查+静默跳过），任何失败跳过不影响识别主流程。
-  测试：新增 `_align_full_text` 3 条（标点 extras/replace 标 diff/空白忽略）+ VL 回退与超时 3 条；后端全量 **555 过**（2 存量失败与本次无关）；flutter analyze 零问题、flutter test 587 过（1 存量失败）。BACKEND_BUILD v143→**v144**（full-text-check，Dart 握手同步）。pubspec 1.0.0+197→1.0.0+198。
-
-## 1.0.0+197
-
-- **修复：VL 直读 300s 超时被杀（"PaddleOCR daemon 响应超时(>300s) 已重启"），文本视图残留旧模型的无标点文本造成"VL 识别不出标点"的误解**（用户实测日志：9 个 kraken daemon（k2–k9）各自占一份 CUDA 显存加载中，`[paddle-worker:p1] 等待 read_page 响应已 300s` 后被 watchdog 杀掉重启，直读 500）。VL 0.9B 首次推理含权重编译，且与 kraken 池共享显存——被挤时退 CPU/排队可达分钟级，300s 默认超时不够。**超时链路整体放宽**：后端 read_page 单请求超时 VL 场景 300s→**900s**（`PADDLE_VL_READ_TIMEOUT` 可覆写；watchdog/心跳跟随同一值），客户端 Dart 超时同步 VL 场景 10→**15 分钟**（必须不短于后端，否则先被客户端掐断）。说明：那次直读实际失败了，面板显示的是旧 small_rec 文本（v195 起状态栏会橙字提示"本书已选 VL-1.6"）——VL 本身读标点没问题（本机实测同一页 86 个标点，与官网演示一致）；显存恢复后重试即成功，模型已热后约 15-25s/页。**使用建议**：VL 与大 kraken 池（9 进程各占一份 CUDA 上下文）同机共挤显存时，可用 `OCR_KRAKEN_WORKERS` 调小 kraken 池或先重试一次（首读被挤超时、二读常已热）。后端全量 pytest 552 过（2 存量失败与本次无关）；flutter analyze 零问题。BACKEND_BUILD v142→**v143**（vl-read-timeout，Dart 握手同步）。pubspec 1.0.0+196→1.0.0+197。
-
-## 1.0.0+196
-
-- **修复：选 PaddleOCR-VL-1.6 整页直读报"Internal Server Error"**（用户实测：直读失败，Dart 端报 FormatException 掩盖真实原因）。三处后端根因 + 一处客户端呈现，全部修完并实测全链路跑通：
-  **① `PaddleOCRVLBlock` 对象误当 dict**——真实管线返回的 `parsing_res_list` 元素随取用路径不同而是 dict（json 序列化）或 PaddleOCRVLBlock 对象；v193 的提取代码统一 `.get()` 直接 AttributeError（用户所见 500 的直接原因）。新增 `_vl_block_content` 两条路径都兼容。
-  **② 对象属性名是 `content` 不是 `block_content`**——`block_content` 是 JSON 序列化后的字段名，对象直取时叫 `content`；首次兼容只认 `block_content` 导致提取 0 行（静默失败比报错更隐蔽）。两个名字都认。
-  **③ VL daemon 的几何管线档位推导崩溃**——VL 模型名没有 `_rec` 后缀，`_get_pipeline()` 拼出 `PaddleOCR-VL-1.6_det` 不存在 → UnknownModelError。VL daemon 固定用 small 档 det+rec 定行框（行文本由 VL 给出，rec 结果丢弃）。
-  **④ 客户端错误体解析顺序**——`readPageText` 先 `jsonDecode` 再查状态码，后端未捕获异常时 uvicorn 返回纯文本 "Internal Server Error"，FormatException 把真实状态/响应体盖掉。改为先查状态码、非 JSON 体原样透出"整页直读失败（HTTP 500）：Internal Server Error"。`_vl_result_dict`/`_vl_read_page` 增加 json 通道失败与提取落空的诊断日志（后端控制台可见结果对象形态）。
-  **e2e 实测**（用户实际页面 page_005）：行/字 op 明确拒绝 ✓；VL 文本 17 行带标点 ✓；混合直读 22 行、逐行带标点（mark stats 显示 text punct=4/7/…）✓；阅读序正确。后端全量 pytest 552 过（2 存量失败与本次无关）；flutter analyze 零问题。BACKEND_BUILD v141→**v142**（vl-readpage-fix，Dart 握手同步——重启应用自动换新后端）。pubspec 1.0.0+195→1.0.0+196。
-
-## 1.0.0+195
-
-- **修复：文本视图状态栏分不清"本书配置的模型"和"实际读出文本的模型"**（用户反馈：选了 PaddleOCR-VL-1.6，状态栏仍显示"引擎 PaddleOCR（PP-OCRv6_small_rec）"，不知道自己在用什么、看到的文本是谁读的）。两层修复：
-  **① 状态栏如实区分两个概念**——直读落盘新增元数据侧车 `<direct_text>/<pageId>.meta.json`（engine/ocr/耗时/行数/时间），状态栏有记录时显示"**文本由 X 识别**"（X = 实际产出该文本的引擎/模型，从后端返回的 `ocr` 字段如 `paddle+PP-OCRv6_small_rec` 解析）；无记录（老文本）维持"引擎 X"（本书配置）。
-  **② 改了模型没重读时橙字提醒**——实际产出与本书当前选择不一致（引擎或模型改过、旧文本不会自动重读）时，状态栏追加橙字"⚠ 本书已选 Y，点「重新识别」用新模型重读"。Kraken 的识别模型固定（chat_rec），只比引擎不比模型。
-  说明（非 bug 的行为确认）：设置页"AI 辅助设置"里的 Paddle 默认档只影响**新建任务**的初始选择；已建书籍用各自的设置（编辑器「页面操作 → 识别引擎（本书）」里改），改完要点「重新识别」才用新模型读当前页。使用手册同步。
-  测试：flutter analyze 零问题、直读存储相关测试过。纯客户端改动，BACKEND_BUILD 不变 v141。pubspec 1.0.0+194→1.0.0+195。
-
-## 1.0.0+194
-
-- **改进：模型选项标题显示真实模型名**（用户反馈：设置页 PaddleOCR 模型卡只显示"极轻量/小模型/中等"这类昵称，看不出用的到底是哪个模型）。`PaddleModelChoice` 新增 `displayLabel`（`模型名 · 昵称`，如 `PP-OCRv6_small_rec · 小模型（蒸馏）20.4MB · 默认`、`PaddleOCR-VL-1.6 · 视觉语言模型 0.9B · 古籍最强`），AI 辅助设置模型卡、书内引擎对话框、任务向导的模型选项标题与下载结果提示统一改用；顺带修正卡片脚注过时的"下载约 4~73MB"（现在 4MB~73MB，VL 档约 1.9GB）。纯客户端改动，BACKEND_BUILD 不变 v141。测试：flutter analyze 零问题、设置页相关测试过。pubspec 1.0.0+193→1.0.0+194。
-
-## 1.0.0+193
-
-- **新增：Paddle 模型选择加入 `PP-OCRv3_mobile_rec`（v3 轻量档）与 `PaddleOCR-VL-1.6`（0.9B 视觉语言模型）的下载与选择**（用户需求）。后端目录（paddle_proc.PP_OCRV6_MODELS 5 档，默认仍 v6_small）、设置页模型卡、任务向导/书内引擎对话框同步。
-  **① PP-OCRv3_mobile_rec（9.8MB）**：老一代轻量档（2022），CPU 可跑、精度低于 v5/v6；整页直读不支持竖排（v5 起原生支持），配置要求文案注明"适合横排书籍或引擎对照"。配对检测模型 `PP-OCRv3_mobile_det` 走现有 `tier+"_det"` 逻辑自动成立，行/字识别走现有 TextRecognition 路径零改动。
-  **② PaddleOCR-VL-1.6（0.9B，下载约 1.9GB）——古籍直读质变**：实测用户实际页面（page_005）**标点 86 个 vs PP-OCRv6 的 3 个**（此前诊断的"古籍小号标点被整行识别系统性跳过"在 VL 上原生解决），竖排/复杂版式同样更强。约束：仅整页直读（文本视图）可用——行/单字识别 op（recognize/read_boxes/read_strip）被 worker 明确拒绝（中文提示"仅支持整页直读；行/单字识别请选 PP-OCR 系"）；需 NVIDIA 独显（建议 ≥8GB 显存）；CPU 极慢。**直读为混合方案**：VL 只出块级 bbox（无逐行坐标），故用"VL 读文（无版面模式按列分行、带标点）+ PP-OCR det 定行框"，`_vl_merge_texts` 把 VL 分行文本（去标点）与 PP-OCR 行按相似度对齐换装（行框几何准、行文本带标点；对不上的 VL 行贴邻行保文本、PP-OCR 多余行如页码保留原文）。标记 stats 标点诊断对 VL 直读照常输出，可量化对比。
-  **③ 环境与缓存健壮性**：VL 管线需要 `paddlex[ocr]` extra（bs4/einops/tokenizers 等 14 个轻量包）——已装进本机 paddleocr 环境、安装脚本 install_paddleocr.bat 同步追加；直读构造 VL 管线时关闭文档朝向/矫正/图表/印章/版面检测旁路（直读只要逐行文本，也省版面模型）。半截缓存自愈：paddlex 对"目录存在但缺 inference.yml"的中断下载不再重下、直接报"无有效模型文件"（实测踩坑：1 月一次失败的 PaddleOCR-VL 下载留空壳目录，另 PP-DocLayoutV2 目录 ACL 损坏连读都拒绝）——`downloaded_models` 改为"带模型配置才算已下载"，`download_model` 先删该模型的半截目录再走全新下载（坏 ACL 目录改名隔离由用户侧处理）。
-  测试：test_paddle_engine 29 过（新增 VL 混合对齐 4 条：带标点文本换装/未匹配几何行保留/未匹配 VL 行不丢文本/无几何行零框兜底；目录 5 档含 VL"仅整页直读"文案；下载扫描改半截目录不算）；e2e：真实 VL 输出+真实 PP-OCR 几何走通 `_op_read_page` 全链路（22 行 86 标点、阅读序正确），行/字 op 拒绝路径实测（显存争用环境下 VL 实机推理超时改由桩验证代码路径；首次实测 GPU 推理 15.6s/页）。后端全量 552 过（2 存量失败与本次无关）；flutter analyze 零问题、flutter test 587 过（1 存量失败）。使用手册识别引擎/标点局限节同步。BACKEND_BUILD v140→**v141**（paddle-v3-vl，Dart 握手同步）。pubspec 1.0.0+192→1.0.0+193。
-
-## 1.0.0+192
-
-- **修复：后端控制台被两股日志洪水刷屏（+191 让服务 stdout 实时可见后暴露）**——① uvicorn 访问日志：App 每 3 秒轮询两次 `/process_stats`，每请求一行 `INFO: ... "GET /process_stats" 200 OK` 刷屏；② Windows Proactor 良性断连噪音：每个轮询连接关闭时 `_ProactorBasePipeTransport._call_connection_lost` 对已关闭 socket 再 shutdown 抛 WinError 10022（CPython 已知问题、无害），asyncio 默认处理器整段 traceback（7 行栈）打到 stderr。两股此前一直存在，只是被 conda 缓冲遮住。修复：① `uvicorn.run(access_log=False)`（请求计时 App 客户端侧已自带 `[http]` 日志；500 的 traceback 走错误日志不受影响）；② 自装 asyncio 异常处理器 `_quiet_connection_lost`（api_base，lifespan 里注册到 uvicorn 的事件循环）——只静默"_call_connection_lost + WinError 10022"这一类，其余异常照走默认处理器。端到端复验（conda --no-capture-output 拉起 + 6 次断连轮询 + 直读）：访问日志 0 行、10022 噪音 0 行、`[paddle-worker]` mark stats 标点诊断 20 行照常实时流出。测试：test_kraken_daemon 新增 3 条（良性噪音被吞/其它 WinError 转发/其它回调转发），后端全量 548 过（test_seg_layout/test_layout_analysis 2 条存量失败与本次无关）；flutter analyze 零问题。BACKEND_BUILD v139→**v140**（console-noise，Dart 握手同步）。pubspec 1.0.0+191→1.0.0+192。
-
-## 1.0.0+191
-
-- **修复：后端服务的 stdout 日志在应用控制台整段不可见（含 worker 透传日志）**（用户实测：v139 后端在跑、直读成功，控制台仍无任何 `[paddle-worker]` 行；对照发现控制台里 `[app]`/`[http]` 全是应用侧日志，服务进程的行一条都没有）。根因：应用用 `conda run -n paddle python main.py` 启动后端，而 **`conda run` 默认捕获子进程 stdout、缓冲到命令结束才整体吐出**（本机实测：Python 立刻打印的 LINE-A 与 3 秒后的 LINE-B 同一时刻才到达管道）——服务全部 stdout（uvicorn 日志、worker 透传的 mark stats 标点诊断等）被扣在 conda 缓冲里，进程不退出就永远看不到。修复：启动命令加 **`--no-capture-output`**（实测 LINE-A 立刻、LINE-B 3 秒后到达，逐行实时）；`run_backend_console.cmd`（独立控制台窗口模式，同样吃这个缓冲）一并加。端到端验证：与 App 同款命令拉起后端 + `POST /read_page_text engine=paddle`，26 条 `[paddle-worker:p1]` 日志（模型加载、page read done、mark stats 逐行明细与整页汇总 `text puncts=3, mark-like blobs≈266, read ratio 1%`）全部实时流出。纯客户端/启动脚本改动（后端 Python 零改动，BACKEND_BUILD 不变 v139）；flutter analyze 零问题。pubspec 1.0.0+190→1.0.0+191。
-
-## 1.0.0+190
-
-- **修复：worker 进程日志（含直读标点诊断 mark stats）在后端控制台不可见**（用户实测：v138 后端已运行、直读成功返回 22 行，但控制台没有任何 `[paddle-worker:...]` 日志）。根因在 `kraken_proc._KrakenDaemon._start()`：spawn worker 时 `stderr=None`（继承父进程句柄），而下方 `_stderr_reader` 透传线程读的是 `proc.stderr`——继承模式下它恒为 **None**，线程首行即 AttributeError 被吞、静默死掉，worker 的全部 tlog 进度日志（模型加载耗时、strip read、page read done、mark stats 标点统计等）从未进入转发管道，与类文档注释"stderr 由读线程收取后 print 透传"的设计相悖（引擎参数化改造时的遗留笔误）。修复：`stderr=subprocess.PIPE` 一行，透传线程随即按设计工作。迷你 worker 实测：启动 1.5 秒内 stderr 日志行即透传打印。测试：后端全量 545 过（test_seg_layout/test_layout_analysis 2 条存量失败与本次无关，见 v132/v133）；flutter analyze 零问题。BACKEND_BUILD v138→**v139**（worker-stderr-fwd，Dart 握手同步）。pubspec 1.0.0+189→1.0.0+190。
-
-## 1.0.0+189
-
-- **新增：Paddle 整页直读的标点诊断日志**（用户要求：增加日志分析为什么没识别出标点——实测文本 3 个标点 vs 标注存档约 140 个/页）。`paddle_worker._op_read_page` 在直读完成后对每个 det 行框裁图做连通域统计（cv2），把「文本里读出的标点数 vs 图上检出的**小墨块数**（高度 < 0.6×中位字高的连通域，即疑似被识别模型跳过的古籍小号句读/圈点）」打进后端日志：逐行 `mark stats line N/22: 27 chars, text punct=0, mark-like blobs≈17 (model likely skipped ≈17)`，整页汇总 `mark stats: 22 lines, text puncts=3, mark-like blobs≈266 (19 lines dropping), read ratio 1%`（用户实际页面 page_005 实测输出）。只记日志、不改识别结果；cv2/PIL 缺失或图异常时诊断降级跳过、绝不影响识别路径。测试：test_paddle_engine 新增 3 条（合成竖排列 8 字 + 3 标点检出 3；过小裁图返回 None；标点集合覆盖常见中文标点），后端全量 545 过（test_seg_layout/test_layout_analysis 2 条存量失败与本次无关，见 v132/v133）；flutter analyze 零问题。BACKEND_BUILD v137→**v138**（paddle-punct-diag，Dart 握手同步——诊断日志在 worker 内，需换新后端才可见）。使用手册「标点局限」条补诊断日志说明。pubspec 1.0.0+188→1.0.0+189。
-
-## 1.0.0+188
-
-- **改进：「文本」视图行文对照小字改用高亮色 + 查明 Paddle 直读丢标点的原因并由 AI 校对补标点**（用户实测：Paddle 直读通篇几乎无标点；对照小字黑色不显眼）。两项：
-  **① Paddle 直读丢标点＝识别模型能力盲区（非 bug，参数不可救）**——实测铁证：该页标注存档（人工校对）含约 140 个标点/页，Paddle 直读仅出 3 个；用标注几何比对发现古籍句读/圈点是**印在字间空隙里的小号符号（约 0.4 字高）**，det 行框其实包住了它们，但 PP-OCRv6 识别模型按现代排版（标点与正文字同高）训练，整行识别时系统性跳过这类小符号。逐一实测排除：加大检测框外扩 `text_det_unclip_ratio` 1.4→2.5 仅 +2 个、提高分辨率/2x 放大无效（rec 按行高归一化后相对大小不变）、三字上下文窗口只救回首尾标点、小符号单独抠图放大反而被读成数字"0/9"。也试做了"连通域抠小符号→紧排重组条识别→按墨迹位置插回"的整页原型：召回可达 ~88/140 但碎片误判产生"，，，"连串、位置 ±1-2 字漂移，精度不可靠，**不采纳**（宁缺毋滥）。应对：AI 校对提示词内置补标点指令——"OCR 文本整行/整页几乎没有标点时按文意用标准中文标点断句补全，已有标点保持原样"（LLM 古文断句是强项，直读流程本就带 AI 校对）；使用手册「整页直读」节新增「标点局限」说明（含"忠实还原印刷标点请走标注管线单字识别"指引）。
-  **② 行文对照小字改高亮色**——对照字片文字从黑色改为**按行序轮换的彩虹高亮色**（同一行同色、相邻行异色），与编辑器单字框同一套颜色语义；字片描边同色（原主题色描边移除）。色板 `kCharRainbow`/`charRainbowColor` 从 editor_page 抽出至 `widgets/char_rainbow.dart` 共享（editor_page 与 line_reseg_page 改引共享文件，页面间互相 import 解除）。
-  测试：flutter analyze 零问题；flutter test 全量 587 过（tool_export_crowd_tasks 为无头环境存量失败；ink_align_features 旋转容差断言为偶发——单测重跑一次过一次挂，随机噪声临界，与本轮无接触面）；后端零改动（BACKEND_BUILD 不变 v137）。使用手册同步。pubspec 1.0.0+187→1.0.0+188。
-
-## 1.0.0+187
-
-- **修复：点「整页文本（直读）」按钮闪退**（用户实测：`segmented_button.dart` 断言 `selected.length > 0 || emptySelectionAllowed` 不成立、应用异常退出）。v186 把视图分段按钮改为文本模式下传**空选中集**（四个标注分段都不选），但漏了 SegmentedButton 的 `emptySelectionAllowed: true` 参数——Flutter 断言要求空选中必须显式允许。一行补上。测试：flutter analyze 零问题、相关 Dart 测试过（+186 的工具栏改动无其他回归面）。纯客户端改动，BACKEND_BUILD 不变 v137。pubspec 1.0.0+186→1.0.0+187。
-
-## 1.0.0+186
-
-- **修复：切到 PaddleOCR 引擎做行重识别时的两类问题——界面报"RenderFlex overflowed by 11 pixels"红条 + 换模型时请求被卡几十秒**（用户实测 14:48-14:50：先后两次行重识别各耗时 66.9s/37.3s，期间应用两次抛未捕获溢出异常；后端日志还原全程）。后端两处 + 前端一处：
-  **① 编辑器工具栏溢出（用户所见"报错"本体）**——v184 给视图 SegmentedButton 加的第 5 个「文本」分段挤爆了工具栏宽度（240px 面板内实测右溢 11px，调试模式渲染为红黑条纹，被当成识别报错）。修复：分段按钮恢复四档（主区/段/行/详细），「文本」视图改为分段下方**整宽独立按钮**（进入后变为「退出文本视图」FilledButton；文本模式下分段不选中）。
-  **② 换模型被正在加载的旧 daemon 卡死几十秒（根因）**——`_KrakenDaemon.request()` 全程持锁（首载含模型下载，实测 small 档 ping 62.6s），池重建时 `old.shutdown()` 用 `with self._lock` **无限等锁**：14:49:18 的行重识别想换 small→medium 池，被在载 small 的 daemon 等锁卡到 14:49:54 加载完才放行。修复：`shutdown()` 改**限时拿锁（15s）**，拿不到直接强杀——加载中途被杀无害（该进程不再接客，新成员重新加载）。kraken 激活/重建池路径同样受益。
-  **③ paddle 换池的旧池关停放后台线程**——`paddle_proc.ensure_pool` 此前在请求线程里同步 `old.shutdown()`（排空+成员关闭），叠加 ② 最坏可拖几十秒；改后台线程关旧池，换模型立即返回新池等待。
-  顺带确认（非 bug，使用提示写进使用手册）：Paddle 首次用某档要下载模型（small 20.4MB 实测 62.6s、medium 73.3MB；已缓存后加载仅 ~5s）；每本书/每次探测切换模型 = 池重建重载，建议先在设置页「PaddleOCR 模型」卡预下载好再用。当日日志里两次行重识别最终都成功返回（34 字，dual-read both×28）。
-  测试：后端全量 542 过（test_seg_layout/test_layout_analysis 2 条存量失败与本次无关，见 v132/v133 注记）；`import main` 冒烟 OK；flutter analyze 零问题；flutter test 全量 587 过（唯一失败 tool_export_crowd_tasks 为无头环境存量）。BACKEND_BUILD v136→**v137**（paddle-pool-switch，Dart 握手同步，重启应用自动替换旧后端）。使用手册识别引擎节补换模型重建池注记。pubspec 1.0.0+185→1.0.0+186。
-
-## 1.0.0+185
-
-- **修复：「文本」视图行文对照的字片过大、遮住邻列文字且与书页文字没对齐**（用户实测截图：字片约与列等宽，盖住相邻列；字位按整列高度粗放均分，与页面字形错位）。纯客户端改动，三点收敛：
-  **① 字号缩小**——竖排对照字号从 0.92×列宽降到 **0.45×列宽**（片宽 1.2×字号），横排从 0.8×行高降到 **0.55×行高**（钳 9~26px）：小字对照，视觉上明确退居书页文字之后。
-  **② 不遮正文/邻列**——竖排字片右缘**贴列框左缘**（只占列间空隙，不再伸进列内）；页面最左列左缘越界时收紧贴边（x 钳到 ≥0，不向右侵入本列正文）。
-  **③ 逐字对齐书页文字**——新增逐字框数据通道：`_LineRecord.charBoxes`（kraken 直读行本就带 cuts 重建的逐字框，此前丢弃未用），有字框时每个字片**中心对准对应字框中心**（字号仍受"均分列高也挤不下"约束兜底，超长读法自动缩字）；paddle 直读行无逐字框，按列高均分对齐（det 框贴合文字时近似逐字对齐）。字片高度取 min(字位高, 1.3×字号)。
-  测试：flutter analyze 零问题；相关 Dart 测试全过（flutter test 全量 587 过，唯一失败 tool_export_crowd_tasks 为无头环境存量，与本次无关）；后端零改动（BACKEND_BUILD 不变 v136）。使用手册行文对照描述同步。pubspec 1.0.0+184→1.0.0+185。
-
-## 1.0.0+184
-
-- **改进：「文本」视图重排为左右分栏——左侧书页栏（保留校对的页图对照）+ 右侧文本栏，书页旁可叠加显示每行识别文本（带开关）**（用户需求：保留书页栏、画面中心对半、书页用现有展示方案但不显示识别框、可在书页文字旁显示该行识别文本并可开关）。纯客户端改动：
-  **① 左右分栏**——DirectTextPanel 重构为 `Row` 对半布局：左侧**书页栏**沿用标注画布同款展示方案（`instantiateImageCodec` 解码位图 + `RawImage`、缩放平移、首帧整页适配留 4% 边距、换页/退出释放纹理），**不画任何识别框/标注**；右侧**文本栏**保留原有全部功能（识别本页/重新识别、可编辑文本框、AI 校对、保存/复制、引擎与行数状态行）。
-  **② 行文对照叠加（新）**——书页栏顶部「行文对照」开关（默认开）：把 `/read_page_text` 返回的每行识别文本画在书页对应行旁——**竖排行逐字竖排**在列框左侧的列间隙里（字号取 min(列宽×0.92, 行高/字数)，与页面自身版式一致、天然不遮正文；页面最左列越界时退到框内左侧；字位 <6px 的碎片行不画避免糊成噪点），**横排行**整行画在行框下方；每字/整行带半透明白底圆角片 + 主题色描边，页面底纹上可读。文本栏**编辑实时同步**：按行号逐行更新叠加文本（行数一致时；增删过行保持识别原文不做错位同步），同步走 `ValueListenable` 只重画叠加层、不重建面板（文本框每键触发）。
-  测试：flutter analyze 零问题；flutter test 全量 587 过（唯一失败 tool_export_crowd_tasks 为无头环境存量，与本次无关）；后端无改动（BACKEND_BUILD 不变 v136）。使用手册「整页直读」节同步分栏与行文对照说明。pubspec 1.0.0+183→1.0.0+184。
-
-## 1.0.0+183
-
-- **修复：「文本」视图整页直读用 Kraken 引擎必失败——"Kraken worker 失败: 'TorchVGSLModel' object has no attribute 'codec'"，且直读文本几乎全空**（用户实测 GujiBT 某书源图 b4715f1c（284×627 竖排 6 列）点「识别本页」即 500）。两处根因与修复：
-  **① 分割模型加载方式错误（报错的直接原因）**——`_op_read_page` 用 `kraken.lib.models.load_any` 加载 `chat_seg.mlmodel`，而本环境 kraken 7.1.1 的 `load_any` 只适用于**识别**模型：无条件包 `TorchSeqRecognizer` 并取 `nn.codec`，分割模型没有该属性 → AttributeError。修复：分割模型改用 `TorchVGSLModel.load_model`（`blla.segment` 内部默认模型同款加载方式，已实测 chat_seg 元数据合法：model_type=segmentation、含 class_mapping）；`blla.segment` 参数名纠正为 `model=`（原误写 `load_model=`）、按书方向传 `text_direction`（竖排列旋转后进识别网络，桥接层经 payload 下发）；kraken 7.1 的 `Segmentation` 是 dataclass，取行改 `seg.lines`；blla 弃用告警（kraken 8 移除，替代 `SegmentationTaskModel`）就地抑制并注记。
-  **② 整页直喂 rpred 读不出字（修完 ① 后暴露）**——原实现把原始灰度整页 seg 直接交 `rpred.rpred`，CHAT 模型要求"窄轴 ≥100px 定倍 + 逐行局部 nlbin"（`_prepare_line` 既有结论），欠放大未二值化的整页读出 28 行几乎全空（32 字符）。修复重构：**blla 只负责检测**（行框 = boundary 多边形外接矩形），每行交与标注管线完全同款的 `_per_line_pipeline` 逐行预处理路径（裁剪/定倍/nlbin/rpred/cuts，空白行有既有保护）。另发现 blla（chat_seg 与 kraken 默认模型皆同）在竖排小图上把一列拆成**单字级碎片**（实测该页 28 片、片高 15~42px≈单字，放大 2~4 倍不恢复）——新增 `_merge_line_rects_by_band` 带状合并：按列中心贪心聚簇（容差=列宽中位数一半，与 page_text 分列同款启发）取联合框还原整列，交 CHAT 读整列语境。修复中顺带修掉合并函数的聚类基准 bug（误用全局累计均值而非当前簇运行均值，致第二簇起永不合并，实测 27 片只并成 25）。
-  真图端到端验证（kraken 环境实跑该源图）：修复前 codec 500；中间版 28 行 32 字符几乎全空；修复后 5 条整列、42 字符，含"詣佛各於弟子衆中歎""名字皆悉踊躍來生我國"等与页面内容吻合的整列读法，RTL 列序正确。残留已知限制：右侧小字注释列与正文列在被 blla 碎片化后可能并成一带（首列读法混入注释字），小图直读质量以 PaddleOCR 全管线为佳（det+rec 原生竖排），Kraken 直读为引擎可选兜底。
-  测试：test_page_text 新增 KrakenBandMergeTests 5 条（竖排碎片并整列、相邻列不并、**簇均值回归**（防全局均值 bug 复发）、横排按 y 并行带、单框/空透传）；后端全量 542 过（test_seg_layout/test_layout_analysis 2 条存量失败与本次无关，见 v132/v133 注记）；`import main` 冒烟 OK；flutter analyze 零问题（Dart 仅同步握手串）。BACKEND_BUILD v135→**v136**（direct-read-kraken，worker 代码修复需重启后端生效，Dart 握手同步后应用会自动替换旧后端）。pubspec 1.0.0+182→1.0.0+183。
-
-## 1.0.0+182
-
-- **新功能：① 应用内更新日志——本版本更新内容就地可看、一键复制 GitHub 发布说明**（用户需求）。「AI 辅助设置 → 说明 → 更新日志」新入口：按版本分节展示项目根 `CHANGELOG.md`（第一条即当前版本，带「本版本」徽标，默认展开），每节可单独复制，页顶「复制本版本 / 全部」一键取 markdown——上传 GitHub 时直接贴进 Release 发布说明。实现：`changelog_service.dart`（`## ` 分节解析纯函数 + 路径探测：python_service 上级（开发=仓库根 / 安装版=安装目录）→ exe 同级 → exe 上级；CRLF/首尾空行兼容、节内空行保留）+ `changelog_page.dart`（ExpansionTile 列表 + 复制反馈）；安装脚本把 CHANGELOG.md 放进安装目录（`skipifsourcedoesntexist`），找不到时页面降级提示。
-- **新功能：② 整页直读「文本」视图——Paddle/Kraken + AI 校对，不拆主区/段落/单行/单字**（用户需求：直接显示该页识别内容的文本框，书籍校对界面可切换）。四部分：
-  **① 后端直读**——新端点 `POST /read_page_text`（`engine`/`paddle_model`/方向参数 → `{text, lines, engine, ocr, elapsed_s}`，`_gated_recognition` 保护）。Paddle：`paddle_worker.py` 新 op `read_page`，懒建 det+rec 完整管线（检测模型跟随识别档位 `PP-OCRv6_<tier>_det`，首次自动下载；PP-OCRv5 起原生支持竖排检测+识别，页面不旋转），`rec_boxes` 优先/`rec_polys` 外接框兜底。Kraken：`kraken_worker.py` 新 op `read_page`，blla 分行（`chat_seg.mlmodel` 首次直读懒加载常驻）+ rpred 读字，boundary 多边形外接框。两引擎都返回**未排序**行列表，阅读序由新模块 `page_text.py` 统一重排：竖排按 x 中心**贪心聚列**（容差半个列宽中位数，容忍检测框列中心抖动、列距不均）→ 列按 rtl/ltr → 列内 y 按 ttb/btt；横排聚行同理；btt/rtl 行内文本反向——纯函数可测。两引擎共用同一排序/拼接，行为一致。
-  **② 编辑器「文本」视图**——右侧视图切换加「文本」档（主区/段/行/详细/文本）：主体换成 `DirectTextPanel`——「识别本页/重新识别」（本书当前引擎）→ 可编辑整页文本框 →「AI 校对」→「保存/复制」；识别结果即时落盘、编辑手动保存；翻页按 pageId 换 key 自动换内容。不依赖本页已有标注（未识别过的页也能直读）。落盘 `<书目录>/direct_text/<pageId>.txt`（原子写，与页标注 JSON 完全解耦：重识别/标注保存互不影响，也不进训练数据/导出）。
-  **③ AI 校对**——`OllamaService.proofreadPageText`：优先视觉模型带整页原图（页图读不出退化为纯文本），prompt 按古籍校对口径（异体字/繁体保持原样、无把握不改、不增删行、行数与输入一致），JSON 输出解析含 ``` 围栏剥离，失败不丢 OCR 原文；结果预览对话框（可选中复制）后自行「采用（替换文本框）」；走「AI 辅助设置」的推理来源/限流/追踪（10 分钟超时、按 2 token/字预算钳 8192）。
-  **④ 客户端**——`PythonService.readPageText`（10 分钟超时，首载检测模型提示）；BACKEND_BUILD v134→**v135**（direct-text，Dart 握手同步）。
-  测试：新增 `test_page_text.py` 10 条（竖排 rtl/ltr 列序与列内序、列抖动不拆列、相邻列不并列、btt 行内反向与列内倒序、横排行序/行内序/行抖动、空输入、逐行拼接）；新增 `changelog_and_direct_text_test.dart` 7 条（CHANGELOG 分节/CRLF/空行/GitHub 格式、DirectTextStore 往返/覆盖/空文本落盘/分页隔离）；后端全量 537 过、`import main` 冒烟 OK（test_seg_layout/test_layout_analysis 2 条存量失败与本次无关，见 v132/v133 注记）；flutter analyze 零问题、flutter test 587 过（唯一失败 tool_export_crowd_tasks 为无头环境存量）。文档：README（新版首页结构）功能特性补双引擎与文本视图一句；详细说明写入 `docs/使用手册.md`（新增「整页直读」「更新日志」两节，识别引擎节为 v180/v181 迁移内容）。pubspec 1.0.0+181→1.0.0+182。
-
-## 1.0.0+181
-
-- **新功能：设置页「PaddleOCR 模型」卡——模型说明、逐档下载与默认档选择**（用户需求：设置界面中添加 paddle 的模型下载和说明，并且可选择使用哪个模型）。三部分：
-  **① 后端**——`/paddle/status` 响应新增 `downloaded`（已下载模型名清单）：`paddle_proc.downloaded_models()` 纯磁盘扫描官方缓存（`<缓存根>/official_models/<模型名>/` 非空目录，缓存根候选 `PADDLE_PDX_CACHE_HOME` 环境覆写 > `~/.paddlex` > `~/.paddleocr`），不起 daemon、环境未装也能回答哪些档已就位。新端点 `POST /paddle/download`：`download_model()` 用**一次性临时 daemon** 加载指定模型（首载自动下载到官方缓存）后即关——与 `/paddle/probe` 的区别是 probe 会把池重绑到该模型（切走正在用的档位），download 不影响现有池，专为设置页逐档预下载；已下载时等价一次加载自检（数秒），返回 `was_cached` 供 UI 区分"下载完成/自检通过"。
-  **② 设置页（AI 辅助设置，识别进程数卡之后）**——新卡：环境状态行（就绪/未装给安装指引/后端未连降级提示）+ 三档模型列表（每档 ListTile：标题=档名与体积、副标题=电脑配置要求说明、行尾=已下载 ✓ 或「下载」按钮（逐档独立转圈态，完成后 SnackBar 回报设备与耗时并刷新状态）、点选行即设**默认档**）+ 尾注（默认档只影响新建任务初始选择，每本书在编辑器「识别引擎（本书）」单独覆盖）。默认档落 `OllamaSettings.paddleModel`（SharedPreferences `ollama_settings_v1` 追加 `paddle_model` 字段，未知/历史脏值归一默认小档，与后端 `normalize_model` 同口径）；新建任务页的 Paddle 档位预填此全局默认（用户已手动改过则不覆盖，与 AI 整行开关同款快照语义）。
-  **③ 客户端 API**——`PythonService.paddleDownload(model)`（超时 15 分钟）；设置页进页后台拉一次 `/paddle/status`（失败静默降级）。
-  测试：test_paddle_engine 新增 4 条（official_models 目录扫描：非空目录算已下载/空目录不算；缓存根候选含环境覆写与默认 home；download_model 用临时 daemon ping 后即关且不碰池、spawn 参数与 was_cached 语义；未知名归一默认）；新增 ollama_settings_paddle_test 4 条（默认值/fromJson 读回与脏值归一/toJson 往返/copyWith 保持与归一）；后端全量 527 过（test_seg_layout/test_layout_analysis 2 条存量失败与本次无关，见 v132/v133 注记）；`import main` 冒烟 OK；flutter analyze 零问题。BACKEND_BUILD 不变 v134（新增端点向后兼容，旧客户端不调用）。README「识别引擎」节补设置页卡与 `/paddle/download`。pubspec 1.0.0+180→1.0.0+181。
+- **VL 直读标点丢失**：开启"版面分析"后 VL 输出整段文本、标点不再落在各行——已改为自动按阅读顺序切回逐行，开或关版面分析都能正确输出带标点的文本。
+- VL 整页直读的一系列报错与超时（Internal Server Error、格式错误、300 秒超时）；显存紧张时直读等待上限已放宽。
+- "重新识别当前页"报 type 'Null' 崩溃。
+- 切换到 Paddle 引擎重识别单行时报错、界面出现红条；文本视图直读按钮闪退；Kraken 引擎整页直读失败；行文对照小字过大遮挡相邻列文字。
 
 ## 1.0.0+180
 
