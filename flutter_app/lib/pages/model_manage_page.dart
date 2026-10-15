@@ -64,6 +64,17 @@ class _ModelManagePageState extends State<ModelManagePage> {
   /// 发版打包进行中（POST /models/pack，几秒到几分钟，期间按钮禁用）。
   bool _packing = false;
 
+  /// 多选批量删除模式：开启后每个模型版本（best/last/第 N 轮）前出现
+  /// 勾选框，顶栏出现 全选/反选/删除所选。
+  bool _selectMode = false;
+
+  /// 已勾选的检查点：路径 → 所属层（删除接口需要 layer）。
+  final Map<String, String> _selected = {};
+
+  /// 批量删除进行中（进度文案展示在多选工具条上）。
+  bool _batchDeleting = false;
+  String? _batchProgress;
+
   @override
   void initState() {
     super.initState();
@@ -101,6 +112,17 @@ class _ModelManagePageState extends State<ModelManagePage> {
           }
         }
         _models = models;
+        // 多选勾选清理：列表刷新后已不存在的检查点路径自动落选
+        final livePaths = <String>{};
+        for (final entry in models.values) {
+          for (final raw in (entry['runs'] as List?) ?? const []) {
+            for (final rawCk
+                in ((raw as Map)['checkpoints'] as List?) ?? const []) {
+              livePaths.add((rawCk as Map)['path']?.toString() ?? '');
+            }
+          }
+        }
+        _selected.removeWhere((k, v) => !livePaths.contains(k));
         _loading = false;
       });
     } catch (e) {
@@ -158,6 +180,145 @@ class _ModelManagePageState extends State<ModelManagePage> {
       builder: (_) => const ModelCleanupDialog(),
     );
     unawaited(_load());
+  }
+
+  /// 当前页面上所有可勾选（可删除）的检查点：跨层扁平清单，排除当前
+  /// 启用来源（唯一不可删项；其运行副本独立，删除其余不影响推理）。
+  List<({String layer, String path, String name, int size, String runName})>
+      _allDeletableCheckpoints() {
+    String norm(String s) =>
+        p.normalize(s).replaceAll('/', '\\').toLowerCase();
+    final out = <({String layer, String path, String name, int size, String runName})>[];
+    _models.forEach((layer, entry) {
+      final activeSource = entry['active_source']?.toString();
+      final activeNc = (activeSource == null || activeSource.isEmpty)
+          ? null
+          : norm(activeSource);
+      for (final raw in (entry['runs'] as List?) ?? const []) {
+        final run = Map<String, dynamic>.from(raw as Map);
+        final runDir = run['run_dir']?.toString() ?? '';
+        final runName = p.basename(runDir).replaceFirst(RegExp(r'^run_'), '');
+        for (final rawCk in (run['checkpoints'] as List?) ?? const []) {
+          final ck = Map<String, dynamic>.from(rawCk as Map);
+          final path = ck['path']?.toString() ?? '';
+          if (path.isEmpty) continue;
+          if (activeNc != null && norm(path) == activeNc) continue;
+          out.add((
+            layer: layer,
+            path: path,
+            name: ck['name']?.toString() ?? p.basename(path),
+            size: ((ck['size'] as num?) ?? 0).toInt(),
+            runName: runName,
+          ));
+        }
+      }
+    });
+    return out;
+  }
+
+  void _enterSelectMode() => setState(() {
+        _selectMode = true;
+        _selected.clear();
+      });
+
+  void _exitSelectMode() => setState(() {
+        _selectMode = false;
+        _selected.clear();
+      });
+
+  void _selectAll() {
+    for (final ck in _allDeletableCheckpoints()) {
+      _selected[ck.path] = ck.layer;
+    }
+    setState(() {});
+  }
+
+  void _invertSelection() {
+    for (final ck in _allDeletableCheckpoints()) {
+      if (_selected.remove(ck.path) == null) {
+        _selected[ck.path] = ck.layer;
+      }
+    }
+    setState(() {});
+  }
+
+  /// 批量删除勾选的模型文件：逐个走 /models/delete_checkpoint（当前启
+  /// 用来源由后端拒绝），完成后汇总成功/释放/失败。
+  Future<void> _deleteSelected() async {
+    final byPath = {
+      for (final ck in _allDeletableCheckpoints()) ck.path: ck
+    };
+    final targets = <({String layer, String path, String name, int size, String runName})>[];
+    for (final path in _selected.keys) {
+      final ck = byPath[path];
+      if (ck != null) targets.add(ck);
+    }
+    if (targets.isEmpty) return;
+    final totalMb =
+        targets.fold<int>(0, (s, ck) => s + ck.size) / 1024 / 1024;
+    if (!mounted) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('批量删除 ${targets.length} 个模型文件'),
+        content: Text(
+            '共约 ${totalMb.toStringAsFixed(1)} MB，删除后不可恢复。\n'
+            '正在使用的版本已自动排除；删除某次训练的 best 后，'
+            '该训练保留剩余轮数与训练曲线，只是不再有 best 标记。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+                backgroundColor: Colors.red.shade400),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() {
+      _batchDeleting = true;
+      _batchProgress = null;
+    });
+    var deleted = 0;
+    var freedBytes = 0;
+    final failures = <String>[];
+    try {
+      for (var i = 0; i < targets.length; i++) {
+        final ck = targets[i];
+        if (!mounted) return;
+        setState(() =>
+            _batchProgress = '正在删除 ${i + 1}/${targets.length}：${ck.name}');
+        try {
+          await PythonService.deleteModelCheckpoint(
+              layer: ck.layer, path: ck.path);
+          deleted++;
+          freedBytes += ck.size;
+          _selected.remove(ck.path);
+        } catch (e) {
+          failures.add('${ck.runName}/${ck.name}');
+        }
+      }
+      await _load();
+      if (!mounted) return;
+      final msg = '已删除 $deleted 个，释放 '
+          '${(freedBytes / 1024 / 1024).toStringAsFixed(1)} MB'
+          '${failures.isEmpty ? '' : '；失败 ${failures.length} 个'
+              '（如 ${failures.first}，多为正在使用的版本）'}';
+      ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text(msg)));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _batchDeleting = false;
+          _batchProgress = null;
+        });
+      }
+    }
   }
 
   /// 导入外部 .pt 模型为该层的一个 run：复制进训练根并登记，与训练
@@ -571,6 +732,13 @@ class _ModelManagePageState extends State<ModelManagePage> {
         title: const Text('模型使用管理'),
         actions: [
           IconButton(
+            icon: Icon(Icons.checklist,
+                color: _selectMode ? Colors.blue.shade700 : null),
+            tooltip: _selectMode ? '退出多选' : '多选（批量删除）',
+            onPressed:
+                _selectMode ? _exitSelectMode : _enterSelectMode,
+          ),
+          IconButton(
             icon: const Icon(Icons.cleaning_services),
             tooltip: '清理训练模型目录',
             onPressed: _openCleanupCenter,
@@ -618,6 +786,16 @@ class _ModelManagePageState extends State<ModelManagePage> {
               if (widget.embedded) ...[
                 const SizedBox(width: 8),
                 IconButton(
+                  icon: Icon(Icons.checklist,
+                      size: 20,
+                      color: _selectMode
+                          ? Colors.blue.shade700
+                          : null),
+                  tooltip: _selectMode ? '退出多选' : '多选（批量删除）',
+                  onPressed:
+                      _selectMode ? _exitSelectMode : _enterSelectMode,
+                ),
+                IconButton(
                   icon: const Icon(Icons.cleaning_services, size: 19),
                   tooltip: '清理训练模型目录',
                   onPressed: _openCleanupCenter,
@@ -635,6 +813,7 @@ class _ModelManagePageState extends State<ModelManagePage> {
         // 路径与文件夹入口：数据集统一目录 / 训练模型目录（可配置），
         // 应用模型目录（models/，启用=拷贝到这里）只读直达
         _buildPathsPanel(),
+        if (_selectMode) _buildSelectionBar(),
         Expanded(
           child: ListView(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
@@ -645,6 +824,63 @@ class _ModelManagePageState extends State<ModelManagePage> {
           ),
         ),
       ],
+    );
+  }
+
+  /// 多选模式工具条：全选/反选/批量删除（勾选时显示已选数量与体积）。
+  Widget _buildSelectionBar() {
+    final all = _allDeletableCheckpoints();
+    final selectedCks =
+        all.where((ck) => _selected.containsKey(ck.path)).toList();
+    final selectedMb = selectedCks.fold<int>(0, (s, ck) => s + ck.size) /
+        1024 / 1024;
+    return Container(
+      color: Colors.blueGrey.shade50,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      child: _batchDeleting
+          ? Row(children: [
+              const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2)),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(_batchProgress ?? '正在删除…',
+                    style: const TextStyle(fontSize: 12)),
+              ),
+            ])
+          : Row(children: [
+              Text(
+                '已选 ${_selected.length} 个'
+                '${selectedMb > 0 ? ' · 约 ${selectedMb.toStringAsFixed(1)} MB' : ''}',
+                style: const TextStyle(fontSize: 12.5),
+              ),
+              const Spacer(),
+              TextButton(
+                onPressed: all.isEmpty ? null : _selectAll,
+                child: const Text('全选', style: TextStyle(fontSize: 12)),
+              ),
+              TextButton(
+                onPressed: all.isEmpty ? null : _invertSelection,
+                child: const Text('反选', style: TextStyle(fontSize: 12)),
+              ),
+              const SizedBox(width: 4),
+              FilledButton.icon(
+                onPressed:
+                    _selected.isEmpty ? null : () => unawaited(_deleteSelected()),
+                icon: const Icon(Icons.delete_outline, size: 16),
+                label: Text('删除所选${_selected.isEmpty ? '' : '（${_selected.length}）'}',
+                    style: const TextStyle(fontSize: 12)),
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.red.shade400,
+                  visualDensity: VisualDensity.compact,
+                ),
+              ),
+              TextButton(
+                onPressed: _exitSelectMode,
+                child: const Text('取消', style: TextStyle(fontSize: 12)),
+              ),
+            ]),
     );
   }
 
@@ -857,6 +1093,15 @@ class _ModelManagePageState extends State<ModelManagePage> {
                 activeSource: entry['active_source'] as String?,
                 projectMode: _project != null,
                 projectOverride: _project?.modelOverrides[layer.key],
+                selectionMode: _selectMode,
+                isSelected: (path) => _selected.containsKey(path),
+                onToggleSelect: (path, v) => setState(() {
+                  if (v) {
+                    _selected[path] = layer.key;
+                  } else {
+                    _selected.remove(path);
+                  }
+                }),
                 onActivate: (path) => _activate(layer.key, modelPath: path),
                 onProjectUse: (path) =>
                     _setProjectOverride(layer.key, path),

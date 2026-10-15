@@ -25,6 +25,12 @@ class ModelRunTile extends StatefulWidget {
   final VoidCallback onShowCurve;
   final Future<void> Function() onDeleteRun;
 
+  /// 多选批量删除模式：勾选框替代行内操作按钮；勾选状态由宿主持有
+  ///（跨 run 聚合做全选/反选/批量删除）。当前启用来源不可勾选。
+  final bool selectionMode;
+  final bool Function(String path)? isSelected;
+  final void Function(String path, bool value)? onToggleSelect;
+
   const ModelRunTile({
     super.key,
     required this.run,
@@ -37,6 +43,9 @@ class ModelRunTile extends StatefulWidget {
     required this.onDeleteCheckpoint,
     required this.onShowCurve,
     required this.onDeleteRun,
+    this.selectionMode = false,
+    this.isSelected,
+    this.onToggleSelect,
   });
 
   /// 目录/路径归一化（统一分隔符 + 小写）作比较键。
@@ -132,7 +141,27 @@ class _ModelRunTileState extends State<ModelRunTile> {
                 width: 14,
                 height: 14,
                 child: CircularProgressIndicator(strokeWidth: 2))
-          else ...[
+          else if (widget.selectionMode) ...[
+            // 多选模式：勾选框替代行内操作；当前启用来源不可勾选
+            if (isActive)
+              const Tooltip(
+                message: '正在使用的版本不可删除',
+                child: SizedBox(
+                    width: 36,
+                    height: 30,
+                    child: Checkbox(value: false, onChanged: null)),
+              )
+            else
+              SizedBox(
+                width: 36,
+                height: 30,
+                child: Checkbox(
+                  value: widget.isSelected?.call(path) ?? false,
+                  onChanged: (v) =>
+                      widget.onToggleSelect?.call(path, v ?? false),
+                ),
+              ),
+          ] else ...[
             if (widget.projectMode && !isActive)
               TextButton(
                 onPressed: isOverride
@@ -197,6 +226,8 @@ class _ModelRunTileState extends State<ModelRunTile> {
         .toList();
     final epochCount =
         checkpoints.where((c) => c['epoch'] != null).length;
+    // 多选模式强制展开（勾选需要看到完整清单）
+    final expanded = _expanded || widget.selectionMode;
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 4),
@@ -216,7 +247,7 @@ class _ModelRunTileState extends State<ModelRunTile> {
                 child: Row(
                   children: [
                     Icon(
-                      _expanded
+                      expanded
                           ? Icons.expand_less
                           : Icons.expand_more,
                       size: 18,
@@ -250,7 +281,7 @@ class _ModelRunTileState extends State<ModelRunTile> {
                 ),
               ),
             ),
-            if (_expanded)
+            if (expanded)
               Padding(
                 padding: const EdgeInsets.only(
                     left: 4, right: 8, bottom: 6),
