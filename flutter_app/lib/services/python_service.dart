@@ -20,7 +20,7 @@ String _base = 'http://127.0.0.1:$_kBasePort';
 // Keep the client gate in lock-step with the backend build string: accepting
 // an older build silently leaves the app talking to an older segmenter (and
 // makes the new layout/ink rules appear to have no effect).
-const _expectedBackendBuild = 'fulltext-auto-refresh-2026-10-15-v152';
+const _expectedBackendBuild = 'model-manage-epochs-2026-10-15-v156';
 
 /// 测试专用：把服务基地址指到别处（如一个已关闭的本地端口，模拟
 /// 「后端未启动/被关闭」时的连接被拒）。不落盘、不写端口文件；调用方
@@ -3679,6 +3679,77 @@ class PythonService {
         .timeout(const Duration(seconds: 120));
     if (r.statusCode != 200) {
       throw Exception('models/delete_run failed: ${r.body}');
+    }
+    return jsonDecode(r.body) as Map<String, dynamic>;
+  }
+
+  /// 删除一个中间轮检查点（epoch{N}.pt）释放磁盘。后端拒绝 best/last
+  /// 与当前启用来源检查点；返回 {path, size, sizeMbFreed}。
+  static Future<Map<String, dynamic>> deleteModelCheckpoint({
+    required String layer,
+    required String path,
+  }) async {
+    _addLog('http', 'POST /models/delete_checkpoint layer=$layer');
+    final r = await _post(
+          Uri.parse('$_base/models/delete_checkpoint'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'layer': layer, 'path': path}),
+        )
+        .timeout(const Duration(seconds: 30));
+    if (r.statusCode != 200) {
+      throw Exception('models/delete_checkpoint failed: ${r.body}');
+    }
+    return jsonDecode(r.body) as Map<String, dynamic>;
+  }
+
+  /// 导入外部 .pt 模型为该层的一个 run（复制进训练根并登记）。
+  static Future<Map<String, dynamic>> importModel({
+    required String layer,
+    required String path,
+  }) async {
+    _addLog('http', 'POST /models/import layer=$layer');
+    final r = await _post(
+          Uri.parse('$_base/models/import'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'layer': layer, 'path': path}),
+        )
+        .timeout(const Duration(seconds: 300));
+    if (r.statusCode != 200) {
+      throw Exception('models/import failed: ${r.body}');
+    }
+    return jsonDecode(r.body) as Map<String, dynamic>;
+  }
+
+  /// 训练模型根目录扫描：每个 run 的占用与状态（清理中心数据源）。
+  /// {root, totalMb, runs: [{layer, runDir, name, registered, finished,
+  ///  trained, epochsCount, epochsMb, bestMb, sizeMb}]}
+  static Future<Map<String, dynamic>> modelCleanupScan() async {
+    final r = await _get(Uri.parse('$_base/models/cleanup_scan'))
+        .timeout(const Duration(seconds: 60));
+    if (r.statusCode != 200) {
+      throw Exception('models/cleanup_scan failed: ${r.body}');
+    }
+    return jsonDecode(r.body) as Map<String, dynamic>;
+  }
+
+  /// 清理一个 run：action='epochs' 删全部中间轮（保留 best/last 与启用
+  /// 来源）；action='dir' 整删未登记残目录。返回 {deleted, skippedActive,
+  /// freedMb}。
+  static Future<Map<String, dynamic>> modelCleanupRun({
+    required String layer,
+    required String runDir,
+    required String action,
+  }) async {
+    _addLog('http', 'POST /models/cleanup layer=$layer action=$action');
+    final r = await _post(
+          Uri.parse('$_base/models/cleanup'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'layer': layer, 'run_dir': runDir,
+                             'action': action}),
+        )
+        .timeout(const Duration(seconds: 300));
+    if (r.statusCode != 200) {
+      throw Exception('models/cleanup failed: ${r.body}');
     }
     return jsonDecode(r.body) as Map<String, dynamic>;
   }

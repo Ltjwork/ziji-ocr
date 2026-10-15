@@ -162,11 +162,12 @@ _MODEL_TEST_CACHE: dict[str, tuple[Any, str]] = {}
 
 
 
-# 按项目配置的多层模型覆写：layer -> 模型文件路径；'' 表示该层强制停用
-#（走基线）。优先级：单层测试覆写 > 关闭开关 > 项目覆写 > 注册表启用。
-_MODEL_OVERRIDES: dict[str, str] = {}
-
-
+# 按项目配置的多层模型覆写：layer -> 模型文件路径（任意 .pt，含某轮
+# 检查点 epochN.pt）；'' 表示该层强制停用（走基线）。
+# 优先级：单层测试覆写 > 关闭开关 > 项目覆写 > 注册表启用。
+# 存线程本地：/segment 是同步端点（线程池里整请求占一个线程），并发
+# 请求各设各的覆写互不串线；请求结束由处理器置 None。
+_LOCAL = threading.local()
 
 
 def set_models_disabled(disabled: bool) -> None:
@@ -174,11 +175,19 @@ def set_models_disabled(disabled: bool) -> None:
     _MODELS_DISABLED = disabled
 
 
+def set_model_overrides(overrides: dict[str, str] | None) -> None:
+    """设置本线程的项目模型覆写（layer -> .pt 路径，''=强制停用）。
+
+    /segment 处理器请求开始设置、finally 清空；路径接受任意 .pt
+    （各 run 的 best.pt 或中间轮检查点，_get_custom_model 直接
+    YOLO(路径) 加载）。"""
+    _LOCAL.overrides = dict(overrides) if overrides else None
 
 
 def _override_for(layer: str) -> str | None:
     """返回该层的项目覆写：路径 = 使用指定模型；'' = 强制停用；None = 未覆写。"""
-    return _MODEL_OVERRIDES.get(layer)
+    overrides = getattr(_LOCAL, "overrides", None)
+    return overrides.get(layer) if overrides else None
 
 
 

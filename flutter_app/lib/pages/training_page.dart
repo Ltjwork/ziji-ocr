@@ -558,6 +558,10 @@ class _TrainingPageState extends State<TrainingPage> {
           await PythonService.activateModel(layer, modelPath: modelPath);
           await _refresh();
         },
+        onDeleteCheckpoint: (path) async {
+          await PythonService.deleteModelCheckpoint(layer: layer, path: path);
+          await _refresh();
+        },
       ),
     );
   }

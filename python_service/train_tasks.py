@@ -5,6 +5,7 @@ training_service.py 仍为门面。"""
 import csv
 import json
 import hashlib
+import math
 import os
 import random
 import re
@@ -110,7 +111,7 @@ def _monitor(task: _Task) -> None:
     if os.path.exists(done_path):
         try:
             with open(done_path, encoding="utf-8") as f:
-                task.result = json.load(f)
+                task.result = _json_safe(json.load(f))
             task.status = "done"
         except Exception as exc:
             task.status = "failed"
@@ -431,7 +432,7 @@ def training_curve(run_dir: str) -> dict:
     if os.path.exists(done_path):
         try:
             with open(done_path, encoding="utf-8") as f:
-                done = json.load(f)
+                done = _json_safe(json.load(f))
         except Exception:
             done = None
     return {
@@ -450,7 +451,9 @@ def _read_curve_csv(csv_path: str) -> tuple[list[str], list[dict]]:
     """解析 results.csv → (列名, 行列表)。
 
     ultralytics 部分版本列名带前导空格，键统一 strip；值尽量转 float
-    （转换失败或空单元格存 None，前端按断点处理）。"""
+    （转换失败或空单元格存 None，前端按断点处理）。nan/inf 也降级为
+    None：训练早期 val 列常是 nan，而 JSON 不允许非有限浮点，漏一个
+    整个 /train/curve 就 500（连接被中途掐断，前端还会误报"后端不可达"）。"""
     with open(csv_path, encoding="utf-8") as f:
         reader = csv.DictReader(f)
         columns = [(k or "").strip() for k in (reader.fieldnames or [])]
@@ -462,11 +465,24 @@ def _read_curve_csv(csv_path: str) -> tuple[list[str], list[dict]]:
                 if not key:
                     continue
                 try:
-                    row[key] = float(value)
+                    num = float(value)
                 except (TypeError, ValueError):
                     row[key] = None
+                    continue
+                row[key] = num if math.isfinite(num) else None
             rows.append(row)
     return columns, rows
+
+
+def _json_safe(obj: Any) -> Any:
+    """递归把非有限浮点（nan/inf）换成 None，保证响应可 JSON 序列化。"""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 
 def _register_run(task: _Task) -> None:

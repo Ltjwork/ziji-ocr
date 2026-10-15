@@ -41,7 +41,7 @@ from segmenter import (
 
 
 
-BACKEND_BUILD = "fulltext-auto-refresh-2026-10-15-v152"
+BACKEND_BUILD = "model-manage-epochs-2026-10-15-v156"
 
 
 

@@ -449,6 +449,81 @@ def models_delete_run(req: ModelDeleteRunRequest):
     return result
 
 
+class ModelImportRequest(BaseModel):
+    layer: str
+    path: str
+
+
+@app.post("/models/import")
+def models_import(req: ModelImportRequest):
+    """导入外部 .pt 模型为该层的一个 run（复制进训练根并登记）。
+
+    导入后与其他训练 run 同等管理：启用/删除/对比测试/按轮启用；
+    无训练历史，曲线弹窗会提示没有 results.csv。"""
+    import train_registry
+
+    if req.layer not in train_registry.LAYERS:
+        raise HTTPException(status_code=400, detail=f"未知层：{req.layer}")
+    try:
+        return train_registry.import_model(req.layer, req.path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.get("/models/cleanup_scan")
+def models_cleanup_scan():
+    """扫描训练模型根目录：每个 run 的占用与状态（清理中心数据源）。"""
+    import train_registry
+
+    try:
+        return train_registry.cleanup_scan()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class ModelCleanupRequest(BaseModel):
+    layer: str
+    run_dir: str
+    action: str  # epochs=删全部中间轮 | dir=整删未登记残目录
+
+
+@app.post("/models/cleanup")
+def models_cleanup(req: ModelCleanupRequest):
+    """清理一个 run：epochs=删全部中间轮（保留 best/last 与启用来源）；
+    dir=整删未登记残目录（已登记 run 走 /models/delete_run）。"""
+    import train_registry
+
+    if req.layer not in train_registry.LAYERS:
+        raise HTTPException(status_code=400, detail=f"未知层：{req.layer}")
+    try:
+        return train_registry.cleanup_run(req.layer, req.run_dir, req.action)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class ModelDeleteCheckpointRequest(BaseModel):
+    layer: str
+    path: str
+
+
+@app.post("/models/delete_checkpoint")
+def models_delete_checkpoint(req: ModelDeleteCheckpointRequest):
+    """删除一个中间轮检查点（epoch{N}.pt）释放磁盘。
+
+    best/last 与当前启用来源检查点由后端拒绝；运行中模型是稳定副本，
+    删除不影响推理。"""
+    import train_registry
+
+    if req.layer not in train_registry.LAYERS:
+        raise HTTPException(status_code=400, detail=f"未知层：{req.layer}")
+    try:
+        result = train_registry.delete_checkpoint(req.layer, req.path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    result["size_mb_freed"] = round(result["size"] / 1024 / 1024, 1)
+    return result
+
+
 @app.get("/models/run_size")
 def models_run_size(run_dir: str):
     """run 目录磁盘占用（删除确认框展示用）。"""

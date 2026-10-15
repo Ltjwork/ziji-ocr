@@ -78,6 +78,10 @@ class SegmentRequest(BaseModel):
     # 人工已确认版面区（Dart 侧 ensurePageAnnotation 从现有标注取）：
     # 区域门控优先用它，结果的 main_regions 原样带回（确认身份不丢）。
     gate_regions: List[GateRegion] = []
+    # 按项目的多层模型覆写（Dart 侧 project.modelOverrides）：layer ->
+    # .pt 路径（任意 run 的 best 或某轮检查点），''=该层强制停用；
+    # 缺省/空 = 跟随全局注册表启用。线程本地存储，请求结束清空。
+    model_overrides: dict = {}
 
 
 
@@ -233,6 +237,9 @@ def segment(req: SegmentRequest):
         segmenter.set_models_disabled(True)
     if req.test_layer and req.test_model_path:
         segmenter.set_model_test(req.test_layer, req.test_model_path)
+    # 项目级模型覆写（模型管理页「本项目使用」）：线程本地，本请求内
+    # _get_custom_model 按层取用；finally 清空防串线。
+    segmenter.set_model_overrides(req.model_overrides or None)
     try:
         begin_debug_trace()
         img_test = _imread(req.image_path)
@@ -313,6 +320,7 @@ def segment(req: SegmentRequest):
         if not req.use_models:
             segmenter.set_models_disabled(False)
         segmenter.set_model_test(None, None)
+        segmenter.set_model_overrides(None)
         _release_recognition_slot(exclusive=exclusive)
         print(
             f"[segment] finished in {time.time() - segment_started:.1f}s",

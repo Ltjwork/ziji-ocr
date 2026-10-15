@@ -113,8 +113,13 @@ class _ModelComparePageState extends State<ModelComparePage> {
   String? _ckptB;
 
   /// 各 run 的检查点清单（/train/curve 拉取一次后缓存，键为 run_dir）；
-  /// 拉取失败缓存空清单——轮数下拉隐藏，测试仍用 run 的 best。
+  /// 拉取失败的 run 不进这张表——轮数下拉暂时隐藏，下次切换模型/层级
+  /// 自动重试（此前失败被永久缓存成空清单，/train/curve 故障期间轮数
+  /// 下拉整个会话不再出现，用户无从得知入口为何消失）。
   final Map<String, _RunCheckpoints> _ckptsByRun = {};
+
+  /// 检查点清单拉取失败的 run 目录（界面就近提示"获取失败可重试"）。
+  final Set<String> _ckptFetchFailed = {};
 
   /// 对比方式：'side' 左右并排 | 'slider' 滑动叠加。
   String _mode = 'side';
@@ -294,6 +299,8 @@ class _ModelComparePageState extends State<ModelComparePage> {
       p.normalize(dir).replaceAll('/', '\\').toLowerCase();
 
   /// 拉取并缓存一次 run 的检查点清单与逐轮主指标（/train/curve）。
+  /// 失败不缓存，只记入 [_ckptFetchFailed] 供界面提示，下次触发
+  /// [_syncCkpts] 时自动重试。
   Future<void> _ensureCkpts(String? runDir) async {
     if (runDir == null || runDir.isEmpty || _ckptsByRun.containsKey(runDir)) {
       return;
@@ -318,11 +325,11 @@ class _ModelComparePageState extends State<ModelComparePage> {
           .toList();
       setState(() {
         _ckptsByRun[runDir] = _RunCheckpoints(items, metric?.$2, metricByEpoch);
+        _ckptFetchFailed.remove(runDir);
       });
     } catch (_) {
       if (!mounted) return;
-      setState(() =>
-          _ckptsByRun[runDir] = const _RunCheckpoints([], null, {}));
+      setState(() => _ckptFetchFailed.add(runDir));
     }
   }
 
@@ -844,7 +851,12 @@ class _ModelComparePageState extends State<ModelComparePage> {
                               if (v != null) setState(() => _ckptA = v);
                             },
                     ),
-                  ],
+                  ] else if (_ckptFetchFailed.contains(ckptRunDirA))
+                    const Padding(
+                      padding: EdgeInsets.only(left: 6),
+                      child: Text('轮数清单获取失败，切换模型重试',
+                          style: TextStyle(fontSize: 11, color: Colors.grey)),
+                    ),
                   const SizedBox(width: 6),
                   const Text('对比：', style: TextStyle(fontSize: 13)),
                   SegmentedButton<String>(
@@ -923,7 +935,12 @@ class _ModelComparePageState extends State<ModelComparePage> {
                                 if (v != null) setState(() => _ckptB = v);
                               },
                       ),
-                    ],
+                    ] else if (_ckptFetchFailed.contains(ckptRunDirB))
+                      const Padding(
+                        padding: EdgeInsets.only(left: 6),
+                        child: Text('轮数清单获取失败，切换模型重试',
+                            style: TextStyle(fontSize: 11, color: Colors.grey)),
+                      ),
                     const SizedBox(width: 6),
                   ],
                 ],

@@ -27,11 +27,17 @@ class TrainingCurveDialog extends StatefulWidget {
   /// 启用某个模型文件（宿主页决定路由到哪条激活接口）。
   final Future<void> Function(String modelPath) onActivate;
 
+  /// 删除一个中间轮检查点（epoch{N}.pt，释放磁盘；宿主页按层路由到
+  /// /models/delete_checkpoint）。null = 不显示删除入口（如墨迹比对，
+  /// 没有中间轮检查点）。后端会拒绝 best/last 与当前启用来源。
+  final Future<void> Function(String path)? onDeleteCheckpoint;
+
   const TrainingCurveDialog({
     super.key,
     required this.runs,
     required this.title,
     required this.onActivate,
+    this.onDeleteCheckpoint,
     this.autoRefresh = false,
     this.activePath,
   });
@@ -91,6 +97,7 @@ class _TrainingCurveDialogState extends State<TrainingCurveDialog>
   String? _error;
   int _tab = 0;
   final Set<String> _activating = {};
+  final Set<String> _deleting = {};
   Timer? _timer;
 
   @override
@@ -435,18 +442,76 @@ class _TrainingCurveDialogState extends State<TrainingCurveDialog>
               ? null
               : Text(details.join(' · '),
                   style: const TextStyle(fontSize: 10.5, color: Colors.grey)),
-          trailing: _activating.contains(path)
+          trailing: _activating.contains(path) || _deleting.contains(path)
               ? const SizedBox(
                   width: 15,
                   height: 15,
                   child: CircularProgressIndicator(strokeWidth: 2))
-              : TextButton(
-                  onPressed: isActive ? null : () => unawaited(_activate(path)),
-                  child: const Text('启用', style: TextStyle(fontSize: 12)),
-                ),
+              : Row(mainAxisSize: MainAxisSize.min, children: [
+                  if (widget.onDeleteCheckpoint != null)
+                    IconButton(
+                      visualDensity: VisualDensity.compact,
+                      tooltip: epoch != null
+                          ? '删除此轮检查点，释放磁盘'
+                          : '删除 $name（当前启用中的版本不可删）',
+                      icon: Icon(Icons.delete_outline,
+                          size: 17, color: Colors.red.shade300),
+                      onPressed: () =>
+                          unawaited(_deleteCheckpoint(path, label, sizeMb)),
+                    ),
+                  TextButton(
+                    onPressed:
+                        isActive ? null : () => unawaited(_activate(path)),
+                    child: const Text('启用', style: TextStyle(fontSize: 12)),
+                  ),
+                ]),
         );
       },
     );
+  }
+
+  /// 删除中间轮检查点：确认框（体积提示）→ 宿主回调 → 刷新检查点清单。
+  Future<void> _deleteCheckpoint(String path, String label, double sizeMb) async {
+    final onDelete = widget.onDeleteCheckpoint;
+    if (onDelete == null) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除模型文件'),
+        content: Text(
+            '$label（约 ${sizeMb.toStringAsFixed(0)} MB）删除后不可恢复。\n'
+            '当前启用的模型是独立副本，不受影响（启用中的版本不可删）。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(
+                backgroundColor: Colors.red.shade400),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    setState(() => _deleting.add(path));
+    try {
+      await onDelete(path);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已删除：$label')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('删除失败：$e')),
+      );
+    } finally {
+      if (mounted) setState(() => _deleting.remove(path));
+      await _load(silent: true);
+    }
   }
 
   Future<void> _activate(String path) async {

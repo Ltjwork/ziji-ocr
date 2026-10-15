@@ -11,6 +11,8 @@ import '../models/models.dart';
 import '../services/python_service.dart';
 import '../services/storage.dart';
 import 'training_curve_dialog.dart';
+import 'model_cleanup_dialog.dart';
+import '../widgets/model_run_tile.dart';
 
 /// 模型使用管理：集中查看/配置五个层级（正文区/段落/行/单字检测/单字候选
 /// 分类）各自使用的自训模型。
@@ -146,6 +148,109 @@ class _ModelManagePageState extends State<ModelManagePage> {
       }
     } finally {
       if (mounted) setState(() => _busy.remove(layer));
+    }
+  }
+
+  /// 清理训练模型目录：扫描各 run 占用，按 run 清理中间轮/删残目录。
+  Future<void> _openCleanupCenter() async {
+    await showDialog<void>(
+      context: context,
+      builder: (_) => const ModelCleanupDialog(),
+    );
+    unawaited(_load());
+  }
+
+  /// 导入外部 .pt 模型为该层的一个 run：复制进训练根并登记，与训练
+  /// 产物同等管理（启用/删除/对比测试/按轮启用）。
+  Future<void> _importModel(_ManagedLayer layer) async {
+    final picked = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['pt'],
+      dialogTitle: '选择要导入的${layer.label}模型（.pt）',
+    );
+    if (picked == null || picked.files.isEmpty) return;
+    final path = picked.files.single.path;
+    if (path == null || !mounted) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('导入${layer.label}模型'),
+        content: Text('$path\n\n'
+            '复制进训练模型目录并登记为一个新 run，'
+            '可随时启用、删除或参与对比测试（导入的模型没有训练曲线）。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('导入'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _busy.add(layer.key));
+    try {
+      await PythonService.importModel(layer: layer.key, path: path);
+      await _load();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已导入为${layer.label}新模型，可在列表里启用')),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('导入失败：$e')),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy.remove(layer.key));
+    }
+  }
+
+  /// 删除一个中间轮检查点（epoch{N}.pt）释放磁盘：确认框 → 后端拒绝
+  /// best/last 与当前启用来源 → 刷新模型列表与检查点清单。
+  Future<void> _deleteCheckpoint(String layer, String path) async {
+    final name = p.basename(path);
+    final sizeMb = (await File(path).length()) / 1024 / 1024;
+    if (!mounted) return;
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('删除模型文件'),
+        content: Text(
+            '$name（约 ${sizeMb.toStringAsFixed(0)} MB）删除后不可恢复。\n'
+            '当前启用的模型是独立副本，不受影响。'
+            '${name == 'best.pt' ? '\n注意：best 是该 run 的登记产物，删除后该 run 将失去 best 标记（剩余轮数与训练曲线保留）。' : ''}'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.red.shade400),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('删除'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    try {
+      await PythonService.deleteModelCheckpoint(layer: layer, path: path);
+      await _load();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('已删除：$name')),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('删除失败：$e')),
+        );
+      }
     }
   }
 
@@ -432,9 +537,8 @@ class _ModelManagePageState extends State<ModelManagePage> {
   /// 第 N 轮）直接启用——onActivate 走 /models/activate（收任意 .pt）。
   void _showRunCurve(_ManagedLayer layer, Map<String, dynamic> run) {
     final runDir = run['run_dir']?.toString() ?? '';
-    final best = run['best']?.toString() ?? '';
-    if (runDir.isEmpty || best.isEmpty) return;
-    final label = _runDirName(best);
+    if (runDir.isEmpty) return;
+    final label = p.basename(runDir).replaceFirst(RegExp(r'^run_'), '');
     showDialog(
       context: context,
       builder: (ctx) => TrainingCurveDialog(
@@ -443,6 +547,11 @@ class _ModelManagePageState extends State<ModelManagePage> {
         activePath: (_models[layer.key]?['active_source'] as String?) ??
             (_models[layer.key]?['active'] as String?),
         onActivate: (path) => _activate(layer.key, modelPath: path),
+        onDeleteCheckpoint: (path) async {
+          await PythonService.deleteModelCheckpoint(
+              layer: layer.key, path: path);
+          await _load();
+        },
       ),
     );
   }
@@ -461,6 +570,11 @@ class _ModelManagePageState extends State<ModelManagePage> {
       appBar: AppBar(
         title: const Text('模型使用管理'),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.cleaning_services),
+            tooltip: '清理训练模型目录',
+            onPressed: _openCleanupCenter,
+          ),
           IconButton(icon: const Icon(Icons.refresh), onPressed: _load),
         ],
       ),
@@ -503,6 +617,11 @@ class _ModelManagePageState extends State<ModelManagePage> {
               ),
               if (widget.embedded) ...[
                 const SizedBox(width: 8),
+                IconButton(
+                  icon: const Icon(Icons.cleaning_services, size: 19),
+                  tooltip: '清理训练模型目录',
+                  onPressed: _openCleanupCenter,
+                ),
                 IconButton(
                   icon: const Icon(Icons.refresh, size: 20),
                   tooltip: '刷新',
@@ -658,9 +777,13 @@ class _ModelManagePageState extends State<ModelManagePage> {
     final entry = _models[layer.key] ?? const {};
     final active = entry['active'] as String?;
     final activeMetrics = entry['active_metrics'] as Map<String, dynamic>?;
+    // best 被单独删除的 run 仍显示（按 run_dir + 剩余检查点渲染），
+    // 只有彻底空壳（无 best 无检查点）的占位条目才过滤掉。
     final runs = ((entry['runs'] as List?) ?? const [])
         .map((r) => Map<String, dynamic>.from(r as Map))
-        .where((r) => (r['best'] as String?)?.isNotEmpty == true)
+        .where((r) =>
+            (r['best'] as String?)?.isNotEmpty == true ||
+            ((r['checkpoints'] as List?) ?? const []).isNotEmpty)
         .toList();
 
     final map50 = activeMetrics?['metrics/mAP50(B)'];
@@ -689,6 +812,14 @@ class _ModelManagePageState extends State<ModelManagePage> {
                   ),
                 ),
                 const Spacer(),
+                IconButton(
+                  icon: const Icon(Icons.upload_file, size: 16),
+                  tooltip: '导入外部 .pt 模型为该层新模型',
+                  visualDensity: VisualDensity.compact,
+                  onPressed: _busy.contains(layer.key)
+                      ? null
+                      : () => unawaited(_importModel(layer)),
+                ),
                 if (_project != null)
                   Text(
                     override == null
@@ -718,72 +849,24 @@ class _ModelManagePageState extends State<ModelManagePage> {
                 style: TextStyle(fontSize: 11.5, color: Colors.grey.shade600),
               ),
             ],
-            for (final run in runs) ...[
-              const SizedBox(height: 4),
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      '${_runDirName(run['best'] as String)} · '
-                      '${run['epochs'] ?? '?'} 轮'
-                      '${run['metrics'] is Map && (run['metrics'] as Map)['metrics/mAP50(B)'] is num ? ' · mAP50 ${(run['metrics'] as Map)['metrics/mAP50(B)'].toStringAsFixed(2)}' : ''}',
-                      style: const TextStyle(fontSize: 12),
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  TextButton(
-                    onPressed: _busy.contains(layer.key)
-                        ? null
-                        : () => _activate(
-                            layer.key,
-                            modelPath: run['best'] as String,
-                          ),
-                    style: TextButton.styleFrom(
-                      visualDensity: VisualDensity.compact,
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                    ),
-                    child: Text(
-                      _project == null ? '启用' : '启用为全局',
-                      style: const TextStyle(fontSize: 11.5),
-                    ),
-                  ),
-                  if (_project != null)
-                    TextButton(
-                      onPressed: () =>
-                          _setProjectOverride(layer.key, run['best'] as String),
-                      style: TextButton.styleFrom(
-                        visualDensity: VisualDensity.compact,
-                        padding: const EdgeInsets.symmetric(horizontal: 8),
-                      ),
-                      child: Text(
-                        '本项目使用',
-                        style: TextStyle(
-                          fontSize: 11.5,
-                          color: Colors.blue.shade700,
-                        ),
-                      ),
-                    ),
-                  IconButton(
-                    icon: const Icon(Icons.show_chart, size: 16),
-                    tooltip: '训练曲线 · 按轮启用（best/last/第 N 轮）',
-                    visualDensity: VisualDensity.compact,
-                    onPressed: () => _showRunCurve(layer, run),
-                  ),
-                  IconButton(
-                    icon: Icon(
-                      Icons.delete_outline,
-                      size: 16,
-                      color: Colors.red.shade400,
-                    ),
-                    tooltip: '删除该 run（目录+注册表条目；启用中先自动停用）',
-                    visualDensity: VisualDensity.compact,
-                    onPressed: _busy.contains(layer.key)
-                        ? null
-                        : () => unawaited(_confirmDeleteRun(layer.key, run)),
-                  ),
-                ],
+            for (final run in runs)
+              ModelRunTile(
+                run: run,
+                metricLabel:
+                    layer.key == 'char_cls' ? 'top1' : 'mAP50-95',
+                activeSource: entry['active_source'] as String?,
+                projectMode: _project != null,
+                projectOverride: _project?.modelOverrides[layer.key],
+                onActivate: (path) => _activate(layer.key, modelPath: path),
+                onProjectUse: (path) =>
+                    _setProjectOverride(layer.key, path),
+                onDeleteCheckpoint: (path) =>
+                    _deleteCheckpoint(layer.key, path),
+                onShowCurve: () => _showRunCurve(layer, run),
+                onDeleteRun: () async {
+                  await _confirmDeleteRun(layer.key, run);
+                },
               ),
-            ],
             if (active != null) ...[
               const SizedBox(height: 2),
               Row(

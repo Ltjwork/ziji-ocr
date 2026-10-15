@@ -609,6 +609,29 @@ class TrainingCurveTests(unittest.TestCase):
         self.assertEqual(curve["rows"][1]["train/box_loss"], None)
         self.assertEqual(curve["rows"][1]["metrics/mAP50(B)"], None)
 
+    def test_curve_nan_inf_cells_become_json_safe(self):
+        # 实测（2026-10-15 单字检测 run）：训练早期 val 列写出 nan，原样
+        # 返回会让 JSONResponse（allow_nan=False）500，连接被中途掐断，
+        # 前端还把中断误报成"后端不可达"。nan/inf 必须降级为 None 断点，
+        # 且整个响应（含 done.json）都能过严格 JSON 序列化。
+        self._write(
+            "run/train/results.csv",
+            "epoch,val/box_loss,metrics/mAP50(B)\n"
+            "1,nan,0.0\n2,inf,1e-05\n3,-inf,2.5\n4,1.8,3.0\n",
+        )
+        self._write(
+            "run/done.json",
+            '{"metrics": {"mAP50": 0.5, "bad": NaN}, "epochs": 3}',
+        )
+        curve = training_curve(os.path.join(self._tmp, "run"))
+        self.assertIsNone(curve["rows"][0]["val/box_loss"])
+        self.assertIsNone(curve["rows"][1]["val/box_loss"])
+        self.assertIsNone(curve["rows"][2]["val/box_loss"])
+        self.assertAlmostEqual(curve["rows"][3]["val/box_loss"], 1.8)
+        self.assertIsNone(curve["done"]["metrics"]["bad"])
+        self.assertAlmostEqual(curve["done"]["metrics"]["mAP50"], 0.5)
+        json.dumps(curve, allow_nan=False)  # 响应序列化不再抛 ValueError
+
     def test_siamese_curve_reads_run_level_csv(self):
         self._write(
             "run/results.csv",

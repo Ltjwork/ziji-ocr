@@ -18,8 +18,11 @@ import cv2
 import numpy as np
 import imaging
 import registry_io
+import csv
+import math
 from train_data import (LAYER_INFO, LAYERS, SERVICE_DIR,
     TRAINING_REQUIREMENTS, _layer_default_model, _log, trained_root_dir)
+from train_worker import list_checkpoints
 
 
 
@@ -161,6 +164,76 @@ def reconcile_disk_runs() -> int:
     return added
 
 
+# 各任务类型的主指标列（管理页检查点行与曲线弹窗同口径展示）。
+_PRIMARY_METRIC_BY_TASK = {
+    "detect": ("metrics/mAP50-95(B)", "mAP50-95"),
+    "classify": ("metrics/accuracy_top1", "top1"),
+}
+
+
+def _epoch_primary_metrics(csv_path: str, metric_col: str) -> dict[int, float]:
+    """results.csv → {epoch: 主指标值}（列缺失/解析失败返回空表）。"""
+    out: dict[int, float] = {}
+    try:
+        with open(csv_path, encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fields = {(k or "").strip() for k in (reader.fieldnames or [])}
+            if metric_col not in fields or "epoch" not in fields:
+                return out
+            for raw in reader:
+                try:
+                    epoch = int(float(raw.get("epoch") or ""))
+                    value = float(raw.get(metric_col) or "")
+                except (TypeError, ValueError):
+                    continue
+                # nan/inf 不进响应（JSON 不允许非有限浮点，与
+                # /train/curve 的降级口径一致）
+                if math.isfinite(value):
+                    out[epoch] = value
+    except OSError:
+        pass
+    return out
+
+
+def _run_checkpoint_list(layer: str, run: dict) -> list[dict]:
+    """run 的检查点清单（含每轮主指标）：管理页展开行直接渲染，不用
+    再逐 run 拉 /train/curve。best 行指标取注册表登记值，epoch 行取
+    results.csv，last 行取 CSV 末轮；读不到就是 None（前端留空）。"""
+    run_dir = str(run.get("run_dir") or "")
+    if not run_dir:
+        return []
+    weights = os.path.join(run_dir, "train", "weights")
+    items = list_checkpoints(weights)
+    if not items:
+        return []
+    metric_col, _label = _PRIMARY_METRIC_BY_TASK.get(
+        LAYER_INFO.get(layer, {}).get("task", ""), (None, None))
+    by_epoch: dict[int, float] = {}
+    if metric_col:
+        by_epoch = _epoch_primary_metrics(
+            os.path.join(run_dir, "train", "results.csv"), metric_col)
+    reg_metrics = run.get("metrics") if isinstance(run.get("metrics"), dict) else {}
+    out = []
+    for c in items:
+        metric = None
+        if c["name"] == "best.pt" and metric_col:
+            metric = reg_metrics.get(metric_col)
+        elif c["epoch"] is not None:
+            metric = by_epoch.get(c["epoch"])
+        elif c["name"] == "last.pt" and by_epoch:
+            metric = by_epoch.get(max(by_epoch))
+        try:
+            if metric is not None and math.isfinite(metric):
+                metric = round(float(metric), 6)
+            else:
+                metric = None
+        except (TypeError, ValueError):
+            metric = None
+        out.append({"name": c["name"], "epoch": c["epoch"],
+                    "path": c["path"], "size": c["size"], "metric": metric})
+    return out
+
+
 def list_models() -> dict:
     reg = _load_registry()
     try:
@@ -196,6 +269,12 @@ def list_models() -> dict:
             default_path = resolve_model_path(layer)
         except Exception:
             default_path = ""
+        for r in runs:
+            try:
+                r["checkpoints"] = _run_checkpoint_list(layer, r)
+            except Exception as exc:
+                r["checkpoints"] = []
+                _log(f"[registry] 检查点清单读取失败（{layer} run 条目仍返回）: {exc}")
         out[layer] = {
             "active": active,
             # 启用模型溯源：来自哪个 run 的哪个 .pt（曲线检查点行的
@@ -243,7 +322,8 @@ def activate_model(layer: str, model_path: str | None = None) -> dict:
     """启用某层的已训练模型。
 
     [model_path] 为空时启用最近一次成功训练的 best.pt；也可以指定任意一次
-    训练产出的 best.pt 路径（须真实存在），便于回退到旧版本模型。
+    训练产出的模型文件路径（best.pt 或中间轮 epoch{N}.pt，须真实存在），
+    便于回退旧版本或按轮启用（训练曲线弹窗的检查点行）。
     """
     if layer not in LAYER_INFO:
         raise ValueError(f"unknown layer: {layer}")
@@ -256,6 +336,16 @@ def activate_model(layer: str, model_path: str | None = None) -> dict:
             raise ValueError(f"model file not found: {model_path}")
         source = model_path
         best_run = next((r for r in runs if r.get("best") == model_path), None)
+        if best_run is None:
+            # 中间轮检查点（epoch{N}.pt）不等于任何 run 的 best：按所在
+            # run 目录归属（训练曲线弹窗"按轮启用"走的就是这种路径），
+            # 指标/时间取该 run 的登记值做展示兜底。
+            nc = os.path.normcase(os.path.normpath(os.path.abspath(model_path)))
+            best_run = next(
+                (r for r in runs if str(r.get("run_dir") or "") and nc.startswith(
+                    os.path.normcase(os.path.normpath(
+                        os.path.abspath(str(r["run_dir"])))) + os.sep)),
+                None)
     else:
         if not runs:
             raise ValueError(f"{layer} 没有可用的已训练模型")
@@ -268,10 +358,10 @@ def activate_model(layer: str, model_path: str | None = None) -> dict:
     shutil.copyfile(source, stable_path)
 
     entry["active"] = stable_path
-    # 溯源：稳定副本来自哪个 run 的 best（删除该 run 时据此自动停用）
+    # 溯源：稳定副本来自哪个 run 的哪个 .pt（删除该 run 时据此自动停用）
     entry["active_source"] = source
-    entry["active_metrics"] = best_run.get("metrics")
-    entry["active_started"] = best_run.get("started")
+    entry["active_metrics"] = (best_run or {}).get("metrics")
+    entry["active_started"] = (best_run or {}).get("started")
     entry["active_since"] = time.time()
     reg.setdefault("layers", {})[layer] = entry
     _save_registry(reg)
@@ -373,6 +463,232 @@ def delete_run(layer: str, run_dir: str) -> dict:
     _save_registry(reg)
     _log(f"[registry] 已删除 {layer} run：{target}")
     return {"layer": layer, "run_dir": target, "deactivated": bool(active)}
+
+
+def delete_checkpoint(layer: str, path: str) -> dict:
+    """删除 run 里的一个模型文件（best.pt / last.pt / epoch{N}.pt）。
+
+    每个版本都可单独删除（用户按需留档释放磁盘）；唯一硬保护是当前
+    启用模型的来源（active_source）不可删——运行中模型是稳定副本
+    （models/active_<layer>.pt），删其他源文件不影响推理。删 best 时
+    同步清掉注册表里该 run 的 best 标记（run 仍登记，剩余轮数与训练
+    曲线入口保留）。安全边界与 delete_run 同口径：只允许当前训练根
+    <layer>/run_*/train/weights/ 下的这三类文件名。
+    """
+    if layer not in LAYER_INFO:
+        raise ValueError(f"unknown layer: {layer}")
+    layer_root = os.path.normcase(os.path.normpath(
+        os.path.abspath(os.path.join(trained_root_dir(), layer))))
+    full = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    if not full.startswith(layer_root + os.sep):
+        raise ValueError(f"路径不在 {layer} 的训练目录内")
+    weights_dir = os.path.dirname(full)
+    name = os.path.basename(full)
+    if (os.path.basename(weights_dir) != "weights"
+            or os.path.basename(os.path.dirname(weights_dir)) != "train"
+            or not re.fullmatch(r"(epoch\d+|best|last)\.pt", name)):
+        raise ValueError(
+            "只能删除 run 检查点（…/train/weights/ 下 的 best.pt / "
+            "last.pt / epochN.pt）")
+    if not os.path.exists(full):
+        raise ValueError(f"文件不存在：{path}")
+
+    reg = _load_registry()
+    entry = reg.get("layers", {}).get(layer, {})
+    active_source = entry.get("active_source")
+    if active_source and os.path.normcase(os.path.normpath(
+            os.path.abspath(str(active_source)))) == full:
+        raise ValueError("该文件是当前启用模型的来源；请先启用其他版本再删除")
+
+    size = os.path.getsize(full)
+    os.remove(full)
+    if name == "best.pt":
+        # 该 run 失去 best 标记（仍登记；list_models 照常返回，
+        # 客户端按 run_dir + 剩余检查点渲染）
+        changed = False
+        for r in entry.get("runs", []):
+            if r.get("best") and os.path.normcase(os.path.normpath(
+                    os.path.abspath(str(r["best"])))) == full:
+                r["best"] = None
+                changed = True
+        if changed:
+            _save_registry(reg)
+    _log(f"[registry] 已删除 {layer} 检查点：{full}（{size} 字节）")
+    return {"layer": layer, "path": full, "size": size}
+
+
+def import_model(layer: str, path: str) -> dict:
+    """导入外部 .pt 模型为该层的一个 run（复制进训练根并登记）。
+
+    用于把别处训练/拷贝来的模型纳入统一管理：可启用、可删除、可进
+    对比测试与按轮启用（无训练历史，曲线弹窗会提示没有 results.csv）。
+    返回新 run 的注册表条目。
+    """
+    if layer not in LAYER_INFO:
+        raise ValueError(f"unknown layer: {layer}")
+    if not path.lower().endswith(".pt"):
+        raise ValueError("只支持导入 .pt 模型文件")
+    if not os.path.isfile(path):
+        raise ValueError(f"文件不存在：{path}")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = os.path.join(trained_root_dir(), layer, f"run_import_{stamp}")
+    suffix = 2
+    while os.path.exists(run_dir):
+        run_dir = os.path.join(trained_root_dir(), layer,
+                               f"run_import_{stamp}_{suffix}")
+        suffix += 1
+    weights = os.path.join(run_dir, "train", "weights")
+    os.makedirs(weights, exist_ok=True)
+    best = os.path.join(weights, "best.pt")
+    shutil.copyfile(path, best)
+    with open(os.path.join(run_dir, "done.json"), "w", encoding="utf-8") as f:
+        json.dump({"best": best, "metrics": None, "epochs": None,
+                   "imported": True, "source": os.path.abspath(path)},
+                  f, ensure_ascii=False, indent=1)
+    reg = _load_registry()
+    entry = reg.setdefault("layers", {}).setdefault(
+        layer, {"active": None, "runs": []})
+    record = {
+        "run_dir": run_dir,
+        "best": best,
+        "metrics": None,
+        "epochs": None,
+        "base_model": f"导入自 {os.path.abspath(path)}",
+        "started": time.time(),
+        "imported": True,
+    }
+    entry.setdefault("runs", []).append(record)
+    _save_registry(reg)
+    _log(f"[registry] 已导入 {layer} 模型：{path} -> {best}")
+    return record
+
+
+def cleanup_scan() -> dict:
+    """扫描训练模型根目录：每个 run 的磁盘占用与状态（清理页数据源）。
+
+    registered=注册表可查（曲线/对比/按轮入口可用）；finished=训练正常
+    完成（有 done.json）；trained=有训练曲线（results.csv）。三者皆无的
+    是启动失败/手动中断的残目录，清理页可整删。best_mb 含 best/last，
+    epochs_mb 是全部中间轮（epochN.pt）。
+    """
+    root = trained_root_dir()
+    reg = _load_registry()
+    known = set()
+    for entry in reg.get("layers", {}).values():
+        for r in entry.get("runs", []):
+            d = str(r.get("run_dir") or "")
+            if d:
+                known.add(os.path.normcase(os.path.normpath(
+                    os.path.abspath(d))))
+    runs_out = []
+    if os.path.isdir(root):
+        for layer in sorted(os.listdir(root)):
+            layer_dir = os.path.join(root, layer)
+            if layer.startswith(".") or not os.path.isdir(layer_dir):
+                continue
+            for name in sorted(os.listdir(layer_dir)):
+                run_dir = os.path.join(layer_dir, name)
+                if not name.startswith("run_") or not os.path.isdir(run_dir):
+                    continue
+                key = os.path.normcase(os.path.normpath(
+                    os.path.abspath(run_dir)))
+                weights = os.path.join(run_dir, "train", "weights")
+                epochs_count = 0
+                epochs_mb = 0.0
+                best_mb = 0.0
+                if os.path.isdir(weights):
+                    for f in os.listdir(weights):
+                        fp = os.path.join(weights, f)
+                        if not os.path.isfile(fp):
+                            continue
+                        try:
+                            mb = os.path.getsize(fp) / 1024 / 1024
+                        except OSError:
+                            continue
+                        if re.fullmatch(r"epoch\d+\.pt", f):
+                            epochs_count += 1
+                            epochs_mb += mb
+                        elif f in ("best.pt", "last.pt"):
+                            best_mb += mb
+                runs_out.append({
+                    "layer": layer,
+                    "run_dir": run_dir,
+                    "name": name,
+                    "registered": key in known,
+                    "finished": os.path.exists(
+                        os.path.join(run_dir, "done.json")),
+                    "trained": os.path.exists(
+                        os.path.join(run_dir, "train", "results.csv"))
+                    or os.path.exists(os.path.join(run_dir, "results.csv")),
+                    "epochs_count": epochs_count,
+                    "epochs_mb": round(epochs_mb, 1),
+                    "best_mb": round(best_mb, 1),
+                    "size_mb": round(epochs_mb + best_mb, 1),
+                })
+    return {"root": root, "total_mb": round(sum(r["size_mb"] for r in runs_out), 1),
+            "runs": runs_out}
+
+
+def cleanup_run(layer: str, run_dir: str, action: str) -> dict:
+    """清理一个 run：action='epochs' 删全部中间轮检查点（保留 best/last
+    与当前启用来源）；action='dir' 整删未登记的残目录（注册过的 run 走
+    /models/delete_run——那里有停用与注册表同步）。"""
+    if layer not in LAYER_INFO:
+        raise ValueError(f"unknown layer: {layer}")
+    layer_root = os.path.normcase(os.path.normpath(
+        os.path.abspath(os.path.join(trained_root_dir(), layer))))
+    target = os.path.normcase(os.path.normpath(os.path.abspath(run_dir)))
+    if not target.startswith(layer_root + os.sep):
+        raise ValueError(f"run_dir 不在 {layer} 的训练目录内")
+    if not os.path.isdir(target):
+        raise ValueError(f"run 目录不存在：{run_dir}")
+
+    if action == "dir":
+        reg = _load_registry()
+        entry = reg.get("layers", {}).get(layer, {})
+        known = any(os.path.normcase(os.path.normpath(
+            os.path.abspath(str(r.get("run_dir") or "")))) == target
+            for r in entry.get("runs", []))
+        if known:
+            raise ValueError(
+                "该 run 已登记，请在模型管理里删除（会同步停用与注册表）")
+        shutil.rmtree(target, ignore_errors=False)
+        _log(f"[registry] 已清理 {layer} 残目录：{target}")
+        return {"layer": layer, "run_dir": target, "action": "dir",
+                "deleted": 0, "skipped_active": 0, "freed_mb": 0.0}
+
+    if action != "epochs":
+        raise ValueError(f"unknown action: {action}")
+    weights = os.path.join(target, "train", "weights")
+    if not os.path.isdir(weights):
+        raise ValueError("该 run 没有 weights 目录（没有可清理的检查点）")
+    reg = _load_registry()
+    entry = reg.get("layers", {}).get(layer, {})
+    active_source = entry.get("active_source")
+    active_nc = (os.path.normcase(os.path.normpath(
+        os.path.abspath(str(active_source)))) if active_source else None)
+    freed = 0
+    deleted = 0
+    skipped = 0
+    for f in os.listdir(weights):
+        if not re.fullmatch(r"epoch\d+\.pt", f):
+            continue
+        fp = os.path.join(weights, f)
+        if (active_nc and os.path.normcase(os.path.normpath(
+                os.path.abspath(fp))) == active_nc):
+            skipped += 1
+            continue
+        try:
+            freed += os.path.getsize(fp)
+        except OSError:
+            continue
+        os.remove(fp)
+        deleted += 1
+    _log(f"[registry] 已清理 {layer} 中间轮 {deleted} 个"
+         f"（跳过启用中 {skipped} 个）：{target}")
+    return {"layer": layer, "run_dir": target, "action": "epochs",
+            "deleted": deleted, "skipped_active": skipped,
+            "freed_mb": round(freed / 1024 / 1024, 1)}
 
 
 def run_dir_size_mb(run_dir: str) -> float:
