@@ -26,12 +26,15 @@ import '../services/book_cache.dart';
 import '../services/book_region_apply.dart';
 import '../services/train_auto_export.dart';
 import '../services/mouse_gesture.dart';
+import '../services/editor_shortcut_settings.dart';
 import '../services/page_state_markers.dart';
+import '../services/reading_order.dart';
 import '../services/ollama_service.dart';
 import '../widgets/attached_scrollbar.dart';
 import '../widgets/backend_console_panel.dart';
 import '../widgets/char_rainbow.dart';
 import '../widgets/char_verify_common.dart';
+import '../widgets/ctrl_scroll_zoom.dart';
 import '../widgets/direct_text_panel.dart';
 import '../widgets/engine_settings_section.dart';
 import '../widgets/excalidraw_export_dialog.dart';
@@ -43,6 +46,7 @@ import 'book_split_page.dart';
 import 'export_page.dart';
 import 'straighten_page.dart';
 import 'similar_chars_book_page.dart';
+import '../plugins/plugin_registry.dart';
 import 'similar_chars_page.dart';
 import 'table_review_page.dart';
 
@@ -116,6 +120,21 @@ class _EditorPageState extends State<EditorPage> {
     );
   }
 
+  // 底部翻页栏「隐藏框已确认」开关：确认识别框（玫红）与确认并保存
+  // （绿）的页框几何都已固化，框校对阶段不必再看；过滤后列表只剩还需
+  // 处理框的页（紫/橘黄/灰/无标注）。绿框页同样隐去——完全确认蕴含
+  // 框确认，与下方"框已确认"进度同口径。当前页恒显示，状态持久化。
+  bool _hideBoxesConfirmedPages = false;
+  static const String _prefHideBoxesConfirmedPages =
+      'editor_hide_boxes_confirmed_pages';
+
+  void _setHideBoxesConfirmedPages(bool value) {
+    setState(() => _hideBoxesConfirmedPages = value);
+    SharedPreferences.getInstance().then(
+      (prefs) => prefs.setBool(_prefHideBoxesConfirmedPages, value),
+    );
+  }
+
   // 训练服务的各层数据就绪状态（layer -> readiness）：提供每个模型档位的
   // 下一轮目标（已训档位按轮数进阶）与下一个里程碑，进度卡按档位分条显示。
   Map<String, Map<String, dynamic>> _trainReadiness = {};
@@ -148,7 +167,8 @@ class _EditorPageState extends State<EditorPage> {
   String _reorderTarget = 'line'; // line | paragraph
   final Map<String, int> _pendingLineOrder = {};
   final Map<String, int> _pendingParagraphOrder = {};
-  String _viewMode = 'line'; // 'region' | 'paragraph' | 'line' | 'char' | 'text'（整页直读）
+  String _viewMode =
+      'line'; // 'region' | 'paragraph' | 'line' | 'char' | 'text'（整页直读）
 
   /// 详细视图要滚动定位到的行 id（墨迹归类页「定位」设置）；
   /// 每次定位递增序号，保证定位到同一行的不同字时也会触发滚动。
@@ -159,6 +179,29 @@ class _EditorPageState extends State<EditorPage> {
   /// 10 秒后或下次定位时自动切换/熄灭。
   String? _flashCharId;
   Timer? _flashTimer;
+
+  // ── 画布右上角浮层提示（替代底部 SnackBar）──
+  // 校对操作高频出提示，SnackBar 固定压在窗口底部，会挡住底部工具行
+  // 与画布下缘的拖拽。改为画布右上角的小卡片：IgnorePointer 不截获任何
+  // 手势（缩放/拖框照常），数秒后自动淡出。_toastSeq 递增作 AnimatedSwitcher
+  // 的 key，连续两条相同文案也能重新淡入并重置计时。
+  String? _toastMessage;
+  bool _toastError = false;
+  int _toastSeq = 0;
+  Timer? _toastTimer;
+
+  // ── 多选识别框（Shift+单击逐个加入，快捷键合并/批量删除）──
+  // 只存 id 不存实例：行卡片/级联识别会替换 CharBlock 实例，使用时按
+  // id 在 ann.blocks 里现查。普通单击（_selectBlock）清空多选。
+  final Set<String> _multiSelectedChars = {};
+
+  // ── 合并模式（M 键切换）──
+  // 合并模式下：第一次点击选中第一个字框，第二次点击同行的框自动合并。
+  bool _mergeMode = false;
+  CharBlock? _mergeFirstBox;
+
+  /// 键盘快捷键配置（设置 → 快捷键）：合并/删除识别框的按键。
+  EditorShortcutSettings _shortcuts = const EditorShortcutSettings();
 
   /// 确认后自动增量导出完成 → 刷新训练就绪卡的全局累计数。
   StreamSubscription<void>? _trainExportSub;
@@ -199,6 +242,14 @@ class _EditorPageState extends State<EditorPage> {
 
   void _resetDetailZoom() => setState(() {
     _detailCardWidth = kDetailCardBaseWidth;
+  });
+
+  /// 详细视图 Ctrl+滚轮连续缩放：与缩放按钮同一状态，上滚放大。
+  void _zoomDetailCardBy(double factor) => setState(() {
+    _detailCardWidth = (_detailCardWidth * factor).clamp(
+      kDetailCardMinWidth,
+      kDetailCardMaxWidth,
+    );
   });
 
   void _fontScaleUp() => setState(() {
@@ -259,16 +310,25 @@ class _EditorPageState extends State<EditorPage> {
       if (mounted) unawaited(_loadTrainReadiness());
     });
     unawaited(_loadCharDetModelInfo());
-    // 「隐藏已确认页」开关的持久化状态（上次退出时的选择）。
+    // 「隐藏已确认页」「隐藏框已确认页」开关的持久化状态（上次退出时
+    // 的选择）。
     SharedPreferences.getInstance().then((prefs) {
       final v = prefs.getBool(_prefHideConfirmedPages);
       if (v != null && mounted && v != _hideConfirmedPages) {
         setState(() => _hideConfirmedPages = v);
       }
+      final b = prefs.getBool(_prefHideBoxesConfirmedPages);
+      if (b != null && mounted && b != _hideBoxesConfirmedPages) {
+        setState(() => _hideBoxesConfirmedPages = b);
+      }
     });
     // 鼠标中键手势配置：进页加载一次缓存，松手判定时直接查内存。
     GestureSettings.load().then((s) {
       if (mounted) _gestureSettings = s;
+    });
+    // 键盘快捷键配置（合并/删除识别框的按键可自定义）。
+    EditorShortcutSettings.load().then((s) {
+      if (mounted) setState(() => _shortcuts = s);
     });
     // 进入书籍时把当前页的缩略图滚动到可见位置。
     WidgetsBinding.instance.addPostFrameCallback(
@@ -319,13 +379,24 @@ class _EditorPageState extends State<EditorPage> {
     }
   }
 
-  /// 缩略图列表在「隐藏已确认页」开关下的可见页号；开关关闭时返回
-  /// null（不过滤，直接按原页序显示，大书不白白复制一份列表）。
+  /// 缩略图列表在「隐藏已确认页 / 隐藏框已确认页」开关下的可见页号；
+  /// 两个开关都关闭时返回 null（不过滤，直接按原页序显示，大书不白白
+  /// 复制一份列表）。「框已确认」= 绿框（完全确认）+玫红框（确认识别
+  /// 框）：完全确认蕴含框确认，开关与底部进度条同口径。
+  bool _thumbPageHidden(int i) {
+    if (_hideBoxesConfirmedPages &&
+        (_markers.savedPages.contains(i) ||
+            _markers.boxesReviewedPages.contains(i))) {
+      return true;
+    }
+    return _hideConfirmedPages && _markers.savedPages.contains(i);
+  }
+
   List<int>? _visibleThumbPages(int pageCount) {
-    if (!_hideConfirmedPages) return null;
+    if (!_hideConfirmedPages && !_hideBoxesConfirmedPages) return null;
     return [
       for (var i = 0; i < pageCount; i++)
-        if (i == _pageIndex || !_markers.savedPages.contains(i)) i,
+        if (i == _pageIndex || !_thumbPageHidden(i)) i,
     ];
   }
 
@@ -363,6 +434,7 @@ class _EditorPageState extends State<EditorPage> {
     _persistLastPageIndex();
     _trainExportSub?.cancel();
     _flashTimer?.cancel();
+    _toastTimer?.cancel();
     _focusNode.dispose();
     _thumbScroll.dispose();
     super.dispose();
@@ -428,6 +500,7 @@ class _EditorPageState extends State<EditorPage> {
       _loadingLabel = forceSegment ? '正在重新识别本页…' : '正在识别本页…';
       _error = null;
       _selected = null;
+      _multiSelectedChars.clear();
       _selectedLine = null;
       _reorderMode = false;
       _pendingLineOrder.clear();
@@ -576,10 +649,7 @@ class _EditorPageState extends State<EditorPage> {
       // type cast 类错误只有一行 e.toString() 时无从定位（"type 'Null'
       // is not a subtype of type 'String'" 反复出现而响应解析链逐段
       // 实测均干净，需要堆栈锁定真正抛点）。
-      PythonService.addAppLog(
-        '[载入诊断] 页面识别/载入异常：$e\n$st',
-        isError: true,
-      );
+      PythonService.addAppLog('[载入诊断] 页面识别/载入异常：$e\n$st', isError: true);
       if (!mounted || loadGeneration != _loadGeneration) return;
       setState(() {
         _error = e is RecognitionBusyException
@@ -1040,7 +1110,9 @@ class _EditorPageState extends State<EditorPage> {
                         : done / project.imageFiles.length,
                   ),
                   const SizedBox(height: 12),
-                  Text('已完成 $done / ${project.imageFiles.length} · 改回 $touched 页'),
+                  Text(
+                    '已完成 $done / ${project.imageFiles.length} · 改回 $touched 页',
+                  ),
                   const SizedBox(height: 4),
                   const Text(
                     '确认标记清除中；识别框与文字保留',
@@ -1139,8 +1211,8 @@ class _EditorPageState extends State<EditorPage> {
       cancel
           ? '已停止：改回 $touched 页'
           : touched > 0
-                ? '已把 $touched 页改回未保存（识别框与文字保留，训练统计已回退）'
-                : '本书没有「确认并保存」过的页',
+          ? '已把 $touched 页改回未保存（识别框与文字保留，训练统计已回退）'
+          : '本书没有「确认并保存」过的页',
     );
   }
 
@@ -1471,7 +1543,135 @@ class _EditorPageState extends State<EditorPage> {
 
   // ── block operations ──
 
-  void _selectBlock(CharBlock? b) => setState(() => _selected = b);
+  void _selectBlock(CharBlock? b) => setState(() {
+    if (b != null && _mergeMode) {
+      // 合并模式下的点击由 _handleMergeMode 处理，不在这里消费
+      return;
+    }
+    _selected = b;
+    // 普通单击回到单选语义：清空 Shift 多选集（多选只经 Shift+单击累加）。
+    if (_multiSelectedChars.isNotEmpty) _multiSelectedChars.clear();
+  });
+
+  /// Shift+单击字框：把它加入/移出多选集（合并与批量删除的选择源），
+  /// 同时作为当前选中（属性面板跟随最后点选的框）。
+  void _toggleCharMultiSelect(CharBlock b) => setState(() {
+    if (!_multiSelectedChars.remove(b.id)) _multiSelectedChars.add(b.id);
+    _selected = b;
+  });
+
+  /// 快捷键删除所选识别框：有多选时整组删除，否则删除当前选中（与
+  /// Delete 键同语义，按键可自定义）。
+  void _deleteByShortcut() {
+    if (_multiSelectedChars.isNotEmpty) {
+      final ids = Set<String>.of(_multiSelectedChars);
+      _deleteBlocksByIds(ids);
+      _snack('已删除 ${ids.length} 个识别框');
+      return;
+    }
+    _deleteSelected();
+  }
+
+  /// 按 id 集合批量删除字框：一次 setState、一次落盘（X 键多选删除）。
+  void _deleteBlocksByIds(Set<String> ids) {
+    final ann = _annotation;
+    if (ann == null || ids.isEmpty) return;
+    setState(() {
+      ann.blocks.removeWhere((b) => ids.contains(b.id));
+      for (final line in ann.lines) {
+        final before = line.chars.length;
+        line.chars.removeWhere((c) => ids.contains(c.id));
+        if (line.chars.length != before) {
+          line.text = line.chars.map((c) => c.text).join();
+        }
+      }
+      if (_selected != null && ids.contains(_selected!.id)) _selected = null;
+      _multiSelectedChars.removeAll(ids);
+    });
+    _save();
+  }
+
+  /// 快捷键合并所选识别框：恰好选中同行两个字框时并为一框——矩形取
+  /// 并集、文字按阅读序拼接，并集框随即自动重识别（与手工调框同一
+  /// 通道，新读法不同会进候选）。
+  /// [已弃用] 合并现在通过合并模式实现，见 _handleMergeMode
+  void _mergeMultiSelectedChars() {
+    _snack('合并功能已改为合并模式：按 M 键切换，然后依次点击两个框自动合并');
+  }
+
+  /// M 键切换合并模式：进入模式时提示，退出时清空首框。
+  void _toggleMergeMode() {
+    setState(() {
+      _mergeMode = !_mergeMode;
+      _mergeFirstBox = null;
+      _multiSelectedChars.clear();
+      _selected = null;
+    });
+    _snack(
+      _mergeMode ? '进入合并模式（点击第一个框，再点击第二个框自动合并；按 M 键退出）' : '已退出合并模式',
+    );
+  }
+
+  /// 合并模式下点击字框：第一次选中作为合并源，第二次同行的框自动合并。
+  void _handleMergeMode(CharBlock clicked) {
+    final ann = _annotation;
+    if (ann == null) return;
+
+    if (_mergeFirstBox == null) {
+      // 第一次点击：选中第一个框
+      setState(() {
+        _mergeFirstBox = clicked;
+        _selected = clicked;
+      });
+      _snack('已选中第一个框「${clicked.text}」，点击同一行的第二个框进行合并');
+      return;
+    }
+
+    // 检查是否同行
+    LineBlock? hostLine;
+    for (final line in ann.lines) {
+      final ids = line.chars.map((c) => c.id).toSet();
+      if (ids.contains(_mergeFirstBox!.id) && ids.contains(clicked.id)) {
+        hostLine = line;
+        break;
+      }
+    }
+
+    if (hostLine == null) {
+      _snack('两个框不在同一行，请重新选择', error: true);
+      setState(() => _mergeFirstBox = null);
+      return;
+    }
+
+    // 执行合并
+    final first = _mergeFirstBox!;
+    final second = clicked;
+    final merged = mergeCharBoxes(
+      first,
+      second,
+      horizontal: hostLine.orientation == 'horizontal',
+      rtl: hostLine.orientation == 'horizontal' &&
+          _pageSettings.horizontalDir == 'rtl',
+    );
+    setState(() {
+      hostLine!.chars.removeWhere(
+        (c) => c.id == first.id || c.id == second.id,
+      );
+      _insertCharInReadingOrder(hostLine!, merged);
+      ann.blocks.removeWhere((b) => b.id == first.id || b.id == second.id);
+      ann.blocks.add(merged);
+      hostLine!.manual = true;
+      merged
+        ..aiBoxIssue = null
+        ..aiBoxNote = null;
+      _mergeFirstBox = null;
+      _selected = merged;
+      _mergeMode = false; // 合并完成自动退出合并模式
+    });
+    _save();
+    _queueCharCascade(merged, preserveUserText: false);
+    _snack('已合并为 1 个识别框，正在重新识别');
+  }
 
   void _selectLine(LineBlock? l) => setState(() {
     _selectedLine = l;
@@ -1747,17 +1947,9 @@ class _EditorPageState extends State<EditorPage> {
       ann.tables.add(table);
       await _pushTableReview(table);
     } on TableGridNotFoundException catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text(e.message)));
-      }
+      if (mounted) _snack(e.message, error: true);
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('表格识别失败：$e')));
-      }
+      if (mounted) _snack('表格识别失败：$e', error: true);
     } finally {
       if (mounted) setState(() => _tableBusy = false);
     }
@@ -2322,17 +2514,15 @@ class _EditorPageState extends State<EditorPage> {
 
   void _snack(String message, {bool error = false}) {
     if (!mounted) return;
-    try {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(message),
-          backgroundColor: error ? Colors.red.shade700 : null,
-          duration: Duration(seconds: error ? 4 : 2),
-        ),
-      );
-    } catch (_) {
-      // 元素处于停用窗口（mounted 仍为 true 但不能查祖先）：放弃提示。
-    }
+    _toastTimer?.cancel();
+    setState(() {
+      _toastMessage = message;
+      _toastError = error;
+      _toastSeq++;
+    });
+    _toastTimer = Timer(Duration(seconds: error ? 4 : 2), () {
+      if (mounted) setState(() => _toastMessage = null);
+    });
   }
 
   /// 整页直读完成且行记录落盘后，刷新标注行的整页对照标记
@@ -2344,8 +2534,9 @@ class _EditorPageState extends State<EditorPage> {
   Future<void> _refreshFullTextMarks() async {
     final ann = _annotation;
     if (ann == null || ann.lines.isEmpty) return;
-    final withChars =
-        ann.lines.where((l) => l.chars.isNotEmpty).toList(growable: false);
+    final withChars = ann.lines
+        .where((l) => l.chars.isNotEmpty)
+        .toList(growable: false);
     if (withChars.isEmpty) return;
     try {
       final updates = await PythonService.refreshFullTextCheck(
@@ -2487,7 +2678,68 @@ class _EditorPageState extends State<EditorPage> {
               ],
             ),
           ),
+        // 右上角提示卡片：常驻叶子（内容为空时透明度 0 且不占位），
+        // 出现/消失只动这一片，不触碰画布子树。顶部偏移跟随状态胶囊/
+        // 排序横幅（各约 26/36px 高），避免叠在同一行。
+        Positioned(
+          top: _toastTopOffset,
+          right: 12,
+          child: IgnorePointer(child: _toastCard()),
+        ),
       ],
+    );
+  }
+
+  /// 提示卡片的顶部偏移：避开顶部居中的状态胶囊（_boxReviewChip/
+  /// _cascadeChip，各约 26px 高、间距 6）与排序模式横幅（约 36px）。
+  double get _toastTopOffset {
+    final chips = (_boxReviewing ? 32.0 : 0.0) + (_areaProcessing ? 32.0 : 0.0);
+    if (chips > 0) return 46 + chips;
+    return _reorderMode ? 46 : 8;
+  }
+
+  /// 画布右上角的浮层提示卡片：深色半透明小卡（白底书页上可读），
+  /// IgnorePointer 包裹后不截获任何手势，数秒后经 AnimatedSwitcher 淡出。
+  Widget _toastCard() {
+    final message = _toastMessage;
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 200),
+      child: message == null
+          ? const SizedBox(width: 0, height: 0, key: ValueKey('toast-empty'))
+          : Container(
+              key: ValueKey('toast-$_toastSeq'),
+              constraints: const BoxConstraints(maxWidth: 340),
+              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+              decoration: BoxDecoration(
+                color: (_toastError ? Colors.red.shade800 : Colors.black87)
+                    .withValues(alpha: 0.92),
+                borderRadius: BorderRadius.circular(8),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withValues(alpha: 0.25),
+                    blurRadius: 8,
+                    offset: const Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    _toastError ? Icons.error_outline : Icons.info_outline,
+                    size: 15,
+                    color: Colors.white.withValues(alpha: 0.85),
+                  ),
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      message,
+                      style: const TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+            ),
     );
   }
 
@@ -3366,8 +3618,7 @@ class _EditorPageState extends State<EditorPage> {
 
   /// 批量入口可用性：队列空闲才接受（重复点击会把每行入队两遍——
   /// 同键只替换"还没开始跑"的那份，已经开始的会全部各跑一次）。
-  bool get _pageBatchBusy =>
-      _cascadeQueue.isNotEmpty || _cascadeActive != null;
+  bool get _pageBatchBusy => _cascadeQueue.isNotEmpty || _cascadeActive != null;
 
   /// 全页重新切割：每行推倒重拆字框+识别（与单行「重新切割本列」同
   /// 链路）。用户成果行（手工行框/字框已全部确认，区域级联同款
@@ -3776,8 +4027,8 @@ class _EditorPageState extends State<EditorPage> {
     await _loadPageStateMarkers();
     await _loadPage();
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(hadAnnotation ? '该页已摆正，原识别结果已清空，请重新识别' : '该页已摆正')),
+    _snack(
+      hadAnnotation ? '该页已摆正，原识别结果已清空，请重新识别' : '该页已摆正',
     );
   }
 
@@ -3827,6 +4078,83 @@ class _EditorPageState extends State<EditorPage> {
     );
     await _handleBookClassifyResult(result);
     return result;
+  }
+
+  /// 全书操作菜单的固定基础项（插件功能入口由 itemBuilder 动态插入）。
+  List<PopupMenuItem<String>> _bookMenuEntries() => const [
+    PopupMenuItem(
+      value: 'book_grid',
+      child: ListTile(
+        leading: Icon(Icons.grid_view),
+        title: Text('全书总览'),
+        subtitle: Text('网格浏览所有页（可切主区/段/行/字层），点击跳页'),
+        contentPadding: EdgeInsets.zero,
+      ),
+    ),
+    PopupMenuItem(
+      value: 'book_overlay',
+      child: ListTile(
+        leading: Icon(Icons.layers),
+        title: Text('全书叠加'),
+        subtitle: Text('所有页半透明叠加，批量调整并应用正文区'),
+        contentPadding: EdgeInsets.zero,
+      ),
+    ),
+    PopupMenuItem(
+      value: 'region_grid',
+      child: ListTile(
+        leading: Icon(Icons.filter_center_focus),
+        title: Text('主区快设'),
+        subtitle: Text('网格逐页快速框正文区，改完统一按主区拆行/字/段'),
+        contentPadding: EdgeInsets.zero,
+      ),
+    ),
+    PopupMenuItem(
+      value: 'book_split',
+      child: ListTile(
+        leading: Icon(Icons.splitscreen),
+        title: Text('跨页拆分（左右页拆开）'),
+        subtitle: Text('左右两页合扫的书按中缝拆成两页'),
+        contentPadding: EdgeInsets.zero,
+      ),
+    ),
+    PopupMenuItem(
+      value: 'similar_book',
+      child: ListTile(
+        leading: Icon(Icons.auto_stories),
+        title: Text('墨迹归类（全书版）'),
+        subtitle: Text('指定页范围或整本书跨页聚类批量校正'),
+        contentPadding: EdgeInsets.zero,
+      ),
+    ),
+    PopupMenuItem(
+      value: 'recognize_book',
+      child: ListTile(
+        leading: Icon(Icons.play_circle_outline),
+        title: Text('开始整本识别'),
+        subtitle: Text('后台逐页识别无标注的页，完成后回到书库看进度'),
+        contentPadding: EdgeInsets.zero,
+      ),
+    ),
+  ];
+
+  /// 打开插件功能入口（全书操作菜单里 PluginRegistry.enabledEntries
+  /// 渲染的项）：先冲刷当前页未落盘的修改（插件的写回直接改各页标注
+  /// 文件），再交给入口自身打开；关闭后按回执的改写页集合刷新，处理
+  /// 与全书版墨迹归类一致。编辑器不感知具体插件——入口列表与开关
+  /// 状态全部来自插件注册中心。
+  Future<void> _openPluginEntry(PluginEntry entry) async {
+    _cancelPendingSave();
+    if (_annotation != null) {
+      await _flushSave();
+      _dirty = false;
+    }
+    if (!mounted) return;
+    final result = await entry.onOpen(context);
+    if (!mounted) return;
+    await _handleBookClassifyResult(
+      result == null ? null : BookClassifyResult(modifiedPages: result.modifiedPages),
+    );
   }
 
   /// 全书版归类返回后的统一处理：刷新全书状态标记与进度；带「定位」
@@ -4513,7 +4841,7 @@ class _EditorPageState extends State<EditorPage> {
             blank
                 ? 'AI 检查完成：${r.reason}'
                 : 'AI 检查完成：已重摆并通过裁决'
-                  '（${r.beforeScore.toStringAsFixed(2)} → ${r.afterScore.toStringAsFixed(2)}）',
+                      '（${r.beforeScore.toStringAsFixed(2)} → ${r.afterScore.toStringAsFixed(2)}）',
           );
           return;
         }
@@ -5219,6 +5547,8 @@ class _EditorPageState extends State<EditorPage> {
                           onCharUpdated: _updateBlockFromLineCard,
                           onCharAdded: _addBlock,
                           onCharSelected: _selectBlock,
+                          onCharMultiSelect: _toggleCharMultiSelect,
+                          multiSelectedIds: _multiSelectedChars,
                           onRerecognizeLine: _queueLineCascade,
                           onResplitLine: _queueResplitLine,
                           onAiCheckLine: _runBoxReviewSingleLine,
@@ -5226,6 +5556,9 @@ class _EditorPageState extends State<EditorPage> {
                           aiAdjustedLineIds: _aiAdjustedLineIds,
                           onCharsReordered: _reorderLineChars,
                           onCharDeleted: _deleteBlockById,
+                          onZoom: _zoomDetailCardBy,
+                          mergeMode: _mergeMode,
+                          onMergeMode: _handleMergeMode,
                         )
                       : Column(
                           children: [
@@ -5248,6 +5581,7 @@ class _EditorPageState extends State<EditorPage> {
                                 pendingParagraphOrder: _pendingParagraphOrder,
                                 mainRegions: _annotation!.mainRegions,
                                 paragraphs: _annotation!.paragraphs,
+                                lineOrderBreakIds: _lineOrderBreakIds(),
                                 onSelect: _selectBlock,
                                 onSelectLine: _selectLine,
                                 onReorderLine: _recordLineOrder,
@@ -5335,6 +5669,71 @@ class _EditorPageState extends State<EditorPage> {
               ),
               const Divider(height: 1),
               if (_viewMode == 'char') ...[
+                // 模式切换下拉菜单（普通/合并）
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                  child: Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.grey.shade300),
+                      borderRadius: BorderRadius.circular(6),
+                      color: Colors.grey.shade50,
+                    ),
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                    child: Row(
+                      children: [
+                        const Text(
+                          '模式：',
+                          style: TextStyle(fontSize: 13, color: Colors.black87),
+                        ),
+                        PopupMenuButton<bool>(
+                          onSelected: (mode) {
+                            setState(() {
+                              _mergeMode = mode;
+                              _mergeFirstBox = null;
+                              _multiSelectedChars.clear();
+                              _selected = null;
+                            });
+                            final label = mode ? '合并模式' : '普通模式';
+                            _snack('已切换到 $label');
+                          },
+                          itemBuilder: (context) => [
+                            const PopupMenuItem(
+                              value: false,
+                              child: Text('普通模式'),
+                            ),
+                            const PopupMenuItem(
+                              value: true,
+                              child: Text('合并模式'),
+                            ),
+                          ],
+                          child: Text(
+                            _mergeMode ? '合并模式' : '普通模式',
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w500,
+                              color: _mergeMode ? Colors.orange : Colors.black87,
+                            ),
+                          ),
+                        ),
+                        if (_mergeMode)
+                          Padding(
+                            padding: const EdgeInsets.only(left: 8),
+                            child: Tooltip(
+                              message: '第一框：${_mergeFirstBox?.text ?? '待选'}',
+                              child: Text(
+                                '(${_mergeFirstBox == null ? '选第1框' : '选第2框'})',
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: Colors.orange,
+                                  fontStyle: FontStyle.italic,
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
                 _DetailZoomControls(
                   cardWidth: _detailCardWidth,
                   scale: _detailCardScale,
@@ -5716,14 +6115,35 @@ class _EditorPageState extends State<EditorPage> {
                   } else if (e.logicalKey == LogicalKeyboardKey.escape) {
                     if (_reorderMode) {
                       _cancelReorderMode();
-                    } else if (_selected != null) {
-                      setState(() => _selected = null);
+                    } else if (_selected != null ||
+                        _multiSelectedChars.isNotEmpty) {
+                      setState(() {
+                        _selected = null;
+                        _multiSelectedChars.clear();
+                      });
                     } else if (_selectedLine != null) {
                       setState(() => _selectedLine = null);
                     } else if (_selectedRegion != null) {
                       setState(() => _selectedRegion = null);
                     } else if (_selectedParagraph != null) {
                       setState(() => _selectedParagraph = null);
+                    }
+                  } else if (!_loading &&
+                      !_reorderMode &&
+                      _annotation != null &&
+                      (e.logicalKey.keyId == _shortcuts.mergeChars.keyId ||
+                          e.logicalKey.keyId ==
+                              _shortcuts.deleteChars.keyId)) {
+                    // 合并/删除识别框快捷键（按键可在 设置 → 快捷键 修改）：
+                    // 合并模式：M 键切换进/出合并模式，第一次点击选框，第二次
+                    // 点击同行的框自动合并。删除对多选组或当前选中生效。
+                    // 仅在按键确实匹配时拦截——后面的主区数字快捷键分支
+                    // 仍要对其它按键可见。文本输入框聚焦时事件到不了这里，
+                    // 不会误吞打字。
+                    if (e.logicalKey.keyId == _shortcuts.mergeChars.keyId) {
+                      _toggleMergeMode();
+                    } else {
+                      _deleteByShortcut();
                     }
                   } else if (_viewMode == 'region' &&
                       _viewIndex == 0 &&
@@ -5860,7 +6280,9 @@ class _EditorPageState extends State<EditorPage> {
                             child: ListTile(
                               leading: Icon(Icons.auto_awesome_outlined),
                               title: Text('识别引擎（本书）'),
-                              subtitle: Text('Kraken / PaddleOCR 切换与 Paddle 模型档位'),
+                              subtitle: Text(
+                                'Kraken / PaddleOCR 切换与 Paddle 模型档位',
+                              ),
                               contentPadding: EdgeInsets.zero,
                             ),
                           ),
@@ -5912,12 +6334,20 @@ class _EditorPageState extends State<EditorPage> {
                           setState(() => _viewIndex = value.first),
                     ),
                     const SizedBox(width: 8),
-                    PopupMenuButton<String>(
+                    // value 混合两种类型：固定项是字符串指令，插件功能
+                    // 入口是 PluginEntry 对象（onSelected 里按类型分流）。
+                    PopupMenuButton<Object>(
                       icon: const Icon(Icons.auto_stories),
                       tooltip: '全书操作：总览 / 叠加 / 主区快设 / 拆分 / 墨迹归类 / 整本识别',
                       onSelected: (value) {
                         if (_loading) return;
-                        switch (value) {
+                        // 插件功能入口：统一走插件打开仪式（先冲刷当前页
+                        // 未落盘修改），入口关闭后由回执刷新受影响页。
+                        if (value is PluginEntry) {
+                          unawaited(_openPluginEntry(value));
+                          return;
+                        }
+                        switch (value as String) {
                           case 'book_grid':
                             _openBookGrid();
                           case 'book_overlay':
@@ -5932,61 +6362,28 @@ class _EditorPageState extends State<EditorPage> {
                             _startWholeBookRecognition();
                         }
                       },
-                      itemBuilder: (_) => const [
-                        PopupMenuItem(
-                          value: 'book_grid',
-                          child: ListTile(
-                            leading: Icon(Icons.grid_view),
-                            title: Text('全书总览'),
-                            subtitle: Text('网格浏览所有页（可切主区/段/行/字层），点击跳页'),
-                            contentPadding: EdgeInsets.zero,
+                      itemBuilder: (_) => [
+                        // 基础项固定；插件功能入口按当前开关动态插在
+                        // 「开始整本识别」之前（每次开菜单重新构造，
+                        // 关闭插件后入口自动消失）。
+                        ..._bookMenuEntries(),
+                        for (final entry in PluginRegistry.enabledEntries(
+                          PluginEntryScope(
+                            project: widget.project,
+                            currentPageIndex: _pageIndex,
                           ),
-                        ),
-                        PopupMenuItem(
-                          value: 'book_overlay',
-                          child: ListTile(
-                            leading: Icon(Icons.layers),
-                            title: Text('全书叠加'),
-                            subtitle: Text('所有页半透明叠加，批量调整并应用正文区'),
-                            contentPadding: EdgeInsets.zero,
+                        ))
+                          PopupMenuItem(
+                            value: entry,
+                            child: ListTile(
+                              leading: Icon(entry.icon),
+                              title: Text(entry.title),
+                              subtitle: entry.subtitle == null
+                                  ? null
+                                  : Text(entry.subtitle!),
+                              contentPadding: EdgeInsets.zero,
+                            ),
                           ),
-                        ),
-                        PopupMenuItem(
-                          value: 'region_grid',
-                          child: ListTile(
-                            leading: Icon(Icons.filter_center_focus),
-                            title: Text('主区快设'),
-                            subtitle: Text('网格逐页快速框正文区，改完统一按主区拆行/字/段'),
-                            contentPadding: EdgeInsets.zero,
-                          ),
-                        ),
-                        PopupMenuItem(
-                          value: 'book_split',
-                          child: ListTile(
-                            leading: Icon(Icons.splitscreen),
-                            title: Text('跨页拆分（左右页拆开）'),
-                            subtitle: Text('左右两页合扫的书按中缝拆成两页'),
-                            contentPadding: EdgeInsets.zero,
-                          ),
-                        ),
-                        PopupMenuItem(
-                          value: 'similar_book',
-                          child: ListTile(
-                            leading: Icon(Icons.auto_stories),
-                            title: Text('墨迹归类（全书版）'),
-                            subtitle: Text('指定页范围或整本书跨页聚类批量校正'),
-                            contentPadding: EdgeInsets.zero,
-                          ),
-                        ),
-                        PopupMenuItem(
-                          value: 'recognize_book',
-                          child: ListTile(
-                            leading: Icon(Icons.play_circle_outline),
-                            title: Text('开始整本识别'),
-                            subtitle: Text('后台逐页识别无标注的页，完成后回到书库看进度'),
-                            contentPadding: EdgeInsets.zero,
-                          ),
-                        ),
                       ],
                     ),
                     IconButton(
@@ -6214,15 +6611,32 @@ class _EditorPageState extends State<EditorPage> {
     );
   }
 
+  /// 行视图序号断点行 id（按本页方向做几何阅读序检查，见
+  /// ReadingOrderCalculator.orderBreakIds）：画布标红与底部编号条
+  /// 同源共用，一次计算两处消费。
+  Set<String> _lineOrderBreakIds() {
+    final ann = _annotation;
+    if (ann == null) return const {};
+    return ReadingOrderCalculator.orderBreakIds(
+      ann.lines,
+      paragraphs: ann.paragraphs,
+      orientation: _pageSettings.orientation,
+      horizontalDir: _pageSettings.horizontalDir,
+      verticalDir: _pageSettings.verticalDir,
+    );
+  }
+
   /// 翻页栏上方的识别框编号条：按当前视图层级列出本页全部框的编号
   /// （与画布 showIndex 标注同序同号），点编号选中该框并把画布平移到
   /// 框中心。单字视图没有编号标注，不显示本条；后台控制台视图同样
-  /// 不显示。
+  /// 不显示。行视图里序号断点（空间相邻行序号不连续=顺序错误）的
+  /// 编号同步标红，画布放大到局部时也能从编号条定位断点。
   Widget _buildBoxIndexBar() {
     if (_viewIndex != 0 || _viewMode == 'char') return const SizedBox.shrink();
     final ann = _annotation;
     if (ann == null) return const SizedBox.shrink();
-    final List<({int no, Rect rect, bool selected})> items;
+    final lineBreakIds = _viewMode == 'line' ? _lineOrderBreakIds() : null;
+    final List<({int no, Rect rect, bool selected, bool orderBreak})> items;
     switch (_viewMode) {
       case 'region':
         items = [
@@ -6231,6 +6645,7 @@ class _EditorPageState extends State<EditorPage> {
               no: i + 1,
               rect: ann.mainRegions[i].rect,
               selected: ann.mainRegions[i] == _selectedRegion,
+              orderBreak: false,
             ),
         ];
       case 'paragraph':
@@ -6240,6 +6655,7 @@ class _EditorPageState extends State<EditorPage> {
               no: i + 1,
               rect: ann.paragraphs[i].rect,
               selected: ann.paragraphs[i] == _selectedParagraph,
+              orderBreak: false,
             ),
         ];
       case 'line':
@@ -6249,6 +6665,7 @@ class _EditorPageState extends State<EditorPage> {
               no: i + 1,
               rect: ann.lines[i].rect,
               selected: ann.lines[i] == _selectedLine,
+              orderBreak: lineBreakIds!.contains(ann.lines[i].id),
             ),
         ];
       default:
@@ -6285,13 +6702,19 @@ class _EditorPageState extends State<EditorPage> {
                             vertical: 2,
                           ),
                           decoration: BoxDecoration(
+                            // 断点编号标红（选中橙优先）：与画布行框/
+                            // 角标的 kOrderBreakRed 同色同义
                             color: item.selected
                                 ? Colors.orange.shade700
+                                : item.orderBreak
+                                ? kOrderBreakRed
                                 : Colors.white,
                             borderRadius: BorderRadius.circular(6),
                             border: Border.all(
                               color: item.selected
                                   ? Colors.orange.shade900
+                                  : item.orderBreak
+                                  ? Colors.red.shade900
                                   : Colors.grey.shade400,
                             ),
                           ),
@@ -6301,7 +6724,7 @@ class _EditorPageState extends State<EditorPage> {
                               fontSize: 11.5,
                               fontWeight: FontWeight.w600,
                               fontFeatures: [FontFeature.tabularFigures()],
-                              color: item.selected
+                              color: item.selected || item.orderBreak
                                   ? Colors.white
                                   : Colors.grey.shade800,
                             ),
@@ -6374,13 +6797,23 @@ class _EditorPageState extends State<EditorPage> {
   Widget _buildPageNavBar(int pageCount) {
     final canPrev = _pageIndex > 0;
     final canNext = _pageIndex < pageCount - 1;
-    // 右下角校对进度：还有多少页没确认 + 已确认占比。savedPages 在
-    // 确认/重识别流程中随 setState 增删，翻页/确认即实时刷新；删除页
-    // 后旧页号可能残留，按页数钳界只统计现存页。
+    // 右下角校对进度：还有多少页没确认 + 已确认占比；框已确认 = 绿框
+    // （完全确认）+玫红框（确认识别框），框校对阶段的完成度（完全确认
+    // 蕴含框确认，两组集合不相交，直接相加）。savedPages 在确认/重识别
+    // 流程中随 setState 增删，翻页/确认即实时刷新；删除页后旧页号可能
+    // 残留，按页数钳界只统计现存页。
     final confirmed = _markers.savedPages.where((i) => i < pageCount).length;
     final confirmedPercent = pageCount == 0
         ? 0
         : (confirmed * 100 / pageCount).round();
+    final boxesConfirmed =
+        _markers.savedPages
+            .union(_markers.boxesReviewedPages)
+            .where((i) => i < pageCount)
+            .length;
+    final boxesConfirmedPercent = pageCount == 0
+        ? 0
+        : (boxesConfirmed * 100 / pageCount).round();
     return Container(
       decoration: BoxDecoration(
         color: Theme.of(
@@ -6391,6 +6824,7 @@ class _EditorPageState extends State<EditorPage> {
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
       child: Row(
         children: [
+          _buildHideBoxesConfirmedPill(),
           const Spacer(),
           OutlinedButton.icon(
             onPressed: canPrev ? () => _switchPage(_pageIndex - 1) : null,
@@ -6424,7 +6858,79 @@ class _EditorPageState extends State<EditorPage> {
               fontFeatures: const [FontFeature.tabularFigures()],
             ),
           ),
+          const SizedBox(width: 12),
+          Text(
+            '框已确认 $boxesConfirmed/$pageCount（$boxesConfirmedPercent%）',
+            style: TextStyle(
+              fontSize: 12.5,
+              color: boxesConfirmed == pageCount && pageCount > 0
+                  ? PageStateMarkers.boxesReviewedColor
+                  : Theme.of(context).colorScheme.onSurfaceVariant,
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          ),
         ],
+      ),
+    );
+  }
+
+  /// 翻页栏左侧的「隐藏框已确认」开关：把玫红（确认识别框）与绿框
+  /// （确认并保存）页从左侧缩略图列表隐去，只剩还需处理框的页，便于
+  /// 逐页点选。当前页恒显示；样式与左栏图例下方的「隐藏已确认」开关
+  /// 一致，激活色用玫红与图例对应。
+  Widget _buildHideBoxesConfirmedPill() {
+    final activeColor = PageStateMarkers.boxesReviewedColor;
+    return Tooltip(
+      message:
+          '把「确认识别框」（玫红）与「确认并保存」（绿）的页从左侧列'
+          '表隐去，只剩还需校对识别框的页；当前页始终显示。翻页仍按真'
+          '实页序逐页走。',
+      child: InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: () {
+          _setHideBoxesConfirmedPages(!_hideBoxesConfirmedPages);
+          // 开关切换后可见列表长度变化，把当前页滚回可见位置。
+          WidgetsBinding.instance.addPostFrameCallback(
+            (_) => _scrollThumbsToCurrent(),
+          );
+        },
+        child: Container(
+          height: 24,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+              color: _hideBoxesConfirmedPages
+                  ? activeColor
+                  : Colors.grey.shade400,
+            ),
+            color: _hideBoxesConfirmedPages
+                ? activeColor.withValues(alpha: 0.12)
+                : null,
+          ),
+          padding: const EdgeInsets.symmetric(horizontal: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                _hideBoxesConfirmedPages
+                    ? Icons.visibility_off
+                    : Icons.visibility,
+                size: 13,
+                color: _hideBoxesConfirmedPages ? activeColor : Colors.grey,
+              ),
+              const SizedBox(width: 3),
+              Text(
+                '隐藏框已确认',
+                style: TextStyle(
+                  fontSize: 11,
+                  color: _hideBoxesConfirmedPages
+                      ? activeColor
+                      : Colors.black54,
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -6666,6 +7172,10 @@ class _AnnotationCanvas extends StatefulWidget {
   /// 参与多类互证冲突的区域 id（编辑器层从 annotation.regionConflicts
   /// 算出，画布只管画红色警示描边）。
   final Set<String> regionConflictedIds;
+
+  /// 序号断点行 id（编辑器层用 ReadingOrderCalculator.orderBreakIds
+  /// 按页面方向算出，画布只管在行视图把这些行标红）。
+  final Set<String> lineOrderBreakIds;
   final ValueChanged<Paragraph> onAddParagraph;
   final ValueChanged<Paragraph?> onSelectParagraph;
   final void Function(Paragraph old, Paragraph updated) onUpdateParagraph;
@@ -6718,6 +7228,7 @@ class _AnnotationCanvas extends StatefulWidget {
     this.onUpdateRegion = _noopUpdateRegion,
     this.newRegionLabel = RegionLabel.mainText,
     this.regionConflictedIds = const {},
+    this.lineOrderBreakIds = const {},
     this.onAddParagraph = _noopAddParagraph,
     this.onSelectParagraph = _noopSelectParagraph,
     this.onUpdateParagraph = _noopUpdateParagraph,
@@ -6999,6 +7510,136 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
   AnnotationResizeHandle? _lineResizeHandleAt(LineBlock l, Offset imgPos) =>
       _resizeHandleAt(_objectRect(x: l.x, y: l.y, w: l.w, h: l.h), imgPos, 28);
 
+  // 区/段/行缩放的应用一步（onPointerMove 与 Alt 顶点抓取共用同一链路，
+  // 坐标更新口径完全一致）。
+  void _applyRegionResize(MainRegion r, Offset imgPos) {
+    final resized = _clampRectToImage(
+      _resizeRectFromHandle(
+        _resizeOriginalRect ?? _objectRect(x: r.x, y: r.y, w: r.w, h: r.h),
+        imgPos,
+        _regionResizeHandle!,
+        minSize: 20,
+      ),
+    );
+    final updated = MainRegion(
+      id: r.id,
+      x: resized.left.toInt(),
+      y: resized.top.toInt(),
+      w: resized.width.toInt(),
+      h: resized.height.toInt(),
+      label: r.label,
+      status: r.status,
+      boxConfirmed: r.boxConfirmed,
+      uid: r.uid,
+    );
+    widget.onUpdateRegion(r, updated);
+    setState(() => _resizingRegion = updated);
+  }
+
+  void _applyParagraphResize(Paragraph p, Offset imgPos) {
+    final resized = _clampRectToImage(
+      _resizeRectFromHandle(
+        _resizeOriginalRect ?? _objectRect(x: p.x, y: p.y, w: p.w, h: p.h),
+        imgPos,
+        _paragraphResizeHandle!,
+        minSize: 20,
+      ),
+    );
+    final updated = Paragraph(
+      id: p.id,
+      x: resized.left.toInt(),
+      y: resized.top.toInt(),
+      w: resized.width.toInt(),
+      h: resized.height.toInt(),
+      mainRegionId: p.mainRegionId,
+      lineIds: p.lineIds,
+      type: p.type,
+      manual: true,
+      status: p.status,
+      boxConfirmed: p.boxConfirmed,
+      uid: p.uid,
+    );
+    widget.onUpdateParagraph(p, updated);
+    setState(() => _resizingParagraph = updated);
+  }
+
+  void _applyLineResize(LineBlock l, Offset imgPos) {
+    final resized = _clampRectToImage(
+      _resizeRectFromHandle(
+        _resizeOriginalRect ?? _objectRect(x: l.x, y: l.y, w: l.w, h: l.h),
+        imgPos,
+        _lineResizeHandle!,
+        minSize: 20,
+      ),
+    );
+    final updated = l.copyWith(
+      x: resized.left.toInt(),
+      y: resized.top.toInt(),
+      w: resized.width.toInt(),
+      h: resized.height.toInt(),
+    );
+    widget.onUpdateLine(l, updated);
+    setState(() => _resizingLine = updated);
+  }
+
+  /// Alt+按下（区/段/行视图）：把当前选中框离点击最近的顶点直接贴到
+  /// 点击处，随后拖动沿用缩放手势（顶点跟指针，松开触发级联重识别，
+  /// 与拖角点缩放同口径）。单字视图不接管（那里 Alt 是字框切割）；
+  /// 无选中框或框选导出/排序模式不接管，走原有选择/画框逻辑。
+  bool _tryAltVertexGrab(Offset imgPos) {
+    if (!HardwareKeyboard.instance.isAltPressed ||
+        widget.reorderMode ||
+        widget.pickRegion) {
+      return false;
+    }
+    switch (widget.viewMode) {
+      case 'line':
+        final sel = widget.selectedLine;
+        if (sel == null) return false;
+        final rect = _objectRect(x: sel.x, y: sel.y, w: sel.w, h: sel.h);
+        setState(() {
+          _resizingLine = sel;
+          _lineResizeHandle = AnnotationHitGeometry.nearestHandle(rect, imgPos);
+          _resizeOriginalRect = rect;
+          _resizePointerOffset = Offset.zero; // 顶点直接贴指针，不保留抓取偏移
+        });
+        _applyLineResize(sel, imgPos);
+        return true;
+      case 'region':
+        final sel = widget.selectedRegion;
+        if (sel == null) return false;
+        final rect = _objectRect(x: sel.x, y: sel.y, w: sel.w, h: sel.h);
+        setState(() {
+          _resizingRegion = sel;
+          _regionResizeHandle = AnnotationHitGeometry.nearestHandle(
+            rect,
+            imgPos,
+          );
+          _resizeOriginalRect = rect;
+          _resizePointerOffset = Offset.zero;
+        });
+        _applyRegionResize(sel, imgPos);
+        return true;
+      case 'paragraph':
+        final sel = widget.selectedParagraph;
+        if (sel == null) return false;
+        final rect = _objectRect(x: sel.x, y: sel.y, w: sel.w, h: sel.h);
+        setState(() {
+          _resizingParagraph = sel;
+          _paragraphResizeHandle = AnnotationHitGeometry.nearestHandle(
+            rect,
+            imgPos,
+          );
+          _resizeOriginalRect = rect;
+          _resizePointerOffset = Offset.zero;
+        });
+        _applyParagraphResize(sel, imgPos);
+        return true;
+      default:
+        return false;
+    }
+  }
+
   void _zoomAt(Offset focalPoint, double scaleDelta) {
     final current = _transform.value.clone();
     // 同上：必须取 x/y 轴缩放，否则 currentScale 恒 1.0，滚轮缩放的
@@ -7128,6 +7769,9 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
               if (hit != null) widget.onReorderParagraph(hit);
               return;
             }
+
+            // Alt+按下：非单字视图把选中框最近顶点移到点击处（接管本次手势）
+            if (_tryAltVertexGrab(imgPos)) return;
 
             // line view: click to select / drag / resize line, or draw a new line.
             // 重识别期间不禁止编辑：改动按最新几何重新入队并作废旧任务
@@ -7356,29 +8000,7 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
               widget.onUpdate(b, updated);
               setState(() => _dragging = updated);
             } else if (_resizingRegion != null && _regionResizeHandle != null) {
-              final r = _resizingRegion!;
-              final resized = _clampRectToImage(
-                _resizeRectFromHandle(
-                  _resizeOriginalRect ??
-                      _objectRect(x: r.x, y: r.y, w: r.w, h: r.h),
-                  imgPos,
-                  _regionResizeHandle!,
-                  minSize: 20,
-                ),
-              );
-              final updated = MainRegion(
-                id: r.id,
-                x: resized.left.toInt(),
-                y: resized.top.toInt(),
-                w: resized.width.toInt(),
-                h: resized.height.toInt(),
-                label: r.label,
-                status: r.status,
-                boxConfirmed: r.boxConfirmed,
-                uid: r.uid,
-              );
-              widget.onUpdateRegion(r, updated);
-              setState(() => _resizingRegion = updated);
+              _applyRegionResize(_resizingRegion!, imgPos);
             } else if (_draggingRegion != null && _dragRegionOffset != null) {
               final r = _draggingRegion!;
               final clampedPos = _clampMovePos(
@@ -7406,32 +8028,7 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
               setState(() => _draggingRegion = updated);
             } else if (_resizingParagraph != null &&
                 _paragraphResizeHandle != null) {
-              final p = _resizingParagraph!;
-              final resized = _clampRectToImage(
-                _resizeRectFromHandle(
-                  _resizeOriginalRect ??
-                      _objectRect(x: p.x, y: p.y, w: p.w, h: p.h),
-                  imgPos,
-                  _paragraphResizeHandle!,
-                  minSize: 20,
-                ),
-              );
-              final updated = Paragraph(
-                id: p.id,
-                x: resized.left.toInt(),
-                y: resized.top.toInt(),
-                w: resized.width.toInt(),
-                h: resized.height.toInt(),
-                mainRegionId: p.mainRegionId,
-                lineIds: p.lineIds,
-                type: p.type,
-                manual: true,
-                status: p.status,
-                boxConfirmed: p.boxConfirmed,
-                uid: p.uid,
-              );
-              widget.onUpdateParagraph(p, updated);
-              setState(() => _resizingParagraph = updated);
+              _applyParagraphResize(_resizingParagraph!, imgPos);
             } else if (_draggingParagraph != null && _dragParaOffset != null) {
               final p = _draggingParagraph!;
               final clampedPos = _clampMovePos(
@@ -7461,24 +8058,7 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
               widget.onUpdateParagraph(p, updated);
               setState(() => _draggingParagraph = updated);
             } else if (_resizingLine != null && _lineResizeHandle != null) {
-              final l = _resizingLine!;
-              final resized = _clampRectToImage(
-                _resizeRectFromHandle(
-                  _resizeOriginalRect ??
-                      _objectRect(x: l.x, y: l.y, w: l.w, h: l.h),
-                  imgPos,
-                  _lineResizeHandle!,
-                  minSize: 20,
-                ),
-              );
-              final updated = l.copyWith(
-                x: resized.left.toInt(),
-                y: resized.top.toInt(),
-                w: resized.width.toInt(),
-                h: resized.height.toInt(),
-              );
-              widget.onUpdateLine(l, updated);
-              setState(() => _resizingLine = updated);
+              _applyLineResize(_resizingLine!, imgPos);
             } else if (_draggingLine != null && _dragLineOffset != null) {
               final l = _draggingLine!;
               final clampedPos = _clampMovePos(
@@ -7634,6 +8214,7 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
                               mainRegions: widget.mainRegions,
                               paragraphs: widget.paragraphs,
                               regionConflictedIds: widget.regionConflictedIds,
+                              orderBreakIds: widget.lineOrderBreakIds,
                               pendingLineOrder: widget.pendingLineOrder,
                               pendingParagraphOrder:
                                   widget.pendingParagraphOrder,
@@ -7690,6 +8271,13 @@ bool lineSharesColumnBand(LineBlock line, List<LineBlock> lines) {
 /// 的复查阈值），画布与行卡片统一用它描边。
 const Color kTallBoxRed = Color(0xFFFF1744);
 
+/// 行视图序号断点标记色：空间相邻两行的序号不连续（阅读顺序有问题）
+/// 时，行框与序号角标整体标红。比选中的橙、待排序的青更深更刺眼——
+/// 它是"这页顺序在这里断了"的报警；断点成对出现（断口两侧各一行），
+/// 配合「点击排序」把红行挪回正确位置即可。深红 700 与字框复查用的
+/// 亮红 kTallBoxRed 区分（后者只出现在详细视图的字框上）。
+const Color kOrderBreakRed = Color(0xFFD32F2F);
+
 /// 同行（竖排列）中位字高；字框少于 3 个时不判定（中位数不稳）。
 double? lineMedianCharHeight(List<CharBlock> chars) {
   if (chars.length < 3) return null;
@@ -7723,6 +8311,11 @@ class _BlockPainter extends CustomPainter {
   /// 警示描边，提示正文区与页眉/页脚/页码区重叠。
   final Set<String> regionConflictedIds;
 
+  /// 序号断点行 id（ReadingOrderCalculator.orderBreakIds）：行视图把
+  /// 这些行的行框与序号角标标红——空间相邻行的序号不连续，即阅读
+  /// 顺序在此处出错。
+  final Set<String> orderBreakIds;
+
   _BlockPainter({
     required this.lines,
     required this.blocks,
@@ -7740,6 +8333,7 @@ class _BlockPainter extends CustomPainter {
     this.selectedRegion,
     this.selectedParagraph,
     this.regionConflictedIds = const {},
+    this.orderBreakIds = const {},
   });
 
   @override
@@ -7947,9 +8541,16 @@ class _BlockPainter extends CustomPainter {
           : RegionLabel.normalize(line.regionLabel);
       final typed = typedLabel != null && typedLabel != RegionLabel.mainText;
       final baseColor = typed ? RegionLabel.color(typedLabel) : Colors.indigo;
+      // 序号断点行（空间相邻行序号不连续=顺序错误）：整框标红报警，
+      // 优先级高于类型配色；选中/待排序仍用各自颜色（拖动中的行看
+      // 青色目标号，松手重排后断点随之消长）。
+      final orderBreak =
+          !hasPendingOrder && !isSel && orderBreakIds.contains(line.id);
       final color = hasPendingOrder
           ? Colors.teal
-          : (isSel ? Colors.orange : baseColor);
+          : (isSel
+                ? Colors.orange
+                : (orderBreak ? kOrderBreakRed : baseColor));
       // 半透明色块叠加：整个框在书页上呈现明显的同色覆盖层
       canvas.drawRect(
         r,
@@ -7959,12 +8560,7 @@ class _BlockPainter extends CustomPainter {
       );
       _drawHaloStroke(canvas, r, color, emphasized ? 3.0 : 2.5);
       if (showIndex && !hasPendingOrder) {
-        _drawLabel(
-          canvas,
-          '${i + 1}',
-          r.topLeft,
-          isSel ? Colors.orange : baseColor,
-        );
+        _drawLabel(canvas, '${i + 1}', r.topLeft, color);
       }
       if (typed && !hasPendingOrder && !isSel) {
         _drawLabel(
@@ -8853,6 +9449,12 @@ class _DetailCardList extends StatefulWidget {
   final void Function(CharBlock old, CharBlock updated) onCharUpdated;
   final ValueChanged<CharBlock> onCharAdded;
   final ValueChanged<CharBlock?> onCharSelected;
+
+  /// Shift+单击字框：加入/移出多选集（合并与批量删除的选择源）。
+  final ValueChanged<CharBlock> onCharMultiSelect;
+
+  /// 当前多选中的字框 id（行图上高亮显示）。
+  final Set<String> multiSelectedIds;
   final Future<void> Function(LineBlock line) onRerecognizeLine;
 
   /// 重新切割该列：丢弃现有字框，对该行做全新拆字 + OCR。
@@ -8873,6 +9475,16 @@ class _DetailCardList extends StatefulWidget {
   /// 删除识别框（快捷候选浮层）。
   final void Function(CharBlock c) onCharDeleted;
 
+  /// Ctrl+滚轮缩放行卡片（factor>1 放大）：状态在编辑页（_detailCardWidth），
+  /// 与右侧缩放按钮共享。
+  final ValueChanged<double> onZoom;
+
+  /// 合并模式是否活跃。
+  final bool mergeMode;
+
+  /// 合并模式下点击字框的处理。
+  final ValueChanged<CharBlock>? onMergeMode;
+
   const _DetailCardList({
     required this.imagePath,
     this.imageRevision = 0,
@@ -8889,6 +9501,8 @@ class _DetailCardList extends StatefulWidget {
     required this.onCharUpdated,
     required this.onCharAdded,
     required this.onCharSelected,
+    required this.onCharMultiSelect,
+    required this.multiSelectedIds,
     required this.onRerecognizeLine,
     required this.onResplitLine,
     required this.onAiCheckLine,
@@ -8896,6 +9510,9 @@ class _DetailCardList extends StatefulWidget {
     required this.aiAdjustedLineIds,
     required this.onCharsReordered,
     required this.onCharDeleted,
+    required this.onZoom,
+    this.mergeMode = false,
+    this.onMergeMode,
   });
 
   @override
@@ -8992,50 +9609,56 @@ class _DetailCardListState extends State<_DetailCardList> {
                       .clamp(0.65, 1.0)
             : widget.cardWidth;
         return SingleChildScrollView(
-          padding: const EdgeInsets.all(12),
-          child: horizontalLayout
-              ? Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    for (
-                      var index = 0;
-                      index < widget.annotation.lines.length;
-                      index++
-                    )
-                      Padding(
-                        padding: EdgeInsets.only(
-                          bottom: index == widget.annotation.lines.length - 1
-                              ? 0
-                              : 10,
-                        ),
-                        child: KeyedSubtree(
-                          key: _lineKeys.putIfAbsent(
-                            widget.annotation.lines[index].id,
-                            () => GlobalKey(),
+          child: CtrlScrollZoomSurface(
+            onZoom: widget.onZoom,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: horizontalLayout
+                  ? Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        for (
+                          var index = 0;
+                          index < widget.annotation.lines.length;
+                          index++
+                        )
+                          Padding(
+                            padding: EdgeInsets.only(
+                              bottom:
+                                  index == widget.annotation.lines.length - 1
+                                  ? 0
+                                  : 10,
+                            ),
+                            child: KeyedSubtree(
+                              key: _lineKeys.putIfAbsent(
+                                widget.annotation.lines[index].id,
+                                () => GlobalKey(),
+                              ),
+                              child: _buildCard(index, cardW),
+                            ),
                           ),
-                          child: _buildCard(index, cardW),
-                        ),
-                      ),
-                  ],
-                )
-              : Wrap(
-                  spacing: 10,
-                  runSpacing: 10,
-                  children: [
-                    for (
-                      var index = 0;
-                      index < widget.annotation.lines.length;
-                      index++
+                      ],
                     )
-                      KeyedSubtree(
-                        key: _lineKeys.putIfAbsent(
-                          widget.annotation.lines[index].id,
-                          () => GlobalKey(),
-                        ),
-                        child: _buildCard(index, cardW),
-                      ),
-                  ],
-                ),
+                  : Wrap(
+                      spacing: 10,
+                      runSpacing: 10,
+                      children: [
+                        for (
+                          var index = 0;
+                          index < widget.annotation.lines.length;
+                          index++
+                        )
+                          KeyedSubtree(
+                            key: _lineKeys.putIfAbsent(
+                              widget.annotation.lines[index].id,
+                              () => GlobalKey(),
+                            ),
+                            child: _buildCard(index, cardW),
+                          ),
+                      ],
+                    ),
+            ),
+          ),
         );
       },
     );
@@ -9058,6 +9681,8 @@ class _DetailCardListState extends State<_DetailCardList> {
       onCharUpdated: widget.onCharUpdated,
       onCharAdded: widget.onCharAdded,
       onCharSelected: widget.onCharSelected,
+      onCharMultiSelect: widget.onCharMultiSelect,
+      multiSelectedIds: widget.multiSelectedIds,
       onRerecognizeLine: widget.onRerecognizeLine,
       onResplitLine: widget.onResplitLine,
       onAiCheckLine: widget.onAiCheckLine,
@@ -9065,6 +9690,8 @@ class _DetailCardListState extends State<_DetailCardList> {
       aiAdjusted: widget.aiAdjustedLineIds.contains(line.id),
       onCharsReordered: widget.onCharsReordered,
       onCharDeleted: widget.onCharDeleted,
+      mergeMode: widget.mergeMode,
+      onMergeMode: widget.onMergeMode,
     );
   }
 }
@@ -9326,6 +9953,12 @@ class _LineCard extends StatelessWidget {
   final void Function(CharBlock old, CharBlock updated) onCharUpdated;
   final ValueChanged<CharBlock> onCharAdded;
   final ValueChanged<CharBlock?> onCharSelected;
+
+  /// Shift+单击字框：加入/移出多选集（合并与批量删除的选择源）。
+  final ValueChanged<CharBlock> onCharMultiSelect;
+
+  /// 当前多选中的字框 id（行图上高亮显示）。
+  final Set<String> multiSelectedIds;
   final Future<void> Function(LineBlock line) onRerecognizeLine;
 
   /// 重新切割该列：丢弃现有字框，对该行做全新拆字 + OCR。
@@ -9346,6 +9979,12 @@ class _LineCard extends StatelessWidget {
   /// 删除识别框（快捷候选浮层的"删除识别框"按钮）。
   final void Function(CharBlock c) onCharDeleted;
 
+  /// 合并模式是否活跃。
+  final bool mergeMode;
+
+  /// 合并模式下点击字框的处理。
+  final ValueChanged<CharBlock>? onMergeMode;
+
   const _LineCard({
     required this.line,
     required this.lineIndex,
@@ -9361,6 +10000,8 @@ class _LineCard extends StatelessWidget {
     required this.onCharUpdated,
     required this.onCharAdded,
     required this.onCharSelected,
+    required this.onCharMultiSelect,
+    required this.multiSelectedIds,
     required this.onRerecognizeLine,
     required this.onResplitLine,
     required this.onAiCheckLine,
@@ -9368,6 +10009,8 @@ class _LineCard extends StatelessWidget {
     required this.aiAdjusted,
     required this.onCharsReordered,
     required this.onCharDeleted,
+    this.mergeMode = false,
+    this.onMergeMode,
   });
 
   @override
@@ -9457,7 +10100,10 @@ class _LineCard extends StatelessWidget {
                 onCharUpdated: onCharUpdated,
                 onCharAdded: onCharAdded,
                 onCharSelected: onCharSelected,
-                onCharDeleted: onCharDeleted,
+                onCharMultiSelect: onCharMultiSelect,
+                multiSelectedIds: multiSelectedIds,
+                mergeMode: mergeMode,
+                onMergeMode: onMergeMode,
               ),
               SizedBox(height: 8 * scale),
               // ── 条2：字卡行（与行图同宽，逐字按字框 x 同位） ──
@@ -9539,7 +10185,10 @@ class _LineCard extends StatelessWidget {
                     onCharUpdated: onCharUpdated,
                     onCharAdded: onCharAdded,
                     onCharSelected: onCharSelected,
-                    onCharDeleted: onCharDeleted,
+                    onCharMultiSelect: onCharMultiSelect,
+                    multiSelectedIds: multiSelectedIds,
+                    mergeMode: mergeMode,
+                    onMergeMode: onMergeMode,
                   ),
                   SizedBox(width: 8 * scale),
                   // ── 列2：字符 chips 纵向（轻点下方浮出候选条，长按拖拽改变字序） ──
@@ -11404,6 +12053,14 @@ class _LineCropPainter extends CustomPainter {
   final Rect? selectedRect;
   final Rect? dragRect;
 
+  /// Alt 切割预览：(命中的字框行内相对矩形, 是否横排行, 切线行内相对
+  /// 坐标)。竖排行画水平虚线（上下切）、横排行画垂直虚线（左右切）。
+  final (Rect, bool, double)? altCutLine;
+
+  /// 多选中的字框（行内相对矩形）：青色粗虚线高亮（合并/批量删除的
+  /// 选择源，与橙色选中、彩虹色普通框区分）。
+  final List<Rect> multiRects;
+
   _LineCropPainter({
     required this.image,
     required this.srcRect,
@@ -11413,6 +12070,8 @@ class _LineCropPainter extends CustomPainter {
     this.verifyColors = const [],
     this.selectedRect,
     this.dragRect,
+    this.altCutLine,
+    this.multiRects = const [],
   });
 
   @override
@@ -11494,6 +12153,40 @@ class _LineCropPainter extends CustomPainter {
       }
     }
 
+    // 多选高亮（先画，选中橙框后画盖在上面）：紫色粗虚线 + 淡填充，
+    // 与橙色选中、红色异常框、teal 拖拽框都区分。
+    for (final mr in multiRects) {
+      final dr = Rect.fromLTWH(
+        mr.left * scaleX,
+        mr.top * scaleY,
+        mr.width * scaleX,
+        mr.height * scaleY,
+      );
+      canvas.drawRect(
+        dr,
+        Paint()
+          ..style = PaintingStyle.fill
+          ..color = Colors.purple.withValues(alpha: 0.10),
+      );
+      final path = Path()..addRect(dr);
+      final dash = Paint()
+        ..style = PaintingStyle.stroke
+        ..color = Colors.purple.shade400
+        ..strokeWidth = 2.5;
+      for (final metric in path.computeMetrics()) {
+        double dist = 0;
+        var draw = true;
+        while (dist < metric.length) {
+          final seg = draw ? 6.0 : 4.0;
+          if (draw) {
+            canvas.drawPath(metric.extractPath(dist, dist + seg), dash);
+          }
+          dist += seg;
+          draw = !draw;
+        }
+      }
+    }
+
     if (selectedRect != null) {
       final dr = Rect.fromLTWH(
         selectedRect!.left * scaleX,
@@ -11553,6 +12246,47 @@ class _LineCropPainter extends CustomPainter {
       );
     }
 
+    // Alt 切割虚线：只画在命中的字框内，横贯框宽/框高（跟随鼠标，所见
+    // 即所切）；深橙虚线与选中框橙色系区分于彩虹色字框。
+    final cut = altCutLine;
+    if (cut != null) {
+      final (box, horizontal, cutRel) = cut;
+      final dr = Rect.fromLTWH(
+        box.left * scaleX,
+        box.top * scaleY,
+        box.width * scaleX,
+        box.height * scaleY,
+      );
+      final cutPaint = Paint()
+        ..style = PaintingStyle.stroke
+        ..color = Colors.deepOrange
+        ..strokeWidth = 1.6;
+      final Path cutPath;
+      if (horizontal) {
+        final x = (cutRel * scaleX).clamp(dr.left, dr.right).toDouble();
+        cutPath = Path()
+          ..moveTo(x, dr.top)
+          ..lineTo(x, dr.bottom);
+      } else {
+        final y = (cutRel * scaleY).clamp(dr.top, dr.bottom).toDouble();
+        cutPath = Path()
+          ..moveTo(dr.left, y)
+          ..lineTo(dr.right, y);
+      }
+      for (final metric in cutPath.computeMetrics()) {
+        double dist = 0;
+        var draw = true;
+        while (dist < metric.length) {
+          final seg = draw ? 6.0 : 4.0;
+          if (draw) {
+            canvas.drawPath(metric.extractPath(dist, dist + seg), cutPaint);
+          }
+          dist += seg;
+          draw = !draw;
+        }
+      }
+    }
+
     canvas.drawRect(
       Offset.zero & size,
       Paint()
@@ -11570,7 +12304,9 @@ class _LineCropPainter extends CustomPainter {
       charColors != old.charColors ||
       tallFlags != old.tallFlags ||
       selectedRect != old.selectedRect ||
-      dragRect != old.dragRect;
+      dragRect != old.dragRect ||
+      altCutLine != old.altCutLine ||
+      multiRects != old.multiRects;
 }
 
 // ─── 可交互行裁切画布：绘制/拖拽/调整字框 ──────────────────────────────────────
@@ -11596,9 +12332,19 @@ class InteractiveLineCrop extends StatefulWidget {
   final ValueChanged<CharBlock> onCharAdded;
   final ValueChanged<CharBlock?> onCharSelected;
 
-  /// Shift 单击字框＝删除（可选：编辑器行卡片与行内重切页都接了；
-  /// 未接的调用方该操作无动作）。
-  final ValueChanged<CharBlock>? onCharDeleted;
+  /// Shift 单击字框＝加入/移出多选集（可选；未接的调用方该操作无
+  /// 动作）。多选供快捷键合并（两框）与批量删除使用，替代原先的
+  /// Shift+单击删除——删除改由快捷键（默认 X）对选中/多选组执行。
+  final ValueChanged<CharBlock>? onCharMultiSelect;
+
+  /// 当前多选中的字框 id（行图上以青色粗虚线高亮）。
+  final Set<String> multiSelectedIds;
+
+  /// 合并模式是否活跃：活跃时点击字框由 onMergeMode 处理。
+  final bool mergeMode;
+
+  /// 合并模式下点击字框的处理（第一次选框，第二次同行自动合并）。
+  final ValueChanged<CharBlock>? onMergeMode;
 
   const InteractiveLineCrop({
     super.key,
@@ -11612,7 +12358,10 @@ class InteractiveLineCrop extends StatefulWidget {
     required this.onCharUpdated,
     required this.onCharAdded,
     required this.onCharSelected,
-    this.onCharDeleted,
+    this.onCharMultiSelect,
+    this.multiSelectedIds = const {},
+    this.mergeMode = false,
+    this.onMergeMode,
   });
 
   @override
@@ -11638,6 +12387,85 @@ class _InteractiveLineCropState extends State<InteractiveLineCrop> {
   /// 拖动＝画新框（候选作废）。拖拽只允许从框内开始，保证画框起点
   /// 精确落在鼠标按下位置。
   CharBlock? _pressCandidate;
+
+  /// Alt 切割预览：命中的字框 id + 切线的原图绝对坐标（竖排=水平线
+  /// 的 y、横排=垂直线的 x，已钳进两侧各留最小框 5px 的有效区）。悬停
+  /// 跟随鼠标移动（跟随 = 显示，切割坐标以点击位置为准），Alt 松开/
+  /// 移出/指针下无框即清除。
+  String? _altCutCharId;
+  int? _altCutAbs;
+  Offset? _lastHoverPos;
+
+  @override
+  void initState() {
+    super.initState();
+    // Alt 按下/松开即时显隐切割线（鼠标不动也生效）。旁听不消费，
+    // 仅在有悬停位置或已有切割线时才动手。
+    HardwareKeyboard.instance.addHandler(_handleKeyEvent);
+  }
+
+  @override
+  void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
+    super.dispose();
+  }
+
+  bool _handleKeyEvent(KeyEvent event) {
+    if (_lastHoverPos == null && _altCutCharId == null) return false;
+    if (HardwareKeyboard.instance.isAltPressed) {
+      if (_altCutCharId == null) _recomputeAltCut(_lastHoverPos!);
+    } else if (_altCutCharId != null) {
+      setState(_clearAltCut);
+    }
+    return false;
+  }
+
+  void _clearAltCut() {
+    _altCutCharId = null;
+    _altCutAbs = null;
+  }
+
+  /// 悬停：记住位置供 Alt 按下时重算；按住 Alt 才显示/跟随切割线，
+  /// 松开即清。
+  void _handleHover(Offset displayPos) {
+    _lastHoverPos = displayPos;
+    if (!HardwareKeyboard.instance.isAltPressed) {
+      if (_altCutCharId != null) setState(_clearAltCut);
+      return;
+    }
+    _recomputeAltCut(displayPos);
+  }
+
+  /// 按悬停位置重算切割预览：命中字框（零容差）才显示；切割坐标取整
+  /// 并钳进两侧各留最小框 5px 的有效区（与 splitRectAt 同钳制，所见即
+  /// 所切）；框轴向不足 10px 切不出两个最小框 → 不显示。
+  void _recomputeAltCut(Offset displayPos) {
+    final hit = _hitTestChar(displayPos, toleranceScreen: 0);
+    if (hit == null) {
+      if (_altCutCharId != null) setState(_clearAltCut);
+      return;
+    }
+    final horizontal = widget.line.orientation == 'horizontal';
+    final rel = _displayToLineRel(displayPos);
+    final cutAbs = horizontal
+        ? (rel.dx + widget.line.x).round()
+        : (rel.dy + widget.line.y).round();
+    final boxMin = horizontal ? hit.x : hit.y;
+    final boxMax = horizontal ? hit.x + hit.w : hit.y + hit.h;
+    final minCut = boxMin + 5;
+    final maxCut = boxMax - 5;
+    if (maxCut < minCut) {
+      if (_altCutCharId != null) setState(_clearAltCut);
+      return;
+    }
+    final clamped = cutAbs.clamp(minCut, maxCut);
+    if (_altCutCharId != hit.id || _altCutAbs != clamped) {
+      setState(() {
+        _altCutCharId = hit.id;
+        _altCutAbs = clamped;
+      });
+    }
+  }
 
   final GlobalKey _canvasKey = GlobalKey();
 
@@ -11823,19 +12651,23 @@ class _InteractiveLineCropState extends State<InteractiveLineCrop> {
     );
   }
 
-  /// Alt 单击字框：沿阅读轴拆成两半——竖排上下、横排左右（原框就地改
-  /// 成前半，走 onCharUpdated 触发重识别；后半作为新字框走 onCharAdded，
-  /// 编辑器按阅读序插到原框之后、行内重切页应用时按几何重排）。轴向
-  /// 太薄（拆完不足最小框 5px）不拆，仅选中提示。
-  void _splitChar(CharBlock c) {
+  /// Alt 单击字框：沿阅读轴在鼠标位置切割——竖排上下、横排左右（悬停
+  /// 虚线所见即所切；切线取整并钳进两侧各留最小框 5px 的有效区）。原框
+  /// 就地改成前半，走 onCharUpdated 触发重识别；后半作为新字框走
+  /// onCharAdded，编辑器按阅读序插到原框之后、行内重切页应用时按几何
+  /// 重排。轴向太薄（拆完不足最小框 5px）不拆，仅选中提示。
+  void _splitChar(CharBlock c, Offset cutDisplayPos) {
     final horizontal = widget.line.orientation == 'horizontal';
-    final halves = AnnotationHitGeometry.splitRectHalf(
+    final rel = _displayToLineRel(cutDisplayPos);
+    final cutAbs = horizontal ? rel.dx + widget.line.x : rel.dy + widget.line.y;
+    final halves = AnnotationHitGeometry.splitRectAt(
       Rect.fromLTWH(
         c.x.toDouble(),
         c.y.toDouble(),
         c.w.toDouble(),
         c.h.toDouble(),
       ),
+      cut: cutAbs,
       horizontal: horizontal,
     );
     if (halves == null) {
@@ -11865,7 +12697,7 @@ class _InteractiveLineCropState extends State<InteractiveLineCrop> {
       lineId: widget.line.id,
     );
     PythonService.addAppLog(
-      '[手势] 行卡片 Alt 拆分 char=${c.id} '
+      '[手势] 行卡片 Alt 拆分（切线 y=${cutAbs.round()}）char=${c.id} '
       '(${c.x},${c.y},${c.w},${c.h}) -> '
       '前半(${first.x},${first.y},${first.w},${first.h}) + '
       '新框 $secondId(${second.x},${second.y},${second.w},${second.h})',
@@ -11941,6 +12773,21 @@ class _InteractiveLineCropState extends State<InteractiveLineCrop> {
           )
         : null;
 
+    // 多选中的字框（本行内的）：行内相对矩形，紫色虚线高亮。
+    final multiRects = widget.multiSelectedIds.isEmpty
+        ? const <Rect>[]
+        : previewChars
+              .where((c) => widget.multiSelectedIds.contains(c.id))
+              .map(
+                (c) => Rect.fromLTWH(
+                  (c.x - widget.line.x).toDouble(),
+                  (c.y - widget.line.y).toDouble(),
+                  c.w.toDouble(),
+                  c.h.toDouble(),
+                ),
+              )
+              .toList();
+
     final dragRel = (_dragStart != null && _dragCurrent != null)
         ? Rect.fromPoints(
             _displayToLineRel(_dragStart!),
@@ -11965,6 +12812,29 @@ class _InteractiveLineCropState extends State<InteractiveLineCrop> {
       }
     }
 
+    // Alt 切割虚线预览（行内相对坐标，与 charRects 同空间随 painter 缩放）。
+    (Rect, bool, double)? altCutLine;
+    if (_altCutCharId != null && _altCutAbs != null) {
+      final horizontal = widget.line.orientation == 'horizontal';
+      for (final c in previewChars) {
+        if (c.id != _altCutCharId) continue;
+        altCutLine = (
+          Rect.fromLTWH(
+            (c.x - widget.line.x).toDouble(),
+            (c.y - widget.line.y).toDouble(),
+            c.w.toDouble(),
+            c.h.toDouble(),
+          ),
+          horizontal,
+          (horizontal
+                  ? _altCutAbs! - widget.line.x
+                  : _altCutAbs! - widget.line.y)
+              .toDouble(),
+        );
+        break;
+      }
+    }
+
     return Container(
       // 不给外层 Container 显式宽高：decoration 的 1px 边框会把 child 内缩
       // （BoxDecoration.padding = border.dimensions），画布实际尺寸会比
@@ -11976,267 +12846,287 @@ class _InteractiveLineCropState extends State<InteractiveLineCrop> {
       ),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(4),
-        child: Listener(
-          behavior: HitTestBehavior.opaque,
-          onPointerDown: (e) {
-            if (e.buttons != kPrimaryMouseButton) return;
-            final pos = e.localPosition;
-
-            // 修饰键单击（速校对操作，命中字框才消费，点空白照常画框）：
-            // Shift＝删除字框、Alt＝沿阅读轴拆成两半（竖排上下/横排左右）。
-            final kb = HardwareKeyboard.instance;
-            if (kb.isShiftPressed || kb.isAltPressed) {
-              final hitMod = _hitTestChar(pos, toleranceScreen: 0);
-              if (hitMod != null) {
-                if (kb.isShiftPressed) {
-                  widget.onCharDeleted?.call(hitMod);
-                } else {
-                  _splitChar(hitMod);
-                }
-                return;
-              }
-            }
-
-            // 选中字框的缩放手柄优先判定：手柄命中区有半个在框外，
-            // 且角点可能被相邻字框盖住，先于普通命中测试判断才能点到。
-            final sel = widget.selected;
-            if (sel != null && sel.lineId == widget.line.id) {
-              final selHandle = _hitResizeHandle(sel, pos);
-              if (selHandle != null) {
-                widget.onCharSelected(sel);
-                _beginResize(sel, pos, selHandle);
-                return;
-              }
-            }
-
-            // 只有真正按在框内才拖动；框附近的容差命中只作为"点击选中"
-            // 候选，拖动一律从按下位置开始画新框——否则在字框间隙画框
-            // 会先抓到邻框，框的角点带着抓取偏移跟随光标（看似画框偏移）。
-            final hit = _hitTestChar(pos);
-            final hitExact = _hitTestChar(pos, toleranceScreen: 0);
-            if (hitExact != null) {
-              widget.onCharSelected(hitExact);
-              final hitHandle = _hitResizeHandle(hitExact, pos);
-              if (hitHandle != null) {
-                _beginResize(hitExact, pos, hitHandle);
-              } else {
-                final rel = _displayToLineRel(pos);
-                setState(() {
-                  _dragging = hitExact;
-                  _gestureOriginal = hitExact;
-                  _dragOffset =
-                      rel -
-                      Offset(
-                        (hitExact.x - widget.line.x).toDouble(),
-                        (hitExact.y - widget.line.y).toDouble(),
-                      );
-                });
-              }
-            } else {
-              setState(() {
-                _pressCandidate = hit;
-                _dragStart = pos;
-                _dragCurrent = pos;
-              });
-              // 容差候选立即高亮（等效于点击选中）；随后拖动则转为画框
-              widget.onCharSelected(hit);
-            }
+        child: MouseRegion(
+          // Alt 切割虚线只在悬停时跟随鼠标；移出即清（防 Alt 按住时
+          // 跨卡片残留）。
+          onExit: (_) {
+            _lastHoverPos = null;
+            if (_altCutCharId != null) setState(_clearAltCut);
           },
-          onPointerMove: (e) {
-            if (e.buttons != kPrimaryMouseButton) return;
-            final pos = e.localPosition;
-
-            if (_resizing != null) {
-              final b = _resizing!;
-              final rel = _displayToLineRel(pos);
-              final resizeRel = rel - (_resizePointerOffset ?? Offset.zero);
-              if (_resizeHandle == _CropResizeHandle.topRight) {
-                // 右上角：底边与左边固定，顶边/右边跟随指针（压首字
-                // 上沿常用）；顶边不越过底边-5、不出页面顶（abs y ≥ 0）。
-                // 固定边必须直接取整数原值、拖动边只做一次取整：顶边/
-                // 高度各自独立取整时，显示比例把指针映射到半整数会让
-                // 两处同时进位，固定底边每个事件下移 1px（实测一次拖拽
-                // 累计 +59px）——"其他顶点跟着偏移"的根因。
-                final resizedRect = AnnotationHitGeometry.resizeTopRightRect(
-                  Rect.fromLTWH(
-                    b.x.toDouble(),
-                    b.y.toDouble(),
-                    b.w.toDouble(),
-                    b.h.toDouble(),
-                  ),
-                  widget.line.x + resizeRel.dx,
-                  widget.line.y + resizeRel.dy,
-                );
-                final updated = b.copyWith(
-                  x: resizedRect.left.toInt(),
-                  y: resizedRect.top.toInt(),
-                  w: resizedRect.width.round(),
-                  h: resizedRect.height.round(),
-                );
-                _commitResizePreview(updated);
-              } else {
-                final newW = max(
-                  5,
-                  resizeRel.dx - (b.x - widget.line.x),
-                ).toInt();
-                final newH = max(
-                  5,
-                  resizeRel.dy - (b.y - widget.line.y),
-                ).toInt();
-                final updated = b.copyWith(w: newW, h: newH);
-                _commitResizePreview(updated);
-              }
-            } else if (_dragging != null && _dragOffset != null) {
-              final b = _dragging!;
-              final rel = _displayToLineRel(pos);
-              final newRelX = max(0.0, rel.dx - _dragOffset!.dx);
-              final newRelY = max(0.0, rel.dy - _dragOffset!.dy);
-              final updated = b.copyWith(
-                x: _toAbsX(newRelX),
-                y: _toAbsY(newRelY),
-              );
-              setState(() => _dragging = updated);
-            } else if (_dragStart != null) {
-              // 开始拖动即确认是画框手势：容差候选作废，取消其选中
-              if (_pressCandidate != null) {
-                _pressCandidate = null;
-                widget.onCharSelected(null);
-              }
-              setState(() => _dragCurrent = pos);
-            }
-          },
-          onPointerUp: (e) {
-            if (_gestureOriginal != null) {
-              final current = _resizing ?? _dragging;
-              if (current != null &&
-                  (current.x != _gestureOriginal!.x ||
-                      current.y != _gestureOriginal!.y ||
-                      current.w != _gestureOriginal!.w ||
-                      current.h != _gestureOriginal!.h)) {
-                PythonService.addAppLog(
-                  '[手势] 行卡片手势提交 ${_gestureOriginal!.id} '
-                  '(${_gestureOriginal!.x},${_gestureOriginal!.y},'
-                  '${_gestureOriginal!.w},${_gestureOriginal!.h}) -> '
-                  '(${current.x},${current.y},${current.w},${current.h})',
-                );
-                widget.onCharUpdated(_gestureOriginal!, current);
-              } else if (current != null) {
-                PythonService.addAppLog(
-                  '[手势] 行卡片手势无几何变化 ${current.id}（点击或未拖出变化）',
-                );
-              }
-            }
-            // Ctrl 联动邻框随被拖框一起提交（两框几何都变 → 各自重识别）
-            final linked = _linkedNeighbor;
-            if (linked != null) {
-              CharBlock? neighborOriginal;
-              for (final c in widget.line.chars) {
-                if (c.id == linked.id) neighborOriginal = c;
-              }
-              if (neighborOriginal != null &&
-                  (linked.x != neighborOriginal.x ||
-                      linked.y != neighborOriginal.y ||
-                      linked.w != neighborOriginal.w ||
-                      linked.h != neighborOriginal.h)) {
-                PythonService.addAppLog(
-                  '[手势] 行卡片 Ctrl 联动提交 ${neighborOriginal.id} '
-                  '(${neighborOriginal.x},${neighborOriginal.y},'
-                  '${neighborOriginal.w},${neighborOriginal.h}) -> '
-                  '(${linked.x},${linked.y},${linked.w},${linked.h})',
-                );
-                widget.onCharUpdated(neighborOriginal, linked);
-              }
-            }
-            if (_dragStart != null && _dragCurrent != null) {
-              final rel = Rect.fromPoints(
-                _displayToLineRel(_dragStart!),
-                _displayToLineRel(_dragCurrent!),
-              );
-              if (rel.width > 4 && rel.height > 4) {
-                final id = 'u_${DateTime.now().millisecondsSinceEpoch}';
-                widget.onCharAdded(
-                  CharBlock(
-                    id: id,
-                    x: _toAbsX(rel.left),
-                    y: _toAbsY(rel.top),
-                    w: rel.width.round(),
-                    h: rel.height.round(),
-                    col: widget.line.lineNo,
-                    order: widget.line.chars.length,
-                    lineId: widget.line.id,
-                  ),
-                );
-              }
-            }
-            setState(_clearState);
-          },
-          onPointerCancel: (_) => setState(_clearState),
-          // GestureDetector 声明拖拽手势抢占仲裁（回调全是空实现）：外层
-          // SingleChildScrollView 否则会把画框/拖框/缩放的拖拽同时识别成
-          // 滚动，列表边滚动画框起点边相对鼠标漂移，画出的框尺寸也随之
-          // 错乱。本区域赢得仲裁后拖拽期间列表不滚动；滚轮滚动不受影响。
-          child: GestureDetector(
+          child: Listener(
             behavior: HitTestBehavior.opaque,
-            onPanStart: (_) {},
-            onPanUpdate: (_) {},
-            onPanEnd: (_) {},
-            onPanCancel: () {},
-            // RepaintBoundary：拖动字框时只重绘本行裁切图，避免整个详细视图
-            // （每张卡片都从整页大图取样）每帧重新栅格化。
-            child: RepaintBoundary(
-              child: SizedBox(
-                key: _canvasKey,
-                // 行框退化（宽/高为 0 → 上游算出 NaN/∞/0 尺寸）时退回
-                // 最小占位尺寸：NaN 进入 BoxConstraints 会直接抛错崩页。
-                width: widget.displayWidth.isFinite && widget.displayWidth > 0
-                    ? widget.displayWidth
-                    : 60,
-                height:
-                    widget.displayHeight.isFinite && widget.displayHeight > 0
-                    ? widget.displayHeight
-                    : 20,
-                child: flashRel == null
-                    ? CustomPaint(
-                        painter: _LineCropPainter(
-                          image: widget.image,
-                          srcRect: widget.srcRect,
-                          charRects: charRects,
-                          charColors: charColors,
-                          tallFlags: tallFlags,
-                          verifyColors: verifyColors,
-                          selectedRect: selectedRel,
-                          dragRect: dragRel,
+            onPointerHover: (e) => _handleHover(e.localPosition),
+            onPointerDown: (e) {
+              if (e.buttons != kPrimaryMouseButton) return;
+              final pos = e.localPosition;
+
+              // 修饰键单击（速校对操作，命中字框才消费，点空白照常画框）：
+              // Shift＝字框加入/移出多选（合并/批量删除的选择源，配合
+              // 快捷键使用）、Alt＝沿阅读轴在鼠标位置切割（悬停虚线
+              // 所见即所切；未按切割线时钳进两侧各留 5px 的有效区）。
+              final kb = HardwareKeyboard.instance;
+              if (kb.isShiftPressed || kb.isAltPressed) {
+                final hitMod = _hitTestChar(pos, toleranceScreen: 0);
+                if (hitMod != null) {
+                  if (kb.isShiftPressed) {
+                    widget.onCharMultiSelect?.call(hitMod);
+                  } else {
+                    _splitChar(hitMod, pos);
+                  }
+                  return;
+                }
+              }
+
+              // 选中字框的缩放手柄优先判定：手柄命中区有半个在框外，
+              // 且角点可能被相邻字框盖住，先于普通命中测试判断才能点到。
+              final sel = widget.selected;
+              if (sel != null && sel.lineId == widget.line.id) {
+                final selHandle = _hitResizeHandle(sel, pos);
+                if (selHandle != null) {
+                  widget.onCharSelected(sel);
+                  _beginResize(sel, pos, selHandle);
+                  return;
+                }
+              }
+
+              // 只有真正按在框内才拖动；框附近的容差命中只作为"点击选中"
+              // 候选，拖动一律从按下位置开始画新框——否则在字框间隙画框
+              // 会先抓到邻框，框的角点带着抓取偏移跟随光标（看似画框偏移）。
+              final hit = _hitTestChar(pos);
+              final hitExact = _hitTestChar(pos, toleranceScreen: 0);
+              if (hitExact != null) {
+                // 合并模式下，点击字框由合并处理逻辑接手
+                if (widget.mergeMode && widget.onMergeMode != null) {
+                  widget.onMergeMode!(hitExact);
+                  return;
+                }
+                widget.onCharSelected(hitExact);
+                final hitHandle = _hitResizeHandle(hitExact, pos);
+                if (hitHandle != null) {
+                  _beginResize(hitExact, pos, hitHandle);
+                } else {
+                  final rel = _displayToLineRel(pos);
+                  setState(() {
+                    _dragging = hitExact;
+                    _gestureOriginal = hitExact;
+                    _dragOffset =
+                        rel -
+                        Offset(
+                          (hitExact.x - widget.line.x).toDouble(),
+                          (hitExact.y - widget.line.y).toDouble(),
+                        );
+                  });
+                }
+              } else {
+                setState(() {
+                  _pressCandidate = hit;
+                  _dragStart = pos;
+                  _dragCurrent = pos;
+                });
+                // 容差候选立即高亮（等效于点击选中）；随后拖动则转为画框
+                widget.onCharSelected(hit);
+              }
+            },
+            onPointerMove: (e) {
+              if (e.buttons != kPrimaryMouseButton) return;
+              final pos = e.localPosition;
+
+              if (_resizing != null) {
+                final b = _resizing!;
+                final rel = _displayToLineRel(pos);
+                final resizeRel = rel - (_resizePointerOffset ?? Offset.zero);
+                if (_resizeHandle == _CropResizeHandle.topRight) {
+                  // 右上角：底边与左边固定，顶边/右边跟随指针（压首字
+                  // 上沿常用）；顶边不越过底边-5、不出页面顶（abs y ≥ 0）。
+                  // 固定边必须直接取整数原值、拖动边只做一次取整：顶边/
+                  // 高度各自独立取整时，显示比例把指针映射到半整数会让
+                  // 两处同时进位，固定底边每个事件下移 1px（实测一次拖拽
+                  // 累计 +59px）——"其他顶点跟着偏移"的根因。
+                  final resizedRect = AnnotationHitGeometry.resizeTopRightRect(
+                    Rect.fromLTWH(
+                      b.x.toDouble(),
+                      b.y.toDouble(),
+                      b.w.toDouble(),
+                      b.h.toDouble(),
+                    ),
+                    widget.line.x + resizeRel.dx,
+                    widget.line.y + resizeRel.dy,
+                  );
+                  final updated = b.copyWith(
+                    x: resizedRect.left.toInt(),
+                    y: resizedRect.top.toInt(),
+                    w: resizedRect.width.round(),
+                    h: resizedRect.height.round(),
+                  );
+                  _commitResizePreview(updated);
+                } else {
+                  final newW = max(
+                    5,
+                    resizeRel.dx - (b.x - widget.line.x),
+                  ).toInt();
+                  final newH = max(
+                    5,
+                    resizeRel.dy - (b.y - widget.line.y),
+                  ).toInt();
+                  final updated = b.copyWith(w: newW, h: newH);
+                  _commitResizePreview(updated);
+                }
+              } else if (_dragging != null && _dragOffset != null) {
+                final b = _dragging!;
+                final rel = _displayToLineRel(pos);
+                final newRelX = max(0.0, rel.dx - _dragOffset!.dx);
+                final newRelY = max(0.0, rel.dy - _dragOffset!.dy);
+                final updated = b.copyWith(
+                  x: _toAbsX(newRelX),
+                  y: _toAbsY(newRelY),
+                );
+                setState(() => _dragging = updated);
+              } else if (_dragStart != null) {
+                // 开始拖动即确认是画框手势：容差候选作废，取消其选中
+                if (_pressCandidate != null) {
+                  _pressCandidate = null;
+                  widget.onCharSelected(null);
+                }
+                setState(() => _dragCurrent = pos);
+              }
+            },
+            onPointerUp: (e) {
+              if (_gestureOriginal != null) {
+                final current = _resizing ?? _dragging;
+                if (current != null &&
+                    (current.x != _gestureOriginal!.x ||
+                        current.y != _gestureOriginal!.y ||
+                        current.w != _gestureOriginal!.w ||
+                        current.h != _gestureOriginal!.h)) {
+                  PythonService.addAppLog(
+                    '[手势] 行卡片手势提交 ${_gestureOriginal!.id} '
+                    '(${_gestureOriginal!.x},${_gestureOriginal!.y},'
+                    '${_gestureOriginal!.w},${_gestureOriginal!.h}) -> '
+                    '(${current.x},${current.y},${current.w},${current.h})',
+                  );
+                  widget.onCharUpdated(_gestureOriginal!, current);
+                } else if (current != null) {
+                  PythonService.addAppLog(
+                    '[手势] 行卡片手势无几何变化 ${current.id}（点击或未拖出变化）',
+                  );
+                }
+              }
+              // Ctrl 联动邻框随被拖框一起提交（两框几何都变 → 各自重识别）
+              final linked = _linkedNeighbor;
+              if (linked != null) {
+                CharBlock? neighborOriginal;
+                for (final c in widget.line.chars) {
+                  if (c.id == linked.id) neighborOriginal = c;
+                }
+                if (neighborOriginal != null &&
+                    (linked.x != neighborOriginal.x ||
+                        linked.y != neighborOriginal.y ||
+                        linked.w != neighborOriginal.w ||
+                        linked.h != neighborOriginal.h)) {
+                  PythonService.addAppLog(
+                    '[手势] 行卡片 Ctrl 联动提交 ${neighborOriginal.id} '
+                    '(${neighborOriginal.x},${neighborOriginal.y},'
+                    '${neighborOriginal.w},${neighborOriginal.h}) -> '
+                    '(${linked.x},${linked.y},${linked.w},${linked.h})',
+                  );
+                  widget.onCharUpdated(neighborOriginal, linked);
+                }
+              }
+              if (_dragStart != null && _dragCurrent != null) {
+                final rel = Rect.fromPoints(
+                  _displayToLineRel(_dragStart!),
+                  _displayToLineRel(_dragCurrent!),
+                );
+                if (rel.width > 4 && rel.height > 4) {
+                  final id = 'u_${DateTime.now().millisecondsSinceEpoch}';
+                  widget.onCharAdded(
+                    CharBlock(
+                      id: id,
+                      x: _toAbsX(rel.left),
+                      y: _toAbsY(rel.top),
+                      w: rel.width.round(),
+                      h: rel.height.round(),
+                      col: widget.line.lineNo,
+                      order: widget.line.chars.length,
+                      lineId: widget.line.id,
+                    ),
+                  );
+                }
+              }
+              setState(_clearState);
+            },
+            onPointerCancel: (_) => setState(_clearState),
+            // GestureDetector 声明拖拽手势抢占仲裁（回调全是空实现）：外层
+            // SingleChildScrollView 否则会把画框/拖框/缩放的拖拽同时识别成
+            // 滚动，列表边滚动画框起点边相对鼠标漂移，画出的框尺寸也随之
+            // 错乱。本区域赢得仲裁后拖拽期间列表不滚动；滚轮滚动不受影响。
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onPanStart: (_) {},
+              onPanUpdate: (_) {},
+              onPanEnd: (_) {},
+              onPanCancel: () {},
+              // RepaintBoundary：拖动字框时只重绘本行裁切图，避免整个详细视图
+              // （每张卡片都从整页大图取样）每帧重新栅格化。
+              child: RepaintBoundary(
+                child: SizedBox(
+                  key: _canvasKey,
+                  // 行框退化（宽/高为 0 → 上游算出 NaN/∞/0 尺寸）时退回
+                  // 最小占位尺寸：NaN 进入 BoxConstraints 会直接抛错崩页。
+                  width: widget.displayWidth.isFinite && widget.displayWidth > 0
+                      ? widget.displayWidth
+                      : 60,
+                  height:
+                      widget.displayHeight.isFinite && widget.displayHeight > 0
+                      ? widget.displayHeight
+                      : 20,
+                  child: flashRel == null
+                      ? CustomPaint(
+                          painter: _LineCropPainter(
+                            image: widget.image,
+                            srcRect: widget.srcRect,
+                            charRects: charRects,
+                            charColors: charColors,
+                            tallFlags: tallFlags,
+                            verifyColors: verifyColors,
+                            selectedRect: selectedRel,
+                            dragRect: dragRel,
+                            altCutLine: altCutLine,
+                            multiRects: multiRects,
+                          ),
+                        )
+                      : Stack(
+                          children: [
+                            Positioned.fill(
+                              child: CustomPaint(
+                                painter: _LineCropPainter(
+                                  image: widget.image,
+                                  srcRect: widget.srcRect,
+                                  charRects: charRects,
+                                  charColors: charColors,
+                                  tallFlags: tallFlags,
+                                  verifyColors: verifyColors,
+                                  selectedRect: selectedRel,
+                                  dragRect: dragRel,
+                                  altCutLine: altCutLine,
+                                  multiRects: multiRects,
+                                ),
+                              ),
+                            ),
+                            // 定位闪烁框叠在字框上方；IgnorePointer 保证
+                            // 不遮挡行图的拖框/缩放交互。
+                            Positioned.fromRect(
+                              rect: flashRel,
+                              child: IgnorePointer(
+                                child: _LocateFlash(
+                                  active: true,
+                                  child: const SizedBox.expand(),
+                                ),
+                              ),
+                            ),
+                          ],
                         ),
-                      )
-                    : Stack(
-                        children: [
-                          Positioned.fill(
-                            child: CustomPaint(
-                              painter: _LineCropPainter(
-                                image: widget.image,
-                                srcRect: widget.srcRect,
-                                charRects: charRects,
-                                charColors: charColors,
-                                tallFlags: tallFlags,
-                                verifyColors: verifyColors,
-                                selectedRect: selectedRel,
-                                dragRect: dragRel,
-                              ),
-                            ),
-                          ),
-                          // 定位闪烁框叠在字框上方；IgnorePointer 保证
-                          // 不遮挡行图的拖框/缩放交互。
-                          Positioned.fromRect(
-                            rect: flashRel,
-                            child: IgnorePointer(
-                              child: _LocateFlash(
-                                active: true,
-                                child: const SizedBox.expand(),
-                              ),
-                            ),
-                          ),
-                        ],
-                      ),
+                ),
               ),
             ),
           ),
@@ -13698,15 +14588,12 @@ class _EngineSettingsDialogState extends State<_EngineSettingsDialog> {
         ),
         FilledButton(
           onPressed: _changed
-              ? () => Navigator.pop(
-                  context,
-                  (
-                    _engine,
-                    _paddleModel,
-                    // VL 面板未动时沿用原设置对象（copyWith 已复制）。
-                    _vlSettings ?? (widget.vlSettings!.copyWith()),
-                  ),
-                )
+              ? () => Navigator.pop(context, (
+                  _engine,
+                  _paddleModel,
+                  // VL 面板未动时沿用原设置对象（copyWith 已复制）。
+                  _vlSettings ?? (widget.vlSettings!.copyWith()),
+                ))
               : null,
           child: const Text('保存'),
         ),
