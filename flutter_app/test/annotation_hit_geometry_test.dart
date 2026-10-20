@@ -73,71 +73,77 @@ void main() {
     expect(resized, const Rect.fromLTWH(10, 20, 50, 30));
   });
 
-  test('resizing a left corner keeps the opposite edge fixed after rounding', () {
-    const original = Rect.fromLTWH(10, 20, 40, 30);
-    final first = AnnotationHitGeometry.resizeRect(
-      original,
-      const Offset(21.6, 31.6),
-      AnnotationResizeHandle.topLeft,
-      minSize: 10,
-    );
-    // Simulate the editor writing integer coordinates after this pointer move.
-    final integerized = Rect.fromLTWH(
-      first.left.toInt().toDouble(),
-      first.top.toInt().toDouble(),
-      first.width.toInt().toDouble(),
-      first.height.toInt().toDouble(),
-    );
-    final second = AnnotationHitGeometry.resizeRect(
-      integerized,
-      const Offset(22.4, 32.4),
-      AnnotationResizeHandle.topLeft,
-      minSize: 10,
-    );
-
-    expect(first.right, original.right);
-    expect(first.bottom, original.bottom);
-    expect(integerized.right, original.right);
-    expect(integerized.bottom, original.bottom);
-    expect(second.right, original.right);
-    expect(second.bottom, original.bottom);
-
-    final bottomLeft = AnnotationHitGeometry.resizeRect(
-      original,
-      const Offset(22.4, 47.6),
-      AnnotationResizeHandle.bottomLeft,
-      minSize: 10,
-    );
-    expect(bottomLeft.right, original.right);
-    expect(bottomLeft.top, original.top);
-  });
-
-  test('top-right resize keeps the anchored bottom fixed under half-pixel pointer streams', () {
-    // 用户实测：显示比例把指针坐标映射到半整数时，旧实现里顶边/高度
-    // 各自独立取整、两处同时进位，固定底边每个指针事件下移 1px（一次
-    // 拖拽累计 487 -> 546）。固定边必须直接取整数原值。
-    final original = const Rect.fromLTWH(611, 449, 34, 38); // 实测问题框
-    var rect = original;
-    for (var k = 0; k < 200; k++) {
-      // 半整数指针流：顶边目标始终落在 .5 上（最坏情形）
-      rect = AnnotationHitGeometry.resizeTopRightRect(
-        rect,
-        rect.right + 0.5,
-        456.5,
+  test(
+    'resizing a left corner keeps the opposite edge fixed after rounding',
+    () {
+      const original = Rect.fromLTWH(10, 20, 40, 30);
+      final first = AnnotationHitGeometry.resizeRect(
+        original,
+        const Offset(21.6, 31.6),
+        AnnotationResizeHandle.topLeft,
+        minSize: 10,
       );
-      // 模拟编辑器按整数坐标写回标注
-      rect = Rect.fromLTWH(
-        rect.left,
-        rect.top,
-        rect.width.toInt().toDouble(),
-        rect.height.toInt().toDouble(),
+      // Simulate the editor writing integer coordinates after this pointer move.
+      final integerized = Rect.fromLTWH(
+        first.left.toInt().toDouble(),
+        first.top.toInt().toDouble(),
+        first.width.toInt().toDouble(),
+        first.height.toInt().toDouble(),
       );
-    }
-    expect(rect.bottom, original.bottom); // 底边 487 钉死
-    expect(rect.left, original.left); // 左边不动
-    expect(rect.top, 457); // 半整数进位一次后稳定
-    expect(rect.height, original.bottom - 457);
-  });
+      final second = AnnotationHitGeometry.resizeRect(
+        integerized,
+        const Offset(22.4, 32.4),
+        AnnotationResizeHandle.topLeft,
+        minSize: 10,
+      );
+
+      expect(first.right, original.right);
+      expect(first.bottom, original.bottom);
+      expect(integerized.right, original.right);
+      expect(integerized.bottom, original.bottom);
+      expect(second.right, original.right);
+      expect(second.bottom, original.bottom);
+
+      final bottomLeft = AnnotationHitGeometry.resizeRect(
+        original,
+        const Offset(22.4, 47.6),
+        AnnotationResizeHandle.bottomLeft,
+        minSize: 10,
+      );
+      expect(bottomLeft.right, original.right);
+      expect(bottomLeft.top, original.top);
+    },
+  );
+
+  test(
+    'top-right resize keeps the anchored bottom fixed under half-pixel pointer streams',
+    () {
+      // 用户实测：显示比例把指针坐标映射到半整数时，旧实现里顶边/高度
+      // 各自独立取整、两处同时进位，固定底边每个指针事件下移 1px（一次
+      // 拖拽累计 487 -> 546）。固定边必须直接取整数原值。
+      final original = const Rect.fromLTWH(611, 449, 34, 38); // 实测问题框
+      var rect = original;
+      for (var k = 0; k < 200; k++) {
+        // 半整数指针流：顶边目标始终落在 .5 上（最坏情形）
+        rect = AnnotationHitGeometry.resizeTopRightRect(
+          rect,
+          rect.right + 0.5,
+          456.5,
+        );
+        // 模拟编辑器按整数坐标写回标注
+        rect = Rect.fromLTWH(
+          rect.left,
+          rect.top,
+          rect.width.toInt().toDouble(),
+          rect.height.toInt().toDouble(),
+        );
+      }
+      expect(rect.bottom, original.bottom); // 底边 487 钉死
+      expect(rect.left, original.left); // 左边不动
+      expect(rect.top, 457); // 半整数进位一次后稳定
+      expect(rect.height, original.bottom - 457);
+    },
+  );
 
   test('top-right resize clamps top to min size and page top', () {
     const original = Rect.fromLTWH(611, 449, 34, 38);
@@ -301,15 +307,15 @@ void main() {
       );
     });
 
-    test('Alt 拆分：竖排上下两半，奇数长度和恒等于原长', () {
-      // 气 (0,170,40,41)：前半 20（floor），后半 21
-      final halves = AnnotationHitGeometry.splitRectHalf(
+    test('Alt 切割：中点切线竖排上下，奇数长度和恒等于原长', () {
+      // 气 (0,170,40,41)：中点切线 190.5 → 取整 191（四舍五入），
+      // 前半 21、后半 20
+      final halves = AnnotationHitGeometry.splitRectAt(
         const Rect.fromLTWH(0, 170, 40, 41),
+        cut: 170 + 41 / 2,
         horizontal: false,
       );
       final (first, second) = halves!;
-      expect(first, const Rect.fromLTWH(0, 170, 40, 20));
-      expect(second, const Rect.fromLTWH(0, 190, 40, 21));
       expect(first.height + second.height, 41);
       // 前后半贴合无缝、左右边与原框一致
       expect(first.bottom, second.top);
@@ -317,25 +323,28 @@ void main() {
       expect(second.right, 40);
     });
 
-    test('Alt 拆分：横排左右两半；太薄返回 null', () {
-      final halves = AnnotationHitGeometry.splitRectHalf(
+    test('Alt 切割：横排按切线左右；太薄返回 null', () {
+      final halves = AnnotationHitGeometry.splitRectAt(
         const Rect.fromLTWH(10, 20, 50, 40),
+        cut: 35,
         horizontal: true,
       );
       final (first, second) = halves!;
-      expect(first, const Rect.fromLTWH(10, 20, 25, 40));
-      expect(second, const Rect.fromLTWH(35, 20, 25, 40));
+      expect(first, const Rect.fromLTRB(10, 20, 35, 60));
+      expect(second, const Rect.fromLTRB(35, 20, 60, 60));
       // 轴向长度不足 2×5 → 拆不出两个最小框
       expect(
-        AnnotationHitGeometry.splitRectHalf(
+        AnnotationHitGeometry.splitRectAt(
           const Rect.fromLTWH(0, 170, 40, 9),
+          cut: 175,
           horizontal: false,
         ),
         isNull,
       );
       expect(
-        AnnotationHitGeometry.splitRectHalf(
+        AnnotationHitGeometry.splitRectAt(
           const Rect.fromLTWH(0, 170, 9, 40),
+          cut: 5,
           horizontal: true,
         ),
         isNull,
@@ -343,36 +352,143 @@ void main() {
     });
   });
 
-/// 新字按阅读序插入的落点（readingOrderInsertIndex）。
-group('readingOrderInsertIndex', () {
-  test('横排 ltr：行尾/行中/行首新字各归其位', () {
-    // 行内三字中心 X：10、50、90（ltr 阅读序）
-    const axes = [10.0, 50.0, 90.0];
-    // 行尾（右侧）新字 → 追加
-    expect(readingOrderInsertIndex(axes, 130, rtl: false), 3);
-    // 两字之间 → 插到后者前
-    expect(readingOrderInsertIndex(axes, 70, rtl: false), 2);
-    // 行首（左侧）之前 → 插到最前
-    expect(readingOrderInsertIndex(axes, 5, rtl: false), 0);
+  /// 新字按阅读序插入的落点（readingOrderInsertIndex）。
+  group('splitRectAt（Alt 悬停虚线+点击切割）', () {
+    test('按指定切线拆分：横排左右、竖排上下，两段之和恒等于原长', () {
+      // 横排：cut=32 → 前半宽 22、后半宽 18
+      final h = AnnotationHitGeometry.splitRectAt(
+        const Rect.fromLTWH(10, 20, 40, 30),
+        cut: 32,
+        horizontal: true,
+      )!;
+      final (h1, h2) = h;
+      expect(h1, const Rect.fromLTRB(10, 20, 32, 50));
+      expect(h2, const Rect.fromLTRB(32, 20, 50, 50));
+      expect(h1.width + h2.width, 40);
+      expect(h1.right, h2.left);
+      // 竖排：cut=100 → 前半高 30、后半高 10
+      final v = AnnotationHitGeometry.splitRectAt(
+        const Rect.fromLTWH(0, 70, 40, 40),
+        cut: 100,
+        horizontal: false,
+      )!;
+      final (v1, v2) = v;
+      expect(v1, const Rect.fromLTRB(0, 70, 40, 100));
+      expect(v2, const Rect.fromLTRB(0, 100, 40, 110));
+      expect(v1.height + v2.height, 40);
+      expect(v1.bottom, v2.top);
+    });
+
+    test('切线钳进两侧各留 5px 有效区并取整像素（所见即所切）', () {
+      // 悬停贴近左缘（cut=12 < 10+5=15）→ 钳到 15，两半都 ≥ 最小框
+      final clamped = AnnotationHitGeometry.splitRectAt(
+        const Rect.fromLTWH(10, 20, 40, 30),
+        cut: 12,
+        horizontal: true,
+      )!;
+      final (first, second) = clamped;
+      expect(first, const Rect.fromLTRB(10, 20, 15, 50));
+      expect(second, const Rect.fromLTRB(15, 20, 50, 50));
+      // 小数切线四舍五入到整数像素（坐标保持整数、和恒等于原长）
+      final rounded = AnnotationHitGeometry.splitRectAt(
+        const Rect.fromLTWH(0, 0, 40, 40),
+        cut: 20.6,
+        horizontal: false,
+      )!;
+      final (r1, r2) = rounded;
+      expect(r1.bottom, 21);
+      expect(r2.top, 21);
+      expect(r1.height + r2.height, 40);
+    });
+
+    test('轴向不足 10px 返回 null（与平分同门槛）', () {
+      expect(
+        AnnotationHitGeometry.splitRectAt(
+          const Rect.fromLTWH(0, 170, 40, 9),
+          cut: 175,
+          horizontal: false,
+        ),
+        isNull,
+      );
+      expect(
+        AnnotationHitGeometry.splitRectAt(
+          const Rect.fromLTWH(0, 170, 9, 40),
+          cut: 5,
+          horizontal: true,
+        ),
+        isNull,
+      );
+    });
   });
 
-  test('横排 rtl：轴向递减阅读序下新字按从右到左归位', () {
-    // 行内三字按 rtl 阅读序排列：中心 X 90、50、10（最先读最右）
-    const axes = [90.0, 50.0, 10.0];
-    // 更靠右的新字 → 排最前
-    expect(readingOrderInsertIndex(axes, 130, rtl: true), 0);
-    // 90 与 50 之间 → 插到下标 1
-    expect(readingOrderInsertIndex(axes, 70, rtl: true), 1);
-    // 最左 → 追加到行尾
-    expect(readingOrderInsertIndex(axes, 5, rtl: true), 3);
+  group('nearestHandle（Alt+点击：选中框最近顶点）', () {
+    const rect = Rect.fromLTWH(100, 100, 80, 60);
+
+    test('画布远处点击取距离最近的角，命中半径无上限', () {
+      expect(
+        AnnotationHitGeometry.nearestHandle(rect, const Offset(500, 60)),
+        AnnotationResizeHandle.topRight,
+      );
+      expect(
+        AnnotationHitGeometry.nearestHandle(rect, const Offset(10, 400)),
+        AnnotationResizeHandle.bottomLeft,
+      );
+    });
+
+    test('框内点击同样取最近角', () {
+      expect(
+        AnnotationHitGeometry.nearestHandle(rect, const Offset(110, 115)),
+        AnnotationResizeHandle.topLeft,
+      );
+      expect(
+        AnnotationHitGeometry.nearestHandle(rect, const Offset(170, 150)),
+        AnnotationResizeHandle.bottomRight,
+      );
+    });
+
+    test('零偏移缩放把顶点精确移到点击处（对边钉死，四舍五入取整）', () {
+      final moved = AnnotationHitGeometry.resizeRect(
+        rect,
+        const Offset(300.4, 20.6),
+        AnnotationResizeHandle.topRight,
+        minSize: 20,
+      );
+      expect(moved.right, 300);
+      expect(moved.top, 21);
+      expect(moved.left, 100);
+      expect(moved.bottom, 160);
+    });
   });
 
-  test('本页覆盖 ltr 时不得按整书 rtl 判读（回归：新字全插到行首）', () {
-    // 整书竖排列序 rtl、按页覆盖成横排 ltr 的页：行内字按 ltr 排列，
-    // 行尾新画的字必须追加到行尾——修复前误用整书 rtl 判读会返回 0。
-    const axes = [10.0, 50.0, 90.0];
-    expect(readingOrderInsertIndex(axes, 130, rtl: false), 3);
-    expect(readingOrderInsertIndex(axes, 70, rtl: false), 2);
+  group('readingOrderInsertIndex', () {
+    test('横排 ltr：行尾/行中/行首新字各归其位', () {
+      // 行内三字中心 X：10、50、90（ltr 阅读序）
+      const axes = [10.0, 50.0, 90.0];
+      // 行尾（右侧）新字 → 追加
+      expect(readingOrderInsertIndex(axes, 130, rtl: false), 3);
+      // 两字之间 → 插到后者前
+      expect(readingOrderInsertIndex(axes, 70, rtl: false), 2);
+      // 行首（左侧）之前 → 插到最前
+      expect(readingOrderInsertIndex(axes, 5, rtl: false), 0);
+    });
+
+    test('横排 rtl：轴向递减阅读序下新字按从右到左归位', () {
+      // 行内三字按 rtl 阅读序排列：中心 X 90、50、10（最先读最右）
+      const axes = [90.0, 50.0, 10.0];
+      // 更靠右的新字 → 排最前
+      expect(readingOrderInsertIndex(axes, 130, rtl: true), 0);
+      // 90 与 50 之间 → 插到下标 1
+      expect(readingOrderInsertIndex(axes, 70, rtl: true), 1);
+      // 最左 → 追加到行尾
+      expect(readingOrderInsertIndex(axes, 5, rtl: true), 3);
+    });
+
+    test('本页覆盖 ltr 时不得按整书 rtl 判读（回归：新字全插到行首）', () {
+      // 整书竖排列序 rtl、按页覆盖成横排 ltr 的页：行内字按 ltr 排列，
+      // 行尾新画的字必须追加到行尾——修复前误用整书 rtl 判读会返回 0。
+      const axes = [10.0, 50.0, 90.0];
+      expect(readingOrderInsertIndex(axes, 130, rtl: false), 3);
+      expect(readingOrderInsertIndex(axes, 70, rtl: false), 2);
+    });
   });
-});
 }

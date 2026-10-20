@@ -7,7 +7,7 @@
 #define MyAppIconFile "..\flutter_app\windows\runner\resources\app_icon.ico"
 #ifndef MyAppVersion
   ; 单独用 ISCC 编译而未传 /DMyAppVersion 时的兜底版本号
-  #define MyAppVersion "1.0.1"
+  #define MyAppVersion "1.0.2"
 #endif
 
 [Setup]
@@ -92,4 +92,43 @@ Filename: "{tmp}\vc_redist.x64.exe"; Parameters: "/install /quiet /norestart"; S
 Filename: "{app}\{#MyAppExeName}"; Description: "立即启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 ; 说明：卸载只删除安装目录。书籍项目（文档\GujiBT）、conda 环境、
-; 已训练的模型数据都保留，不受卸载影响。
+; 已训练的模型数据都保留，不受卸载影响。已导入的插件装在用户应用
+; 数据目录，同样不受卸载影响。
+
+[Code]
+// ── WebView2 运行库（插件系统内嵌网页用） ─────────────────────────
+// Win10（较新补丁）/Win11 系统自带；检测 per-user 与 per-machine 两种
+// 安装位置，缺失时在线引导安装官方 Evergreen 运行库。
+function WebView2Installed(): Boolean;
+begin
+  Result :=
+    RegKeyExists(HKLM, 'SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}') or
+    RegKeyExists(HKLM, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}') or
+    RegKeyExists(HKCU, 'SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}');
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  resultCode: Integer;
+begin
+  Result := '';
+  if WebView2Installed() then exit;
+  try
+    // 签名（Inno 6.7）：Url, BaseName, SHA256（空 = 不校验）, 进度回调。
+    DownloadTemporaryFile(
+      'https://go.microsoft.com/fwlink/p/?LinkId=2124703',
+      'MicrosoftEdgeWebview2Setup.exe', '', nil);
+  except
+    Result := '下载 WebView2 运行库失败（插件系统需要它显示插件页面）。' + #13#10 +
+      '请联网后重试，或先手动安装后再运行本安装包：' + #13#10 +
+      'https://developer.microsoft.com/microsoft-edge/webview2/';
+    exit;
+  end;
+  Exec(ExpandConstant('{tmp}\MicrosoftEdgeWebview2Setup.exe'),
+    '/install /quiet /norestart', '', SW_SHOW, ewWaitUntilTerminated, resultCode);
+  if not WebView2Installed() then begin
+    Result := 'WebView2 运行库安装未完成（退出码 ' + IntToStr(resultCode) + '）。' + #13#10 +
+      '软件仍可安装，但插件功能需要该运行库；可稍后从以下地址手动安装：' + #13#10 +
+      'https://developer.microsoft.com/microsoft-edge/webview2/';
+  end;
+end;

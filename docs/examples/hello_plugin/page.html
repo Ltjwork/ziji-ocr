@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>你好，字迹</title>
+<style>
+  body {
+    margin: 0; padding: 24px;
+    font: 14px/1.7 "Microsoft YaHei", "Segoe UI", sans-serif;
+    color: #1f2430; background: #f6f7fa;
+  }
+  .card {
+    background: #fff; border: 1px solid #d5d9e2; border-radius: 10px;
+    padding: 16px 18px; margin-bottom: 14px; max-width: 560px;
+  }
+  h1 { font-size: 16px; margin: 0 0 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eceff3; }
+  th { color: #6b7280; font-weight: 600; }
+  button {
+    margin-top: 10px; padding: 6px 14px; border-radius: 6px;
+    border: 1px solid #3949ab; background: #3949ab; color: #fff;
+    font-size: 13px; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>书库概览</h1>
+    <table>
+      <thead><tr><th>书名</th><th>页数</th><th>上次翻到</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="3">加载中…</td></tr></tbody>
+    </table>
+    <button id="close">返回（携带回执演示）</button>
+  </div>
+<script>
+'use strict';
+
+(async function init() {
+  const info = await ziji.invoke('app.info');
+  document.title = `你好，字迹 · v${info.appVersion}`;
+  const projects = await ziji.invoke('projects.list');
+  const rows = document.getElementById('rows');
+  rows.innerHTML = projects.length === 0
+    ? '<tr><td colspan="3">书库还是空的。</td></tr>'
+    : projects.map((p) =>
+        `<tr><td>《${p.name}》</td><td>${p.pageCount}</td><td>第 ${p.lastPageIndex + 1} 页</td></tr>`,
+      ).join('');
+  document.getElementById('close').addEventListener('click', () => {
+    // 回执演示：告诉编辑器没有页被改写（null 效果相同）。
+    ziji.invoke('ui.closePage', { result: { modifiedPages: [] } });
+  });
+})();
+</script>
+</body>
+</html>

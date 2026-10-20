@@ -3095,7 +3095,7 @@ class _OllamaSettingsPageState extends State<OllamaSettingsPage> {
                   ),
                 ),
                 icon: const Icon(Icons.history_edu, size: 18),
-                label: const Text('更新日志（本版本更新内容，可复制 GitHub 发布说明）'),
+                label: const Text('GitHub 更新日志'),
               ),
             ),
           ],

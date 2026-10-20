@@ -1,0 +1,12 @@
+{
+  "id": "hello",
+  "name": "你好，字迹",
+  "version": "1.0.0",
+  "description": "插件开发示例：注册一个入口，打开页面显示书库概览与页数。",
+  "author": "ziji docs",
+  "api_version": 1,
+  "min_app_version": "1.0.2",
+  "entry": "main.js",
+  "icon": "lightbulb",
+  "permissions": ["projects:read"]
+}

@@ -3,6 +3,8 @@
 
 #include <flutter/dart_project.h>
 #include <flutter/flutter_view_controller.h>
+#include <flutter/method_channel.h>
+#include <flutter/standard_method_codec.h>
 
 #include <memory>
 
@@ -28,6 +30,11 @@ class FlutterWindow : public Win32Window {
 
   // The Flutter instance hosted by this window.
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;
+
+  // 输入法接管字母键时，把 ImmGetVirtualKey 取回的真实键码投递给 Dart
+  // （见 lib/services/ime_virtual_key_bridge.dart）。
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
+      ime_channel_;
 };
 
 #endif  // RUNNER_FLUTTER_WINDOW_H_

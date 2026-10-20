@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import '../models/models.dart';
 import '../services/python_service.dart';
 import '../widgets/band_select_surface.dart';
+import '../widgets/ctrl_scroll_zoom.dart';
 import 'editor_page.dart' show charPinyin;
 import 'similar_chars_book_page.dart' show BookClassifyResult;
 
@@ -54,6 +55,11 @@ class SimilarCharsPage extends StatefulWidget {
   State<SimilarCharsPage> createState() => _SimilarCharsPageState();
 }
 
+// ── Ctrl+滚轮格子缩放（与编辑器详细视图同款交互） ──
+const double kInkCellSize = 64.0;
+const double kInkCellMinZoom = 0.5;
+const double kInkCellMaxZoom = 3.0;
+
 class _SimilarCharsPageState extends State<SimilarCharsPage> {
   ui.Image? _image;
 
@@ -86,6 +92,12 @@ class _SimilarCharsPageState extends State<SimilarCharsPage> {
   String? _error;
   CharClusterResult? _result;
   bool _confirmingGroup = false;
+
+  double _cellZoom = 1.0;
+
+  void _zoomCells(double factor) => setState(() {
+    _cellZoom = (_cellZoom * factor).clamp(kInkCellMinZoom, kInkCellMaxZoom);
+  });
 
   @override
   void initState() {
@@ -360,7 +372,8 @@ class _SimilarCharsPageState extends State<SimilarCharsPage> {
       if (_onlyMarked) {
         return const _HintView(
           icon: Icons.flag_outlined,
-          text: '本页没有标记的特殊字。归类时点选/框选存疑的字后用「标记」按钮'
+          text:
+              '本页没有标记的特殊字。归类时点选/框选存疑的字后用「标记」按钮'
               '打标，等全书识别完成后切回「只看标记」集中校对。',
         );
       }
@@ -486,44 +499,54 @@ class _SimilarCharsPageState extends State<SimilarCharsPage> {
     List<String> singleIds,
   ) {
     final hasSingles = singleIds.isNotEmpty;
+    // 缩放感知层逐卡片包裹：列表项在滚动视图子树内，Ctrl+滚轮在这里
+    // 比外层滚动视图先拿到信号（整层包 ListView 外面会轮不到）。
     return ListView.builder(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
       itemCount: groups.length + (hasSingles ? 1 : 0),
       itemBuilder: (context, index) {
         if (index < groups.length) {
           final group = groups[index];
-          return _ClusterCard(
-            key: ValueKey('cluster-${group.blockIds.first}-$index'),
-            index: index + 1,
-            group: group,
+          return CtrlScrollZoomSurface(
+            onZoom: _zoomCells,
+            child: _ClusterCard(
+              key: ValueKey('cluster-${group.blockIds.first}-$index'),
+              index: index + 1,
+              group: group,
+              image: _image,
+              blocksById: _blocksById,
+              texts: _texts,
+              confirmedIds: _confirmedIds,
+              markedIds: _markedIds,
+              showConfirmed: _showConfirmed,
+              hideMarked: _hideMarked,
+              onlyMarked: _onlyMarked,
+              confirmable: !_confirmingGroup,
+              cellSize: kInkCellSize * _cellZoom,
+              onApplyText: _applyText,
+              onConfirmSelected: _confirmSelected,
+              onSetMarked: _setMarked,
+              onEditSingle: _editSingle,
+              onLocateChar: widget.onLocateChar,
+            ),
+          );
+        }
+        return CtrlScrollZoomSurface(
+          onZoom: _zoomCells,
+          child: _SingletonsCard(
+            key: const ValueKey('singletons'),
+            blockIds: singleIds,
             image: _image,
             blocksById: _blocksById,
             texts: _texts,
             confirmedIds: _confirmedIds,
             markedIds: _markedIds,
-            showConfirmed: _showConfirmed,
-            hideMarked: _hideMarked,
-            onlyMarked: _onlyMarked,
-            confirmable: !_confirmingGroup,
-            onApplyText: _applyText,
-            onConfirmSelected: _confirmSelected,
-            onSetMarked: _setMarked,
+            skippedCount: _result?.skipped.length ?? 0,
+            noGroupsAtAll: groups.isEmpty,
+            cellSize: kInkCellSize * _cellZoom,
             onEditSingle: _editSingle,
             onLocateChar: widget.onLocateChar,
-          );
-        }
-        return _SingletonsCard(
-          key: const ValueKey('singletons'),
-          blockIds: singleIds,
-          image: _image,
-          blocksById: _blocksById,
-          texts: _texts,
-          confirmedIds: _confirmedIds,
-          markedIds: _markedIds,
-          skippedCount: _result?.skipped.length ?? 0,
-          noGroupsAtAll: groups.isEmpty,
-          onEditSingle: _editSingle,
-          onLocateChar: widget.onLocateChar,
+          ),
         );
       },
     );
@@ -546,6 +569,9 @@ class _ClusterCard extends StatefulWidget {
   final bool hideMarked;
   final bool onlyMarked;
   final bool confirmable;
+
+  /// 字格边长（Ctrl+滚轮缩放由页面状态折算传入）。
+  final double cellSize;
   final void Function(List<String> blockIds, String text) onApplyText;
   final Future<void> Function(List<String> blockIds) onConfirmSelected;
   final void Function(List<String> blockIds, bool marked) onSetMarked;
@@ -565,6 +591,7 @@ class _ClusterCard extends StatefulWidget {
     required this.hideMarked,
     required this.onlyMarked,
     required this.confirmable,
+    this.cellSize = kInkCellSize,
     required this.onApplyText,
     required this.onConfirmSelected,
     required this.onSetMarked,
@@ -617,8 +644,7 @@ class _ClusterCardState extends State<_ClusterCard> {
   }
 
   bool _isConfirmed(String id) =>
-      (widget.texts[id] ?? '').isNotEmpty &&
-      widget.confirmedIds.contains(id);
+      (widget.texts[id] ?? '').isNotEmpty && widget.confirmedIds.contains(id);
 
   bool _isMarked(String id) => widget.markedIds.contains(id);
 
@@ -791,16 +817,13 @@ class _ClusterCardState extends State<_ClusterCard> {
         .where((id) => !widget.confirmedIds.contains(id))
         .toList();
     final hiddenCount = widget.group.size - visible.length;
-    final markedCount = widget.group.blockIds
-        .where(_isMarked)
-        .length;
+    final markedCount = widget.group.blockIds.where(_isMarked).length;
     final allConfirmed = widget.group.blockIds.every(
       (id) =>
-          (widget.texts[id] ?? '').isEmpty ||
-          widget.confirmedIds.contains(id),
+          (widget.texts[id] ?? '').isEmpty || widget.confirmedIds.contains(id),
     );
-    final selectedMarkedAll = selectedIds.isNotEmpty &&
-        selectedIds.every(_isMarked);
+    final selectedMarkedAll =
+        selectedIds.isNotEmpty && selectedIds.every(_isMarked);
 
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
@@ -853,7 +876,8 @@ class _ClusterCardState extends State<_ClusterCard> {
                 const SizedBox(width: 8),
                 if (markedCount > 0) ...[
                   Tooltip(
-                    message: '特殊字标记 $markedCount 个（可能裁分有问题或'
+                    message:
+                        '特殊字标记 $markedCount 个（可能裁分有问题或'
                         '暂无法识别），「只看标记」可筛出集中校对',
                     child: Container(
                       padding: const EdgeInsets.symmetric(
@@ -968,6 +992,7 @@ class _ClusterCardState extends State<_ClusterCard> {
                       isConfirmed: _isConfirmed(id),
                       isMarked: _isMarked(id),
                       routed: true,
+                      cellSize: widget.cellSize,
                       cellKey: _cellKeys[id],
                       editKey: _editKeys[id],
                       locateKey: _locateKeys[id],
@@ -1004,9 +1029,7 @@ class _ClusterCardState extends State<_ClusterCard> {
                       foregroundColor: Colors.deepOrange.shade700,
                       side: BorderSide(color: Colors.deepOrange.shade300),
                     ),
-                    onPressed: selectedIds.isEmpty
-                        ? null
-                        : _toggleMarkSelected,
+                    onPressed: selectedIds.isEmpty ? null : _toggleMarkSelected,
                     icon: Icon(
                       selectedMarkedAll ? Icons.flag : Icons.flag_outlined,
                       size: 16,
@@ -1089,15 +1112,12 @@ class _ClusterCardState extends State<_ClusterCard> {
           backgroundColor: Colors.green.shade50,
           foregroundColor: Colors.green.shade800,
         ),
-        onPressed:
-            widget.confirmable && confirmableIds.isNotEmpty
+        onPressed: widget.confirmable && confirmableIds.isNotEmpty
             ? () => widget.onConfirmSelected(confirmableIds)
             : null,
         icon: const Icon(Icons.task_alt, size: 16),
         label: Text(
-          confirmableIds.isEmpty
-              ? '确认所选'
-              : '确认所选（${confirmableIds.length}）',
+          confirmableIds.isEmpty ? '确认所选' : '确认所选（${confirmableIds.length}）',
         ),
       ),
     );
@@ -1115,6 +1135,9 @@ class _SingletonsCard extends StatelessWidget {
   final Set<String> markedIds;
   final int skippedCount;
   final bool noGroupsAtAll;
+
+  /// 字格边长（Ctrl+滚轮缩放由页面状态折算传入）。
+  final double cellSize;
   final void Function(String blockId) onEditSingle;
   final void Function(String blockId) onLocateChar;
 
@@ -1128,6 +1151,7 @@ class _SingletonsCard extends StatelessWidget {
     required this.markedIds,
     required this.skippedCount,
     required this.noGroupsAtAll,
+    this.cellSize = kInkCellSize,
     required this.onEditSingle,
     required this.onLocateChar,
   });
@@ -1180,6 +1204,7 @@ class _SingletonsCard extends StatelessWidget {
                         confirmedIds.contains(id),
                     isMarked: markedIds.contains(id),
                     routed: false,
+                    cellSize: cellSize,
                     onTap: () => onEditSingle(id),
                     onLocate: () => onLocateChar(id),
                   ),
@@ -1213,6 +1238,9 @@ class _CharCell extends StatelessWidget {
   final VoidCallback? onTap; // routed=false 时的点击回调
   final VoidCallback? onLocate; // routed=false 时的定位回调
 
+  /// 字格边长（Ctrl+滚轮缩放）。
+  final double cellSize;
+
   const _CharCell({
     required this.block,
     required this.image,
@@ -1227,11 +1255,12 @@ class _CharCell extends StatelessWidget {
     this.locateKey,
     this.onTap,
     this.onLocate,
+    this.cellSize = kInkCellSize,
   });
 
   @override
   Widget build(BuildContext context) {
-    const cell = 64.0;
+    final cell = cellSize;
     final block = this.block;
     final showEdit = routed && editKey != null;
     return Column(
@@ -1263,7 +1292,7 @@ class _CharCell extends StatelessWidget {
                     child: block == null || image == null
                         ? Container(color: Colors.grey.shade100)
                         : CustomPaint(
-                            size: const Size(cell, cell),
+                            size: Size(cell, cell),
                             painter: _CharCropPainter(
                               image: image!,
                               srcRect: Rect.fromLTWH(
@@ -1314,7 +1343,8 @@ class _CharCell extends StatelessWidget {
                 top: 0,
                 left: 0,
                 child: Tooltip(
-                  message: '特殊字标记：可能裁分有问题或暂无法识别，'
+                  message:
+                      '特殊字标记：可能裁分有问题或暂无法识别，'
                       '待全书识别完成后校对',
                   child: Container(
                     width: 16,
@@ -1520,8 +1550,8 @@ class _SingleCharDialogState extends State<_SingleCharDialog> {
               maxLength: 2,
               // Windows 上 maxLength 默认立刻截断输入法的拼音组合串，
               // 打两个字母就被打断；改为选字完成后再截断到上限。
-              maxLengthEnforcement: MaxLengthEnforcement
-                  .truncateAfterCompositionEnds,
+              maxLengthEnforcement:
+                  MaxLengthEnforcement.truncateAfterCompositionEnds,
               decoration: const InputDecoration(
                 isDense: true,
                 border: OutlineInputBorder(),
@@ -1532,7 +1562,8 @@ class _SingleCharDialogState extends State<_SingleCharDialog> {
             ),
             const SizedBox(height: 12),
             Tooltip(
-              message: '标记后该字在归类里带小旗角标，可「隐藏标记」先跳过，'
+              message:
+                  '标记后该字在归类里带小旗角标，可「隐藏标记」先跳过，'
                   '等全书识别完成后用「只看标记」筛回来集中校对',
               child: InkWell(
                 onTap: () => setState(() => _marked = !_marked),

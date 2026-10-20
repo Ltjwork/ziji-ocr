@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/models.dart';
+import '../services/plugin_host/plugin_runtime.dart';
 import '../services/recognition_queue.dart';
 import '../services/system_monitor.dart';
 import 'sparkline.dart';
@@ -61,17 +62,24 @@ class _FloatingMonitorWindowState extends State<FloatingMonitorWindow> {
     super.initState();
     FloatingMonitorWindow.visible.addListener(_onVisibleChanged);
     RecognitionQueue.instance.addListener(_onQueueChanged);
+    PluginHost.instance.addListener(_onPluginsChanged);
     _restore();
   }
 
   @override
   void dispose() {
+    PluginHost.instance.removeListener(_onPluginsChanged);
     RecognitionQueue.instance.removeListener(_onQueueChanged);
     FloatingMonitorWindow.visible.removeListener(_onVisibleChanged);
     _shutdownTicker?.cancel();
     // 悬浮窗是 SystemMonitor 唯一消费者，销毁即停轮询。
     SystemMonitor.instance.stop();
     super.dispose();
+  }
+
+  /// 插件状态行变化（app.setStatus）驱动插件区刷新。
+  void _onPluginsChanged() {
+    if (mounted) setState(() {});
   }
 
   Future<void> _restore() async {
@@ -220,6 +228,16 @@ class _FloatingMonitorWindowState extends State<FloatingMonitorWindow> {
             padding: const EdgeInsets.fromLTRB(14, 6, 14, 8),
             child: _buildShutdownSection(scheme),
           ),
+          if (PluginHost.instance.statusLines.isNotEmpty) ...[
+            Divider(
+              height: 1,
+              color: scheme.outlineVariant.withValues(alpha: 0.5),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 10, 14, 4),
+              child: _buildPluginSection(scheme),
+            ),
+          ],
           Divider(
             height: 1,
             color: scheme.outlineVariant.withValues(alpha: 0.5),
@@ -530,6 +548,53 @@ class _FloatingMonitorWindowState extends State<FloatingMonitorWindow> {
                     textStyle: const TextStyle(fontSize: 11),
                   ),
                   child: const Text('知道了'),
+                ),
+              ],
+            ),
+          ),
+      ],
+    );
+  }
+
+  // ── 插件状态区（外挂插件经 app.setStatus 上报的一行状态） ──
+
+  Widget _buildPluginSection(ColorScheme scheme) {
+    final host = PluginHost.instance;
+    final rows = [
+      for (final entry in host.statusLines.entries)
+        (name: host.byId(entry.key)?.manifest.name ?? entry.key,
+            line: entry.value),
+    ]..sort((a, b) => a.name.compareTo(b.name));
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          '插件',
+          style: TextStyle(
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            color: Colors.grey.shade600,
+          ),
+        ),
+        for (final row in rows)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.extension_outlined,
+                  size: 12,
+                  color: scheme.primary.withValues(alpha: 0.8),
+                ),
+                const SizedBox(width: 5),
+                Expanded(
+                  child: Text(
+                    '${row.name} · ${row.line.text}',
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11, color: Colors.grey.shade700),
+                  ),
                 ),
               ],
             ),

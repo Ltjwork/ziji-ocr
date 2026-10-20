@@ -117,4 +117,97 @@ void main() {
       ['h2', 'h1'],
     );
   });
+
+  group('orderBreakIds（行视图序号断点检查）', () {
+    // 两列：c1(x=400) c2(x=240)，竖排默认 rtl → 几何序 [c1, c2]。
+    test('列表序与几何序一致 → 无断点', () {
+      final lines = [_line('c1', 400, 100, h: 150), _line('c2', 240, 100, h: 150)];
+      expect(ReadingOrderCalculator.orderBreakIds(lines), isEmpty);
+    });
+
+    test('列表序颠倒 → 两端行都算断点', () {
+      final lines = [_line('c2', 240, 100, h: 150), _line('c1', 400, 100, h: 150)];
+      expect(
+        ReadingOrderCalculator.orderBreakIds(lines),
+        {'c1', 'c2'},
+      );
+    });
+
+    test('方向感知：同一列表在 ltr 下连续、默认 rtl 下断裂', () {
+      final lines = [_line('l1', 80, 100, h: 150), _line('r1', 400, 100, h: 150)];
+      expect(ReadingOrderCalculator.orderBreakIds(lines, horizontalDir: 'ltr'),
+          isEmpty);
+      expect(ReadingOrderCalculator.orderBreakIds(lines), {'l1', 'r1'});
+    });
+
+    test('横排：列表序与 y 序一致 → 无断点；颠倒 → 断点', () {
+      final hLines = [
+        _line('h1', 100, 100, w: 400, h: 60),
+        _line('h2', 100, 200, w: 400, h: 60),
+      ];
+      expect(
+        ReadingOrderCalculator.orderBreakIds(hLines, orientation: 'horizontal'),
+        isEmpty,
+      );
+      expect(
+        ReadingOrderCalculator.orderBreakIds(
+          hLines.reversed.toList(),
+          orientation: 'horizontal',
+        ),
+        {'h1', 'h2'},
+      );
+    });
+
+    test('多行只有一处断口：只标记断口两侧行', () {
+      // 几何序应为 [c1, c2, c3]；列表里 c3 被挪到最前（badge 0）→
+      // 序号沿空间读作 1,2,0，唯一断口在 c2→c3（2 之后跟 0）；
+      // c1→c2 是 1→2 恰好 +1，不算断点。
+      final lines = [
+        _line('c3', 80, 100, h: 150),
+        _line('c1', 400, 100, h: 150),
+        _line('c2', 240, 100, h: 150),
+      ];
+      expect(
+        ReadingOrderCalculator.orderBreakIds(lines),
+        {'c2', 'c3'},
+      );
+    });
+
+    test('只读不写：不改动行的 readingOrder', () {
+      final lines = [_line('c2', 240, 100, h: 150), _line('c1', 400, 100, h: 150)];
+      ReadingOrderCalculator.orderBreakIds(lines);
+      expect(lines.every((l) => l.readingOrder == -1), isTrue);
+    });
+
+    test('少于 2 行 → 空集', () {
+      expect(ReadingOrderCalculator.orderBreakIds([_line('c1', 400, 100)]),
+          isEmpty);
+      expect(ReadingOrderCalculator.orderBreakIds(const []), isEmpty);
+    });
+
+    test('错位近距列不误报（用户实测页回归）：列距小于重排的中心距阈值、'
+        '起点高低交错，列表序正确 → 无断点', () {
+      // 两列中心相距 120（= 旧 0.8×平均行宽阈值上限），旧聚类会并成
+      // 一个伪列、列内按 y 排（左列起点更高）翻成 [c2, c1] → 正确页
+      // 被误标红。x 区间重叠只有 30 < 150×0.5，按重叠口径是两列。
+      final c1 = _line('c1', 320, 150, w: 150); // 右列，起点低
+      final c2 = _line('c2', 200, 55, w: 150); // 左列，起点高
+      expect(ReadingOrderCalculator.orderBreakIds([c1, c2]), isEmpty);
+      // 同页真实乱序（列表颠倒）仍要检出
+      expect(
+        ReadingOrderCalculator.orderBreakIds([c2, c1]),
+        {'c1', 'c2'},
+      );
+    });
+
+    test('同列上下两段（x 区间重叠）仍按一列处理：列内乱序检出', () {
+      final top = _line('top', 240, 100, h: 200);
+      final bottom = _line('bottom', 240, 300, h: 200);
+      expect(ReadingOrderCalculator.orderBreakIds([top, bottom]), isEmpty);
+      expect(
+        ReadingOrderCalculator.orderBreakIds([bottom, top]),
+        {'top', 'bottom'},
+      );
+    });
+  });
 }

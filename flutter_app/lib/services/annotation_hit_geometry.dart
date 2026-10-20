@@ -1,6 +1,8 @@
 import 'dart:math' as math;
 import 'dart:ui';
 
+import '../models/models.dart';
+
 enum AnnotationResizeHandle { topLeft, topRight, bottomLeft, bottomRight }
 
 /// Geometry shared by the page editor and the compact line preview. All
@@ -49,6 +51,22 @@ class AnnotationHitGeometry {
         continue;
       }
       final distance = (center - imagePoint).distanceSquared;
+      if (distance < nearestDistance) {
+        nearest = handle;
+        nearestDistance = distance;
+      }
+    }
+    return nearest;
+  }
+
+  /// 无命中半径上限的最近角（Alt+点击把选中框最近顶点移到点击处的
+  /// 纯逻辑）：点击可落在画布任意位置，只按距离取四角最近者。
+  static AnnotationResizeHandle nearestHandle(Rect rect, Offset imagePoint) {
+    AnnotationResizeHandle nearest = AnnotationResizeHandle.values.first;
+    var nearestDistance = double.infinity;
+    for (final handle in AnnotationResizeHandle.values) {
+      final distance =
+          (handleCenter(rect, handle) - imagePoint).distanceSquared;
       if (distance < nearestDistance) {
         nearest = handle;
         nearestDistance = distance;
@@ -188,8 +206,11 @@ class AnnotationHitGeometry {
         ? draggedUpdated.right
         : draggedUpdated.bottom;
     final delta = (updatedEdge - draggedEdge).round();
-    final pinnedFar = horizontal ? neighborOriginal.right : neighborOriginal.bottom;
-    var near = (horizontal ? neighborOriginal.left : neighborOriginal.top) + delta;
+    final pinnedFar = horizontal
+        ? neighborOriginal.right
+        : neighborOriginal.bottom;
+    var near =
+        (horizontal ? neighborOriginal.left : neighborOriginal.top) + delta;
     if (near < 0) near = 0;
     final maxNear = pinnedFar - minSize;
     if (near > maxNear) near = maxNear;
@@ -197,31 +218,51 @@ class AnnotationHitGeometry {
       return null;
     }
     return horizontal
-        ? Rect.fromLTRB(near, neighborOriginal.top, pinnedFar, neighborOriginal.bottom)
-        : Rect.fromLTRB(neighborOriginal.left, near, neighborOriginal.right, pinnedFar);
+        ? Rect.fromLTRB(
+            near,
+            neighborOriginal.top,
+            pinnedFar,
+            neighborOriginal.bottom,
+          )
+        : Rect.fromLTRB(
+            neighborOriginal.left,
+            near,
+            neighborOriginal.right,
+            pinnedFar,
+          );
   }
 
-  /// Alt 单击字框沿阅读轴对半拆分的两半（纯逻辑）：竖排上下拆、横排
-  /// 左右拆。返回 (前半, 后半)，前半取整除的 floor、后半拿余量（两段
-  /// 之和恒等于原长，不漂移）；轴向长度不足 2×[minSize]（拆完出不了
-  /// 两个最小框）返回 null。
-  static (Rect, Rect)? splitRectHalf(
+  /// 沿阅读轴按指定切线拆分（Alt 悬停虚线+点击切割，纯逻辑）：竖排
+  /// 上下拆（[cut] 为绝对 Y）、横排左右拆（[cut] 为绝对 X）。切线取整
+  /// 像素并钳进两侧各留 [minSize] 的有效区（悬停虚线用同一钳制显示，
+  /// 所见即所切）；轴向长度不足 2×[minSize] 返回 null（切不出两个最小
+  /// 框）。返回 (前半, 后半)，坐标保持整数、两段之和恒等于原长。
+  static (Rect, Rect)? splitRectAt(
     Rect rect, {
+    required double cut,
     required bool horizontal,
     double minSize = 5,
   }) {
-    final len = horizontal ? rect.width : rect.height;
-    if (len < minSize * 2) return null;
-    final firstLen = (len / 2).floor();
-    return horizontal
-        ? (
-            Rect.fromLTRB(rect.left, rect.top, rect.left + firstLen, rect.bottom),
-            Rect.fromLTRB(rect.left + firstLen, rect.top, rect.right, rect.bottom),
-          )
-        : (
-            Rect.fromLTRB(rect.left, rect.top, rect.right, rect.top + firstLen),
-            Rect.fromLTRB(rect.left, rect.top + firstLen, rect.right, rect.bottom),
-          );
+    if (horizontal) {
+      if (rect.width < minSize * 2) return null;
+      final x = cut.roundToDouble().clamp(
+        rect.left + minSize,
+        rect.right - minSize,
+      );
+      return (
+        Rect.fromLTRB(rect.left, rect.top, x, rect.bottom),
+        Rect.fromLTRB(x, rect.top, rect.right, rect.bottom),
+      );
+    }
+    if (rect.height < minSize * 2) return null;
+    final y = cut.roundToDouble().clamp(
+      rect.top + minSize,
+      rect.bottom - minSize,
+    );
+    return (
+      Rect.fromLTRB(rect.left, rect.top, rect.right, y),
+      Rect.fromLTRB(rect.left, y, rect.right, rect.bottom),
+    );
   }
 
   static Rect resizeRect(
@@ -277,4 +318,34 @@ int readingOrderInsertIndex(
     if (comesAfter) return i;
   }
   return axes.length;
+}
+
+/// 把同一行内的两个字框合并为一个（多选合并快捷键的纯逻辑，可单测）：
+/// 矩形取两框并集，文字按阅读轴拼接（与 [readingOrderInsertIndex] 同
+/// 口径——横排按中心 X、rtl 右→左；竖排按中心 Y 上→下）。返回的新块
+/// 沿用 [a] 的 id 与确认/标记等元数据，origText 清空（人工合并产物不
+/// 再是识别输出的原始读法基线，不参与正确率统计）；是否触发重识别由
+/// 调用方决定。
+CharBlock mergeCharBoxes(
+  CharBlock a,
+  CharBlock b, {
+  required bool horizontal,
+  required bool rtl,
+}) {
+  double axisOf(CharBlock c) => horizontal ? c.x + c.w / 2 : c.y + c.h / 2;
+  final (first, second) = (rtl ? axisOf(a) > axisOf(b) : axisOf(a) <= axisOf(b))
+      ? (a, b)
+      : (b, a);
+  final left = math.min(a.x, b.x);
+  final top = math.min(a.y, b.y);
+  final right = math.max(a.x + a.w, b.x + b.w);
+  final bottom = math.max(a.y + a.h, b.y + b.h);
+  return first.copyWith(
+    x: left,
+    y: top,
+    w: right - left,
+    h: bottom - top,
+    text: '${first.text}${second.text}',
+    origText: '',
+  );
 }

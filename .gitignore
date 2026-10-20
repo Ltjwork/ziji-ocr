@@ -64,5 +64,7 @@ installer/*.png
 flutter_app/_patch4.py
 diag_enable_crash_dumps.cmd
 *.zjpack.tmp
+# 外挂插件包（分发件，不入库）
+*.zjplugin
 Thumbs.db
 Desktop.ini

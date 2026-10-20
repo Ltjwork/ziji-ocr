@@ -14,6 +14,7 @@ import '../models/page_quad.dart';
 import '../models/table_block.dart';
 import '../services/char_stats.dart';
 import '../services/page_recognition.dart';
+import '../services/plugin_host/plugin_runtime.dart';
 import '../services/python_service.dart';
 import '../services/recognition_queue.dart';
 import '../services/storage.dart';
@@ -27,6 +28,7 @@ import '../services/book_region_apply.dart';
 import '../services/train_auto_export.dart';
 import '../services/mouse_gesture.dart';
 import '../services/editor_shortcut_settings.dart';
+import '../services/ime_virtual_key_bridge.dart';
 import '../services/page_state_markers.dart';
 import '../services/reading_order.dart';
 import '../services/ollama_service.dart';
@@ -46,7 +48,6 @@ import 'book_split_page.dart';
 import 'export_page.dart';
 import 'straighten_page.dart';
 import 'similar_chars_book_page.dart';
-import '../plugins/plugin_registry.dart';
 import 'similar_chars_page.dart';
 import 'table_review_page.dart';
 
@@ -330,6 +331,7 @@ class _EditorPageState extends State<EditorPage> {
     EditorShortcutSettings.load().then((s) {
       if (mounted) setState(() => _shortcuts = s);
     });
+    ImeVirtualKeyBridge.addListener(_onImeVirtualKey);
     // 进入书籍时把当前页的缩略图滚动到可见位置。
     WidgetsBinding.instance.addPostFrameCallback(
       (_) => _scrollThumbsToCurrent(),
@@ -435,6 +437,7 @@ class _EditorPageState extends State<EditorPage> {
     _trainExportSub?.cancel();
     _flashTimer?.cancel();
     _toastTimer?.cancel();
+    ImeVirtualKeyBridge.removeListener(_onImeVirtualKey);
     _focusNode.dispose();
     _thumbScroll.dispose();
     super.dispose();
@@ -1591,12 +1594,21 @@ class _EditorPageState extends State<EditorPage> {
     _save();
   }
 
-  /// 快捷键合并所选识别框：恰好选中同行两个字框时并为一框——矩形取
-  /// 并集、文字按阅读序拼接，并集框随即自动重识别（与手工调框同一
-  /// 通道，新读法不同会进候选）。
-  /// [已弃用] 合并现在通过合并模式实现，见 _handleMergeMode
-  void _mergeMultiSelectedChars() {
-    _snack('合并功能已改为合并模式：按 M 键切换，然后依次点击两个框自动合并');
+  /// 中文输入法下的合并/删除快捷键（原生层经 [ImeVirtualKeyBridge] 投递，
+  /// 见 [ImeVirtualKeyBridge]）。口径与 KeyboardListener 分支一致：仅本页
+  /// 键盘焦点时生效，文本框聚焦时不误触。
+  void _onImeVirtualKey(int vk) {
+    if (!_focusNode.hasFocus ||
+        _loading ||
+        _reorderMode ||
+        _annotation == null) {
+      return;
+    }
+    if (_shortcuts.mergeChars.matchesVirtualKey(vk)) {
+      _toggleMergeMode();
+    } else if (_shortcuts.deleteChars.matchesVirtualKey(vk)) {
+      _deleteByShortcut();
+    }
   }
 
   /// M 键切换合并模式：进入模式时提示，退出时清空首框。
@@ -1637,7 +1649,8 @@ class _EditorPageState extends State<EditorPage> {
       }
     }
 
-    if (hostLine == null) {
+    final host = hostLine;
+    if (host == null) {
       _snack('两个框不在同一行，请重新选择', error: true);
       setState(() => _mergeFirstBox = null);
       return;
@@ -1649,18 +1662,18 @@ class _EditorPageState extends State<EditorPage> {
     final merged = mergeCharBoxes(
       first,
       second,
-      horizontal: hostLine.orientation == 'horizontal',
-      rtl: hostLine.orientation == 'horizontal' &&
+      horizontal: host.orientation == 'horizontal',
+      rtl: host.orientation == 'horizontal' &&
           _pageSettings.horizontalDir == 'rtl',
     );
     setState(() {
-      hostLine!.chars.removeWhere(
+      host.chars.removeWhere(
         (c) => c.id == first.id || c.id == second.id,
       );
-      _insertCharInReadingOrder(hostLine!, merged);
+      _insertCharInReadingOrder(host, merged);
       ann.blocks.removeWhere((b) => b.id == first.id || b.id == second.id);
       ann.blocks.add(merged);
-      hostLine!.manual = true;
+      host.manual = true;
       merged
         ..aiBoxIssue = null
         ..aiBoxNote = null;
@@ -4138,22 +4151,29 @@ class _EditorPageState extends State<EditorPage> {
     ),
   ];
 
-  /// 打开插件功能入口（全书操作菜单里 PluginRegistry.enabledEntries
-  /// 渲染的项）：先冲刷当前页未落盘的修改（插件的写回直接改各页标注
-  /// 文件），再交给入口自身打开；关闭后按回执的改写页集合刷新，处理
-  /// 与全书版墨迹归类一致。编辑器不感知具体插件——入口列表与开关
-  /// 状态全部来自插件注册中心。
-  Future<void> _openPluginEntry(PluginEntry entry) async {
+  /// 打开插件功能入口（全书操作菜单里 PluginHost.enabledEntries 渲染
+  /// 的项）：先冲刷当前页未落盘的修改（插件的写回直接改各页标注
+  /// 文件），再交给宿主开插件页面；关闭后按回执的改写页集合刷新，
+  /// 处理与全书版墨迹归类一致。编辑器不感知具体插件——入口列表与
+  /// 开关状态全部来自插件宿主。
+  Future<void> _openPluginEntry(PluginEntryDescriptor entry) async {
     _cancelPendingSave();
     if (_annotation != null) {
       await _flushSave();
       _dirty = false;
     }
     if (!mounted) return;
-    final result = await entry.onOpen(context);
+    final modified = await PluginHost.instance.openEntry(
+      entry,
+      projectDir: widget.project.projectDir,
+      projectName: widget.project.name,
+      pageIndex: _pageIndex,
+    );
     if (!mounted) return;
     await _handleBookClassifyResult(
-      result == null ? null : BookClassifyResult(modifiedPages: result.modifiedPages),
+      modified == null
+          ? null
+          : BookClassifyResult(modifiedPages: modified),
     );
   }
 
@@ -6335,7 +6355,8 @@ class _EditorPageState extends State<EditorPage> {
                     ),
                     const SizedBox(width: 8),
                     // value 混合两种类型：固定项是字符串指令，插件功能
-                    // 入口是 PluginEntry 对象（onSelected 里按类型分流）。
+                    // 入口是 PluginEntryDescriptor 对象（onSelected 里按
+                    // 类型分流）。
                     PopupMenuButton<Object>(
                       icon: const Icon(Icons.auto_stories),
                       tooltip: '全书操作：总览 / 叠加 / 主区快设 / 拆分 / 墨迹归类 / 整本识别',
@@ -6343,7 +6364,7 @@ class _EditorPageState extends State<EditorPage> {
                         if (_loading) return;
                         // 插件功能入口：统一走插件打开仪式（先冲刷当前页
                         // 未落盘修改），入口关闭后由回执刷新受影响页。
-                        if (value is PluginEntry) {
+                        if (value is PluginEntryDescriptor) {
                           unawaited(_openPluginEntry(value));
                           return;
                         }
@@ -6362,21 +6383,18 @@ class _EditorPageState extends State<EditorPage> {
                             _startWholeBookRecognition();
                         }
                       },
+                      // 基础项固定；插件功能入口按当前启停动态插在
+                      // 「开始整本识别」之前（每次开菜单重新构造，停用
+                      // 插件后入口自动消失）。
                       itemBuilder: (_) => [
-                        // 基础项固定；插件功能入口按当前开关动态插在
-                        // 「开始整本识别」之前（每次开菜单重新构造，
-                        // 关闭插件后入口自动消失）。
                         ..._bookMenuEntries(),
-                        for (final entry in PluginRegistry.enabledEntries(
-                          PluginEntryScope(
-                            project: widget.project,
-                            currentPageIndex: _pageIndex,
-                          ),
+                        for (final entry in PluginHost.instance.enabledEntries(
+                          projectDir: widget.project.projectDir,
                         ))
                           PopupMenuItem(
                             value: entry,
                             child: ListTile(
-                              leading: Icon(entry.icon),
+                              leading: Icon(entry.iconData),
                               title: Text(entry.title),
                               subtitle: entry.subtitle == null
                                   ? null
@@ -7303,6 +7321,11 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
   bool _panning = false;
   Offset? _panLast;
 
+  /// 鼠标最近一次悬停位置（画布局部坐标）：Alt 引导线的指针端。存局部
+  /// 坐标而非图像坐标，缩放/平移后鼠标不动也能按新变换换算。
+  /// 移出画布置空。
+  Offset? _hoverLocal;
+
   Size _imageSize = Size.zero;
   ui.Image? _image;
 
@@ -7310,10 +7333,69 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
   void initState() {
     super.initState();
     _loadImageSize();
+    // Alt 按下/松开即时显隐引导线（鼠标不动也生效）；旁听不消费。
+    HardwareKeyboard.instance.addHandler(_handleAltKey);
+  }
+
+  bool _handleAltKey(KeyEvent event) {
+    final k = event.logicalKey;
+    if (_hoverLocal != null &&
+        mounted &&
+        (k == LogicalKeyboardKey.altLeft ||
+            k == LogicalKeyboardKey.altRight ||
+            k == LogicalKeyboardKey.alt)) {
+      setState(() {});
+    }
+    return false;
+  }
+
+  /// Alt 顶点抓取的目标框（区/段/行视图的选中框）；与
+  /// [_tryAltVertexGrab] 同一套前置条件，保证"所见即所抓"。
+  Rect? _altTargetRect() {
+    if (widget.reorderMode || widget.pickRegion) return null;
+    switch (widget.viewMode) {
+      case 'line':
+        final s = widget.selectedLine;
+        return s == null ? null : _objectRect(x: s.x, y: s.y, w: s.w, h: s.h);
+      case 'region':
+        final s = widget.selectedRegion;
+        return s == null ? null : _objectRect(x: s.x, y: s.y, w: s.w, h: s.h);
+      case 'paragraph':
+        final s = widget.selectedParagraph;
+        return s == null ? null : _objectRect(x: s.x, y: s.y, w: s.w, h: s.h);
+      default:
+        return null;
+    }
+  }
+
+  /// 按住 Alt 悬停时的引导线：(将被调整的顶点, 鼠标位置)，均为图像
+  /// 坐标。顶点取选中框离鼠标最近的角——与点击后 [_tryAltVertexGrab]
+  /// 抓取的是同一个角。手势进行中（拖动/缩放/画框/平移）不显示。
+  (Offset, Offset)? _altGuide() {
+    final local = _hoverLocal;
+    if (local == null || !HardwareKeyboard.instance.isAltPressed) return null;
+    if (_dragStart != null ||
+        _dragging != null ||
+        _resizing != null ||
+        _draggingRegion != null ||
+        _resizingRegion != null ||
+        _draggingParagraph != null ||
+        _resizingParagraph != null ||
+        _draggingLine != null ||
+        _resizingLine != null ||
+        _panning) {
+      return null;
+    }
+    final rect = _altTargetRect();
+    if (rect == null) return null;
+    final pointer = _toImage(local);
+    final handle = AnnotationHitGeometry.nearestHandle(rect, pointer);
+    return (AnnotationHitGeometry.handleCenter(rect, handle), pointer);
   }
 
   @override
   void dispose() {
+    HardwareKeyboard.instance.removeHandler(_handleAltKey);
     // 页面退出/画布子树被移除时释放变换控制器与页面图像的 native 纹理
     // （此前两者都随 State 一起泄漏）。
     _transform.dispose();
@@ -7734,8 +7816,18 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
             ..scaleByDouble(scale, scale, 1, 1);
         }
 
-        return Listener(
+        return MouseRegion(
+          // 移出画布清掉悬停位置：Alt 引导线只在鼠标位于画布内时出现。
+          onExit: (_) {
+            if (_hoverLocal != null) setState(() => _hoverLocal = null);
+          },
+          child: Listener(
           behavior: HitTestBehavior.opaque,
+          // 悬停跟踪：Alt 引导线的指针端（非 Alt 时不触发重绘）。
+          onPointerHover: (e) {
+            _hoverLocal = e.localPosition;
+            if (HardwareKeyboard.instance.isAltPressed) setState(() {});
+          },
           onPointerSignal: (signal) {
             if (signal is PointerScrollEvent) {
               _zoomAt(
@@ -8226,6 +8318,7 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
                                   _dragStart != null && _dragCurrent != null
                                   ? Rect.fromPoints(_dragStart!, _dragCurrent!)
                                   : null,
+                              altGuide: _altGuide(),
                             ),
                           ),
                         ),
@@ -8235,6 +8328,7 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
                 ),
               ),
             ),
+          ),
           ),
         );
       },
@@ -8307,6 +8401,9 @@ class _BlockPainter extends CustomPainter {
   final double screenScale;
   final Rect? dragRect;
 
+  /// 按住 Alt 悬停时的引导线 (将被调整的顶点, 鼠标位置)，图像坐标。
+  final (Offset, Offset)? altGuide;
+
   /// 参与多类互证冲突的区域 id（region_conflicts）：region 视图画红色
   /// 警示描边，提示正文区与页眉/页脚/页码区重叠。
   final Set<String> regionConflictedIds;
@@ -8328,6 +8425,7 @@ class _BlockPainter extends CustomPainter {
     required this.showCharBox,
     this.screenScale = 1.0,
     required this.dragRect,
+    this.altGuide,
     this.mainRegions = const [],
     this.paragraphs = const [],
     this.selectedRegion,
@@ -8349,6 +8447,44 @@ class _BlockPainter extends CustomPainter {
     }
 
     _drawDragRect(canvas);
+    _drawAltGuide(canvas);
+  }
+
+  /// Alt 引导线：从将被调整的顶点到鼠标的虚线 + 顶点圆环。线宽/虚线
+  /// 间距/圆环按屏幕像素定，缩放时观感不变；白衬底保证任何底色可见。
+  void _drawAltGuide(Canvas canvas) {
+    final guide = altGuide;
+    if (guide == null) return;
+    final (vertex, pointer) = guide;
+    final s = max(screenScale, 0.01);
+    final lineW = 2.0 / s;
+    final dash = 8.0 / s;
+    final gap = 5.0 / s;
+    const color = Colors.blueAccent;
+    final halo = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..color = Colors.white.withValues(alpha: 0.9)
+      ..strokeWidth = lineW + 2.0 / s;
+    final ink = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..color = color
+      ..strokeWidth = lineW;
+    final delta = pointer - vertex;
+    final len = delta.distance;
+    if (len > 0.5 / s) {
+      final dir = delta / len;
+      for (var d = 0.0; d < len; d += dash + gap) {
+        final a = vertex + dir * d;
+        final b = vertex + dir * min(d + dash, len);
+        canvas.drawLine(a, b, halo);
+        canvas.drawLine(a, b, ink);
+      }
+    }
+    final ringR = 9.0 / s;
+    canvas.drawCircle(vertex, ringR, halo);
+    canvas.drawCircle(vertex, ringR, ink);
   }
 
   // ── region view ──

@@ -9,6 +9,7 @@ import '../services/book_cache.dart';
 import '../services/python_service.dart';
 import '../services/storage.dart';
 import '../widgets/band_select_surface.dart';
+import '../widgets/ctrl_scroll_zoom.dart';
 import 'editor_page.dart' show charPinyin;
 import 'line_reseg_page.dart';
 
@@ -72,6 +73,11 @@ class _BookGroup {
   _BookGroup(this.id, this.members, this.cohesion);
 }
 
+// ── Ctrl+滚轮格子缩放（与单页版墨迹归类同款交互） ──
+const double kBookCellSize = 64.0;
+const double kBookCellMinZoom = 0.5;
+const double kBookCellMaxZoom = 3.0;
+
 class _SimilarCharsBookPageState extends State<SimilarCharsBookPage> {
   final TextEditingController _startCtrl = TextEditingController();
   final TextEditingController _endCtrl = TextEditingController();
@@ -110,6 +116,12 @@ class _SimilarCharsBookPageState extends State<SimilarCharsBookPage> {
   final Set<int> _modifiedPages = {};
   Timer? _saveDebounce;
   bool _confirmingGroup = false;
+
+  double _cellZoom = 1.0;
+
+  void _zoomCells(double factor) => setState(() {
+    _cellZoom = (_cellZoom * factor).clamp(kBookCellMinZoom, kBookCellMaxZoom);
+  });
 
   int get _pageCount => widget.project.imageFiles.length;
 
@@ -194,7 +206,8 @@ class _SimilarCharsBookPageState extends State<SimilarCharsBookPage> {
     if (_blocksByPage.isEmpty) {
       setState(() {
         _stage = _Stage.setup;
-        _error = '范围内没有带正文字块的页'
+        _error =
+            '范围内没有带正文字块的页'
             '${_noAnnotationCount > 0 ? '（$_noAnnotationCount 页无标注/未识别）' : ''}，'
             '先整本识别或调整页数范围。';
       });
@@ -531,9 +544,7 @@ class _SimilarCharsBookPageState extends State<SimilarCharsBookPage> {
       }
       if (!mounted) return;
       setState(() {});
-      final pageNote = confirmedPages > 0
-          ? '，涉及 $confirmedPages 页已保存'
-          : '，已保存';
+      final pageNote = confirmedPages > 0 ? '，涉及 $confirmedPages 页已保存' : '，已保存';
       _snack(
         '已确认 $confirmedCount 字$pageNote'
         '${skipped > 0 ? '；$skipped 个空字/已确认未重复处理' : ''}',
@@ -698,9 +709,9 @@ class _SimilarCharsBookPageState extends State<SimilarCharsBookPage> {
               ),
             TextButton(
               onPressed: _dirtyPages.isEmpty
-                  ? () => Navigator.of(context).pop(
-                      BookClassifyResult(modifiedPages: _modifiedPages),
-                    )
+                  ? () => Navigator.of(
+                      context,
+                    ).pop(BookClassifyResult(modifiedPages: _modifiedPages))
                   : _flushAndPop,
               child: Text(
                 _dirtyPages.isEmpty ? '完成' : '保存并完成',
@@ -765,8 +776,10 @@ class _SimilarCharsBookPageState extends State<SimilarCharsBookPage> {
                   ),
                   ActionChip(
                     label: const Text('从当前页到末页'),
-                    onPressed: () =>
-                        _applyQuickRange(widget.currentPageIndex, _pageCount - 1),
+                    onPressed: () => _applyQuickRange(
+                      widget.currentPageIndex,
+                      _pageCount - 1,
+                    ),
                   ),
                   ActionChip(
                     label: const Text('当前页前后 10 页'),
@@ -888,14 +901,15 @@ class _SimilarCharsBookPageState extends State<SimilarCharsBookPage> {
           icon: Icons.flag_outlined,
           text: markedCount > 0
               ? '范围内有 $markedCount 个标记字，但都不满足当前筛选'
-                  '（「只看待处理组」或「显示已确认」把它们滤掉了），'
-                  '试试关闭其他筛选。'
+                    '（「只看待处理组」或「显示已确认」把它们滤掉了），'
+                    '试试关闭其他筛选。'
               : '范围内没有标记的特殊字。归类时点选/框选存疑的字后用「标记」'
                     '按钮打标，等全书识别完成后切回「只看标记」集中校对。',
         );
       }
       final allHidden =
-          _groups.isNotEmpty && _groups.every((g) => !g.members.any(_memberVisible));
+          _groups.isNotEmpty &&
+          _groups.every((g) => !g.members.any(_memberVisible));
       return _HintView(
         icon: Icons.verified_outlined,
         text: _onlyPending || allHidden
@@ -1028,40 +1042,50 @@ class _SimilarCharsBookPageState extends State<SimilarCharsBookPage> {
 
   Widget _buildGroupList(List<_BookGroup> groups, List<_MemberRef> singletons) {
     final hasSingletons = singletons.isNotEmpty;
+    // 缩放感知层逐卡片包裹：列表项在滚动视图子树内，Ctrl+滚轮在这里
+    // 比外层滚动视图先拿到信号（整层包 ListView 外面会轮不到）。
     return ListView.builder(
       padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
       itemCount: groups.length + (hasSingletons ? 1 : 0),
       itemBuilder: (context, index) {
         if (index < groups.length) {
           final group = groups[index];
-          return _BookClusterCard(
-            key: ValueKey('bcluster-${group.id}'),
-            index: index + 1,
-            group: group,
-            project: widget.project,
-            thumbs: _thumbs,
-            showConfirmed: _showConfirmed,
-            hideMarked: _hideMarked,
-            onlyMarked: _onlyMarked,
-            confirmable: !_confirmingGroup,
-            onApplyText: _applyText,
-            onConfirmSelected: _confirmSelected,
-            onSetMarked: _setMarked,
-            onEditMember: _editMember,
-            onOpenLineReseg: _openLineReseg,
-            onLocateMember: _locateMember,
-            onEnsureThumbs: (members) => unawaited(_ensureThumbs(members)),
+          return CtrlScrollZoomSurface(
+            onZoom: _zoomCells,
+            child: _BookClusterCard(
+              key: ValueKey('bcluster-${group.id}'),
+              index: index + 1,
+              group: group,
+              project: widget.project,
+              thumbs: _thumbs,
+              showConfirmed: _showConfirmed,
+              hideMarked: _hideMarked,
+              onlyMarked: _onlyMarked,
+              confirmable: !_confirmingGroup,
+              cellSize: kBookCellSize * _cellZoom,
+              onApplyText: _applyText,
+              onConfirmSelected: _confirmSelected,
+              onSetMarked: _setMarked,
+              onEditMember: _editMember,
+              onOpenLineReseg: _openLineReseg,
+              onLocateMember: _locateMember,
+              onEnsureThumbs: (members) => unawaited(_ensureThumbs(members)),
+            ),
           );
         }
-        return _BookSingletonsCard(
-          key: const ValueKey('bsingletons'),
-          singletons: singletons,
-          skippedCount: _result?.skipped.length ?? 0,
-          project: widget.project,
-          thumbs: _thumbs,
-          onEditMember: _editMember,
-          onLocateMember: _locateMember,
-          onEnsureThumbs: (members) => unawaited(_ensureThumbs(members)),
+        return CtrlScrollZoomSurface(
+          onZoom: _zoomCells,
+          child: _BookSingletonsCard(
+            key: const ValueKey('bsingletons'),
+            singletons: singletons,
+            skippedCount: _result?.skipped.length ?? 0,
+            project: widget.project,
+            thumbs: _thumbs,
+            cellSize: kBookCellSize * _cellZoom,
+            onEditMember: _editMember,
+            onLocateMember: _locateMember,
+            onEnsureThumbs: (members) => unawaited(_ensureThumbs(members)),
+          ),
         );
       },
     );
@@ -1083,6 +1107,9 @@ class _BookClusterCard extends StatefulWidget {
   final bool hideMarked;
   final bool onlyMarked;
   final bool confirmable;
+
+  /// 字格边长（Ctrl+滚轮缩放由页面状态折算传入）。
+  final double cellSize;
   final void Function(List<_MemberRef> members, String text) onApplyText;
   final Future<void> Function(Set<String> selectedKeys) onConfirmSelected;
   final void Function(List<_MemberRef> members, bool marked) onSetMarked;
@@ -1105,6 +1132,7 @@ class _BookClusterCard extends StatefulWidget {
     required this.hideMarked,
     required this.onlyMarked,
     required this.confirmable,
+    this.cellSize = kBookCellSize,
     required this.onApplyText,
     required this.onConfirmSelected,
     required this.onSetMarked,
@@ -1404,10 +1432,9 @@ class _BookClusterCardState extends State<_BookClusterCard> {
     final allConfirmed = widget.group.members.every(
       (m) => m.block.text.isEmpty || _isConfirmed(m),
     );
-    final selectedMarkedAll = selectedKeys.isNotEmpty &&
-        visible
-            .where((m) => selectedKeys.contains(_keyOf(m)))
-            .every(_isMarked);
+    final selectedMarkedAll =
+        selectedKeys.isNotEmpty &&
+        visible.where((m) => selectedKeys.contains(_keyOf(m))).every(_isMarked);
 
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
@@ -1461,7 +1488,8 @@ class _BookClusterCardState extends State<_BookClusterCard> {
                 const SizedBox(width: 8),
                 if (markedCount > 0) ...[
                   Tooltip(
-                    message: '特殊字标记 $markedCount 个（可能裁分有问题或'
+                    message:
+                        '特殊字标记 $markedCount 个（可能裁分有问题或'
                         '暂无法识别），「只看标记」可筛出集中校对',
                     child: Container(
                       padding: const EdgeInsets.symmetric(
@@ -1551,7 +1579,8 @@ class _BookClusterCardState extends State<_BookClusterCard> {
                 for (final m in visible) _keyOf(m): _cellKeys[_keyOf(m)]!,
               },
               actionKeys: {
-                for (final m in visible) 'edit:${_keyOf(m)}': _editKeys[_keyOf(m)]!,
+                for (final m in visible)
+                  'edit:${_keyOf(m)}': _editKeys[_keyOf(m)]!,
                 for (final m in visible)
                   'locate:${_keyOf(m)}': _locateKeys[_keyOf(m)]!,
               },
@@ -1578,6 +1607,7 @@ class _BookClusterCardState extends State<_BookClusterCard> {
                       isConfirmed: _isConfirmed(m),
                       isMarked: _isMarked(m),
                       routed: true,
+                      cellSize: widget.cellSize,
                       cellKey: _cellKeys[_keyOf(m)],
                       editKey: _editKeys[_keyOf(m)],
                       locateKey: _locateKeys[_keyOf(m)],
@@ -1719,15 +1749,12 @@ class _BookClusterCardState extends State<_BookClusterCard> {
           backgroundColor: Colors.green.shade50,
           foregroundColor: Colors.green.shade800,
         ),
-        onPressed:
-            widget.confirmable && confirmableKeys.isNotEmpty
+        onPressed: widget.confirmable && confirmableKeys.isNotEmpty
             ? () => widget.onConfirmSelected(confirmableKeys)
             : null,
         icon: const Icon(Icons.task_alt, size: 16),
         label: Text(
-          confirmableKeys.isEmpty
-              ? '确认所选'
-              : '确认所选（${confirmableKeys.length}）',
+          confirmableKeys.isEmpty ? '确认所选' : '确认所选（${confirmableKeys.length}）',
         ),
       ),
     );
@@ -1747,12 +1774,16 @@ class _BookSingletonsCard extends StatefulWidget {
   final void Function(_MemberRef member) onLocateMember;
   final void Function(List<_MemberRef> members) onEnsureThumbs;
 
+  /// 字格边长（Ctrl+滚轮缩放由页面状态折算传入）。
+  final double cellSize;
+
   const _BookSingletonsCard({
     super.key,
     required this.singletons,
     required this.skippedCount,
     required this.project,
     required this.thumbs,
+    this.cellSize = kBookCellSize,
     required this.onEditMember,
     required this.onLocateMember,
     required this.onEnsureThumbs,
@@ -1832,6 +1863,7 @@ class _BookSingletonsCardState extends State<_BookSingletonsCard> {
                             m.block.status == AnnotationStatus.confirmed,
                         isMarked: m.block.marked,
                         routed: false,
+                        cellSize: widget.cellSize,
                         onTap: () => widget.onEditMember(m),
                         onLocate: () => widget.onLocateMember(m),
                       ),
@@ -1864,6 +1896,9 @@ class _BookCharCell extends StatelessWidget {
   final VoidCallback? onTap; // routed=false 时的点击回调
   final VoidCallback? onLocate; // routed=false 时的定位回调
 
+  /// 字格边长（Ctrl+滚轮缩放）。
+  final double cellSize;
+
   const _BookCharCell({
     required this.member,
     required this.thumb,
@@ -1877,11 +1912,12 @@ class _BookCharCell extends StatelessWidget {
     this.locateKey,
     this.onTap,
     this.onLocate,
+    this.cellSize = kBookCellSize,
   });
 
   @override
   Widget build(BuildContext context) {
-    const cell = 64.0;
+    final cell = cellSize;
     final showEdit = routed && editKey != null;
     final text = member.block.text;
     return Column(
@@ -1951,7 +1987,8 @@ class _BookCharCell extends StatelessWidget {
                 top: 0,
                 left: 0,
                 child: Tooltip(
-                  message: '特殊字标记：可能裁分有问题或暂无法识别，'
+                  message:
+                      '特殊字标记：可能裁分有问题或暂无法识别，'
                       '待全书识别完成后校对',
                   child: Container(
                     width: 16,
@@ -2100,7 +2137,10 @@ class _CandidateChip extends StatelessWidget {
           children: [
             Text(text, style: const TextStyle(fontSize: 20, height: 1.1)),
             if (pinyin.isNotEmpty)
-              Text(pinyin, style: TextStyle(fontSize: 9, color: Colors.blue.shade600)),
+              Text(
+                pinyin,
+                style: TextStyle(fontSize: 9, color: Colors.blue.shade600),
+              ),
             Text(
               '${(score * 100).toStringAsFixed(0)}%',
               style: TextStyle(fontSize: 9, color: Colors.grey.shade600),
@@ -2184,8 +2224,8 @@ class _SingleCharDialogState extends State<_SingleCharDialog> {
               controller: _input,
               autofocus: true,
               maxLength: 2,
-              maxLengthEnforcement: MaxLengthEnforcement
-                  .truncateAfterCompositionEnds,
+              maxLengthEnforcement:
+                  MaxLengthEnforcement.truncateAfterCompositionEnds,
               decoration: const InputDecoration(
                 isDense: true,
                 border: OutlineInputBorder(),
@@ -2196,7 +2236,8 @@ class _SingleCharDialogState extends State<_SingleCharDialog> {
             ),
             const SizedBox(height: 12),
             Tooltip(
-              message: '标记后该字在归类里带小旗角标，可「隐藏标记」先跳过，'
+              message:
+                  '标记后该字在归类里带小旗角标，可「隐藏标记」先跳过，'
                   '等全书识别完成后用「只看标记」筛回来集中校对',
               child: InkWell(
                 onTap: () => setState(() => _marked = !_marked),
@@ -2246,7 +2287,10 @@ class _SingleCharDialogState extends State<_SingleCharDialog> {
             ),
             const SizedBox(height: 12),
             if (candidates.isNotEmpty) ...[
-              const Text('候选', style: TextStyle(fontSize: 12, color: Colors.grey)),
+              const Text(
+                '候选',
+                style: TextStyle(fontSize: 12, color: Colors.grey),
+              ),
               const SizedBox(height: 6),
               Flexible(
                 child: SingleChildScrollView(

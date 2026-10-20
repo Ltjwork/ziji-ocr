@@ -20,6 +20,7 @@ import 'package:path/path.dart' as p;
 import '../models/models.dart';
 import '../models/table_block.dart';
 import '../services/python_service.dart';
+import '../widgets/ctrl_scroll_zoom.dart';
 
 class TableReviewPage extends StatefulWidget {
   final String imagePath;
@@ -52,6 +53,16 @@ class _TableReviewPageState extends State<TableReviewPage> {
   bool _showThumb = true;
   bool _busy = false;
   final _textController = TextEditingController();
+
+  // ── Ctrl+滚轮格子缩放（与其他校对界面同款交互） ──
+  static const double kGridRowHeight = 108.0;
+  static const double kGridMinZoom = 0.5;
+  static const double kGridMaxZoom = 3.0;
+  double _rowZoom = 1.0;
+
+  void _zoomRows(double factor) => setState(() {
+    _rowZoom = (_rowZoom * factor).clamp(kGridMinZoom, kGridMaxZoom);
+  });
 
   @override
   void initState() {
@@ -124,13 +135,15 @@ class _TableReviewPageState extends State<TableReviewPage> {
       });
     } on TableGridNotFoundException catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text(e.message)));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text(e.message)));
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('重新识别失败：$e')));
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('重新识别失败：$e')));
       }
     } finally {
       if (mounted) setState(() => _busy = false);
@@ -148,7 +161,8 @@ class _TableReviewPageState extends State<TableReviewPage> {
 
   Future<void> _export(String format) async {
     final t = widget.table;
-    final rtlCols = widget.orientation == 'vertical' &&
+    final rtlCols =
+        widget.orientation == 'vertical' &&
         widget.horizontalDir == 'rtl' &&
         _readingOrder;
     final content = format == 'md'
@@ -174,12 +188,14 @@ class _TableReviewPageState extends State<TableReviewPage> {
   @override
   Widget build(BuildContext context) {
     final t = widget.table;
-    final confirmedCount =
-        t.cells.where((c) => c.status == AnnotationStatus.confirmed).length;
+    final confirmedCount = t.cells
+        .where((c) => c.status == AnnotationStatus.confirmed)
+        .length;
     return Scaffold(
       appBar: AppBar(
         title: Text(
-            '表格校对 ${t.rows}×${t.cols} · $confirmedCount/${t.cells.length} 已确认'),
+          '表格校对 ${t.rows}×${t.cols} · $confirmedCount/${t.cells.length} 已确认',
+        ),
         actions: [
           IconButton(
             tooltip: _showThumb ? '隐藏格缩略图' : '显示格缩略图',
@@ -188,9 +204,11 @@ class _TableReviewPageState extends State<TableReviewPage> {
           ),
           IconButton(
             tooltip: _readingOrder ? '切换为几何序（列从左到右）' : '切换为阅读序（列从右到左）',
-            icon: Icon(_readingOrder
-                ? Icons.format_align_right
-                : Icons.format_align_left),
+            icon: Icon(
+              _readingOrder
+                  ? Icons.format_align_right
+                  : Icons.format_align_left,
+            ),
             onPressed: () => setState(() => _readingOrder = !_readingOrder),
           ),
           PopupMenuButton<String>(
@@ -207,26 +225,28 @@ class _TableReviewPageState extends State<TableReviewPage> {
               }
             },
             itemBuilder: (_) => const [
-              PopupMenuItem(
-                value: 'rerecognize',
-                child: Text('重新识别（覆盖当前文字）'),
-              ),
+              PopupMenuItem(value: 'rerecognize', child: Text('重新识别（覆盖当前文字）')),
               PopupMenuItem(value: 'confirm_all', child: Text('全部确认')),
-              PopupMenuItem(value: 'export_md', child: Text('导出 Markdown（复制+存文件）')),
+              PopupMenuItem(
+                value: 'export_md',
+                child: Text('导出 Markdown（复制+存文件）'),
+              ),
               PopupMenuItem(value: 'export_tsv', child: Text('导出 TSV（复制+存文件）')),
             ],
           ),
         ],
       ),
       body: _busy
-          ? const Center(child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                CircularProgressIndicator(),
-                SizedBox(height: 12),
-                Text('表格识别中…'),
-              ],
-            ))
+          ? const Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 12),
+                  Text('表格识别中…'),
+                ],
+              ),
+            )
           : Column(
               children: [
                 Expanded(child: _buildGrid()),
@@ -250,56 +270,68 @@ class _TableReviewPageState extends State<TableReviewPage> {
       return 1.0;
     }
 
-    const rowH = 108.0;
+    // Ctrl+滚轮缩放行高（列宽由几何 flex 决定，不参与）。
+    final rowH = kGridRowHeight * _rowZoom;
     return SingleChildScrollView(
-      padding: const EdgeInsets.all(12),
-      child: LayoutBuilder(
-        builder: (context, cons) {
-          final width = cons.maxWidth;
-          // 每列显示区 [left, right]
-          final colBounds = <int, (double, double)>{};
-          var acc = 0.0;
-          final flexSum = List<double>.generate(t.cols, (i) => colFlex(i))
-                  .fold<double>(0, (a, b) => a + b) *
-              1.0;
-          for (var dc = 0; dc < t.cols; dc++) {
-            final geoCol = _readingOrder &&
-                    widget.orientation == 'vertical' &&
-                    widget.horizontalDir == 'rtl'
-                ? t.cols - 1 - dc
-                : dc;
-            final f = colFlex(geoCol);
-            final left = (acc / (flexSum > 0 ? flexSum : 1)) * width;
-            acc += f;
-            final right = (acc / (flexSum > 0 ? flexSum : 1)) * width;
-            colBounds[geoCol] = (left, right);
-          }
-          final blocks = <Widget>[];
-          for (final block in t.cells) {
-            final (l0, _) = colBounds[block.col] ?? (0.0, 0.0);
-            final (_, r1) =
-                colBounds[block.col + block.colSpan - 1] ?? (0.0, 0.0);
-            blocks.add(Positioned(
-              left: l0,
-              top: block.row * rowH,
-              width: (r1 - l0).clamp(20.0, width),
-              height: block.rowSpan * rowH,
-              child: _CellTile(
-                cell: block,
-                image: _image,
-                showThumb: _showThumb,
-                table: t,
-                selected: identical(_selected, block),
-                onTap: () => _selectCell(block),
-              ),
-            ));
-          }
-          return SizedBox(
-            width: width,
-            height: t.rows * rowH,
-            child: Stack(children: blocks),
-          );
-        },
+      child: CtrlScrollZoomSurface(
+        onZoom: _zoomRows,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: LayoutBuilder(
+            builder: (context, cons) {
+              final width = cons.maxWidth;
+              // 每列显示区 [left, right]
+              final colBounds = <int, (double, double)>{};
+              var acc = 0.0;
+              final flexSum =
+                  List<double>.generate(
+                    t.cols,
+                    (i) => colFlex(i),
+                  ).fold<double>(0, (a, b) => a + b) *
+                  1.0;
+              for (var dc = 0; dc < t.cols; dc++) {
+                final geoCol =
+                    _readingOrder &&
+                        widget.orientation == 'vertical' &&
+                        widget.horizontalDir == 'rtl'
+                    ? t.cols - 1 - dc
+                    : dc;
+                final f = colFlex(geoCol);
+                final left = (acc / (flexSum > 0 ? flexSum : 1)) * width;
+                acc += f;
+                final right = (acc / (flexSum > 0 ? flexSum : 1)) * width;
+                colBounds[geoCol] = (left, right);
+              }
+              final blocks = <Widget>[];
+              for (final block in t.cells) {
+                final (l0, _) = colBounds[block.col] ?? (0.0, 0.0);
+                final (_, r1) =
+                    colBounds[block.col + block.colSpan - 1] ?? (0.0, 0.0);
+                blocks.add(
+                  Positioned(
+                    left: l0,
+                    top: block.row * rowH,
+                    width: (r1 - l0).clamp(20.0, width),
+                    height: block.rowSpan * rowH,
+                    child: _CellTile(
+                      cell: block,
+                      image: _image,
+                      showThumb: _showThumb,
+                      table: t,
+                      selected: identical(_selected, block),
+                      onTap: () => _selectCell(block),
+                    ),
+                  ),
+                );
+              }
+              return SizedBox(
+                width: width,
+                height: t.rows * rowH,
+                child: Stack(children: blocks),
+              );
+            },
+          ),
+        ),
       ),
     );
   }
@@ -323,11 +355,7 @@ class _TableReviewPageState extends State<TableReviewPage> {
               decoration: BoxDecoration(
                 border: Border.all(color: Colors.pink.shade200),
               ),
-              child: _CellThumb(
-                image: _image,
-                cell: cell,
-                table: widget.table,
-              ),
+              child: _CellThumb(image: _image, cell: cell, table: widget.table),
             ),
           const SizedBox(width: 12),
           Expanded(
@@ -367,8 +395,8 @@ class _TableReviewPageState extends State<TableReviewPage> {
                 onPressed: confirmed
                     ? null
                     : () => setState(() {
-                          cell.status = AnnotationStatus.confirmed;
-                        }),
+                        cell.status = AnnotationStatus.confirmed;
+                      }),
                 icon: const Icon(Icons.check, size: 18),
                 label: Text(confirmed ? '已确认' : '确认本格'),
               ),
@@ -412,8 +440,8 @@ class _CellTile extends StatelessWidget {
           color: selected
               ? Colors.orange.shade50
               : confirmed
-                  ? Colors.green.shade50
-                  : null,
+              ? Colors.green.shade50
+              : null,
           border: selected ? Border.all(color: Colors.orange, width: 2) : null,
         ),
         padding: const EdgeInsets.all(4),
@@ -485,10 +513,7 @@ class _CellThumbPainter extends CustomPainter {
       cell.h.toDouble(),
     );
     // 等比放入（letterbox 居中）
-    final scale = math.min(
-      size.width / src.width,
-      size.height / src.height,
-    );
+    final scale = math.min(size.width / src.width, size.height / src.height);
     final dstW = src.width * scale;
     final dstH = src.height * scale;
     final offX = (size.width - dstW) / 2;
@@ -550,12 +575,14 @@ class TableExport {
     if (m.isEmpty) return '';
     final buf = StringBuffer();
     final head = m.first;
-    buf.writeln('| 行 | ${head.skip(1).map((c) => c.isEmpty ? ' ' : c).join(' | ')} |');
     buf.writeln(
-        '| --- | ${head.skip(1).map((_) => '---').join(' | ')} |');
+      '| 行 | ${head.skip(1).map((c) => c.isEmpty ? ' ' : c).join(' | ')} |',
+    );
+    buf.writeln('| --- | ${head.skip(1).map((_) => '---').join(' | ')} |');
     for (final row in m.skip(1)) {
       buf.writeln(
-          '| ${row.first} | ${row.skip(1).map((c) => c.isEmpty ? ' ' : c).join(' | ')} |');
+        '| ${row.first} | ${row.skip(1).map((c) => c.isEmpty ? ' ' : c).join(' | ')} |',
+      );
     }
     return buf.toString();
   }

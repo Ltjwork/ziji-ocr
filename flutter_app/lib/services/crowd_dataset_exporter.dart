@@ -48,13 +48,25 @@ class CrowdDatasetExporter {
     bool unconfirmedOnly = false,
     int? pageStart,
     int? pageEnd,
+
+    /// 增量导出（识字同步插件用）：只导出这些页（覆盖页码范围），
+    /// 且任务字只取 [onlyCharUids] 命中的（行/字记录也只保留命中字，
+    /// 包体最小化；服务器端按字 upsert 合并留档）。
+    Set<String>? pageIds,
+    Set<String>? onlyCharUids,
+
+    /// 缺标注的页是否现场自动识别。手动导出（导出页）保持 true；
+    /// 后台增量同步传 false：缺标注的页跳过并记错误（该页之后被
+    /// 人工保存过时再由保存钩子补推），避免后台整本重识别。
+    bool autoSegment = true,
   }) async {
     final root = Directory(outputDir);
     await root.create(recursive: true);
-    // 任务包只用字图，不拷贝整页图/行图，也就不建这两个目录
+    // 任务包（含增量模式）只用字图，不拷贝整页图/行图，也就不建这两个目录
+    final taskMode = unconfirmedOnly || onlyCharUids != null;
     final pagesDir = Directory(p.join(outputDir, 'pages'));
     final linesDir = Directory(p.join(outputDir, 'lines'));
-    if (!unconfirmedOnly) {
+    if (!taskMode) {
       pagesDir.createSync(recursive: true);
       linesDir.createSync(recursive: true);
     }
@@ -95,6 +107,7 @@ class CrowdDatasetExporter {
       pageIndex++
     ) {
       final pageId = project.pageIdAt(pageIndex);
+      if (pageIds != null && !pageIds.contains(pageId)) continue;
       PageAnnotation? annotation = await ProjectStorage.loadAnnotation(
         project.projectDir,
         pageId,
@@ -104,7 +117,8 @@ class CrowdDatasetExporter {
           : '';
       if (annotation == null &&
           sourcePath.isNotEmpty &&
-          await File(sourcePath).exists()) {
+          await File(sourcePath).exists() &&
+          autoSegment) {
         try {
           annotation = await PythonService.segmentWithSettings(
             imagePath: sourcePath,
@@ -128,9 +142,9 @@ class CrowdDatasetExporter {
       final hasConfirmedMainRegion = annotation.mainRegions.any(
         (region) => region.status == AnnotationStatus.confirmed,
       );
-      if (!(unconfirmedOnly ? hasMainRegion : hasConfirmedMainRegion)) {
+      if (!(taskMode ? hasMainRegion : hasConfirmedMainRegion)) {
         errorLog(
-          unconfirmedOnly
+          taskMode
               ? '[$pageId] 未划定正文主区域，跳过'
               : '[$pageId] 未确认正文主区域，跳过正式导出',
         );
@@ -145,7 +159,7 @@ class CrowdDatasetExporter {
       final pageFileName =
           '$pageId${p.extension(sourceFile.path).isEmpty ? '.png' : p.extension(sourceFile.path)}';
       // 任务包不需要整页图（服务器只用字图），省去整书大图拷贝
-      if (!unconfirmedOnly) {
+      if (!taskMode) {
         final pageOut = File(p.join(pagesDir.path, pageFileName));
         await sourceFile.copy(pageOut.path);
       }
@@ -162,17 +176,44 @@ class CrowdDatasetExporter {
       final imageWidth = size?.$1 ?? 1;
       final imageHeight = size?.$2 ?? 1;
 
-      // 任务字判定：未确认模式取「未确认且未拒绝」的正文字作为众包任务；
-      // 已确认模式维持原口径（全部导出字都是已确认字）。
-      bool isTaskChar(CharBlock char) => unconfirmedOnly
+      // 任务字判定：
+      // - 任务包（unconfirmedOnly 或增量模式）：取「未确认且未拒绝」的
+      //   正文字作为众包任务；已确认模式维持原口径（全部导出字都是已
+      //   确认字）。
+      // - 增量模式（onlyCharUids 非空）：任务字 = 命中调用方给定的
+      //   char_uid 集合（调用方已按自己的口径筛过），不再叠加状态过滤；
+      //   未命中的字整条不进包（无结构占位），包体只含本次要推的字。
+      final incremental = onlyCharUids != null;
+      bool eligibleTaskChar(CharBlock char) => unconfirmedOnly
           ? (char.type == 'main_text' &&
               !_isConfirmed(char) &&
               char.status != AnnotationStatus.rejected)
           : (char.type == 'main_text' && _isConfirmed(char));
-      final mainLines = annotation.lines
-          .where((line) => line.chars.any(isTaskChar))
-          .toList();
-      if (unconfirmedOnly && mainLines.isEmpty) {
+      String uidAt(List<CharBlock> lineChars, int index) => _stableUid(
+            digest,
+            'char',
+            lineChars[index].x,
+            lineChars[index].y,
+            lineChars[index].w,
+            lineChars[index].h,
+            index,
+          );
+      bool lineHasTaskChar(LineBlock line) {
+        final mainChars = line.chars
+            .where((c) => c.type == 'main_text')
+            .toList();
+        for (var i = 0; i < mainChars.length; i++) {
+          if (incremental) {
+            if (onlyCharUids.contains(uidAt(mainChars, i))) return true;
+          } else if (eligibleTaskChar(mainChars[i])) {
+            return true;
+          }
+        }
+        return false;
+      }
+
+      final mainLines = annotation.lines.where(lineHasTaskChar).toList();
+      if (taskMode && mainLines.isEmpty) {
         writeLog('[$pageId] 无待识别的未确认字，跳过');
         continue;
       }
@@ -193,7 +234,7 @@ class CrowdDatasetExporter {
           line.h,
           lineIndex,
         );
-        if (!unconfirmedOnly) {
+        if (!taskMode) {
           Directory(p.join(linesDir.path, pageId)).createSync(recursive: true);
           // 任务包不出行图（服务器只用字图），已确认包保持原样
           lineCropBlocks.add(
@@ -212,18 +253,14 @@ class CrowdDatasetExporter {
         }
 
         // 任务包保留行内全部正文字（含已确认/拒绝），保证整书文本可重建；
-        // 已确认包维持原样（只含已确认字）。
+        // 已确认包维持原样（只含已确认字）。增量包只保留命中字。
         final chars = line.chars.where((char) {
-          if (unconfirmedOnly) return char.type == 'main_text';
+          if (taskMode) return char.type == 'main_text';
           return char.type == 'main_text' && _isConfirmed(char);
         }).toList();
         final charEntries = <Map<String, dynamic>>[];
         for (var charIndex = 0; charIndex < chars.length; charIndex++) {
           final char = chars[charIndex];
-          final isTask = unconfirmedOnly
-              ? (!_isConfirmed(char) &&
-                  char.status != AnnotationStatus.rejected)
-              : true;
           final charUid = _stableUid(
             digest,
             'char',
@@ -233,6 +270,14 @@ class CrowdDatasetExporter {
             char.h,
             charIndex,
           );
+          // 增量包：未命中字整条不进包（不做结构占位，包体最小化）。
+          if (incremental && !onlyCharUids.contains(charUid)) continue;
+          final isTask = incremental
+              ? true
+              : (unconfirmedOnly
+                    ? (!_isConfirmed(char) &&
+                          char.status != AnnotationStatus.rejected)
+                    : true);
           final cropBlock = char.copyWith(
             id: charUid,
             lineId: line.id,
@@ -347,7 +392,7 @@ class CrowdDatasetExporter {
             final merged = mergeCharCandidates(
               saved: saved,
               fresh: fresh,
-              ensureText: unconfirmedOnly ? entry['text']?.toString() : null,
+              ensureText: taskMode ? entry['text']?.toString() : null,
             );
             entry['candidates'] = merged.map((e) => e.toJson()).toList();
             entry['status'] = merged.isEmpty
@@ -394,7 +439,7 @@ class CrowdDatasetExporter {
                   saved: saved,
                   fresh: fresh,
                   ensureText:
-                      unconfirmedOnly ? entry['text']?.toString() : null,
+                      taskMode ? entry['text']?.toString() : null,
                 );
                 entry['candidates'] = merged.map((e) => e.toJson()).toList();
                 entry['status'] = merged.isEmpty
@@ -413,7 +458,7 @@ class CrowdDatasetExporter {
 
       pageRecords.add({
         'page_id': pageId,
-        'source_file': unconfirmedOnly ? '' : 'pages/$pageFileName',
+        'source_file': taskMode ? '' : 'pages/$pageFileName',
         'source_sha256': digest,
         'ocr_revision': ocrRevision,
         'model_version': modelVersion,
@@ -425,7 +470,7 @@ class CrowdDatasetExporter {
       });
       blockPages.add({
         'page_id': pageId,
-        'image': unconfirmedOnly ? '' : 'pages/$pageFileName',
+        'image': taskMode ? '' : 'pages/$pageFileName',
         'lines': pageLineRecords,
       });
       lineCount += pageLineRecords.length;
@@ -433,13 +478,13 @@ class CrowdDatasetExporter {
       taskCount += pageTaskCount;
       writeLog(
         '[$pageId] 导出 ${pageLineRecords.length} 行、${exportCharEntries.length} 字'
-        '${unconfirmedOnly ? '（任务 $pageTaskCount）' : ''}',
+        '${taskMode ? '（任务 $pageTaskCount）' : ''}',
       );
     }
 
     final manifest = {
       'schema_version': 2,
-      'task_mode': unconfirmedOnly ? 'unconfirmed' : 'confirmed',
+      'task_mode': taskMode ? 'unconfirmed' : 'confirmed',
       'project_id': project.id,
       'project_name': project.name,
       'book': project.bookMetadata.toJson(),
@@ -505,6 +550,19 @@ class CrowdDatasetExporter {
 
   static bool _isConfirmed(CharBlock char) =>
       char.confirmed || char.status.toLowerCase() == 'confirmed';
+
+  /// 计算识字数据包的 char_uid（增量同步插件按同一算法在导出前挑选
+  /// 待推送字；[order] 必须传「行内正文字（type==main_text）列表中的
+  /// 下标」——与 [export] 内部口径一致，否则 uid 对不上）。
+  static String charUidFor(
+    String sourceSha256,
+    int x,
+    int y,
+    int w,
+    int h,
+    int order,
+  ) =>
+      _stableUid(sourceSha256, 'char', x, y, w, h, order);
 
   /// 合并识别时保存的候选与现场识别候选：按文本去重（现场结果优先）、
   /// 过滤单个 ASCII 字母噪声（识别模型对古汉字的退化猜测）、按分数降序。

@@ -2,14 +2,17 @@ import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import 'about_update_page.dart';
 import 'char_verify_debug_page.dart';
 import 'cleanup_page.dart';
 import 'crowd_import_page.dart';
 import 'debug_page.dart';
 import 'gesture_settings_page.dart';
+import 'keyboard_shortcuts_page.dart';
 import 'model_compare_page.dart';
 import 'model_manage_page.dart';
 import 'ollama_settings_page.dart';
+import 'plugins_page.dart';
 import '../services/python_service.dart';
 import 'training_page.dart';
 
@@ -119,7 +122,7 @@ class TrainingHubPage extends StatelessWidget {
   }
 }
 
-/// 「设置」整合页：模型管理 / AI 辅助 / 鼠标手势。
+/// 「设置」整合页：模型管理 / AI 辅助 / 插件 / 鼠标手势。
 class SettingsHubPage extends StatelessWidget {
   const SettingsHubPage({super.key});
 
@@ -139,9 +142,24 @@ class SettingsHubPage extends StatelessWidget {
           child: OllamaSettingsPage(embedded: true),
         ),
         HubTab(
+          label: '插件',
+          icon: Icons.extension_outlined,
+          child: PluginsPage(),
+        ),
+        HubTab(
           label: '鼠标手势',
           icon: Icons.gesture,
           child: GestureSettingsPage(embedded: true),
+        ),
+        HubTab(
+          label: '快捷键',
+          icon: Icons.keyboard_outlined,
+          child: KeyboardShortcutsPage(embedded: true),
+        ),
+        HubTab(
+          label: '关于 / 更新',
+          icon: Icons.system_update_outlined,
+          child: AboutUpdatePage(embedded: true),
         ),
       ],
     );

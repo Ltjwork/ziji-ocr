@@ -2,12 +2,17 @@ import 'dart:io';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models/models.dart';
+import '../services/annotation_hit_geometry.dart' show mergeCharBoxes;
+import '../services/editor_shortcut_settings.dart';
+import '../services/ime_virtual_key_bridge.dart';
 import '../services/python_service.dart';
 import '../services/ollama_service.dart';
 import '../services/page_recognition.dart';
 import '../widgets/char_rainbow.dart' show charRainbowColor;
+import '../widgets/ctrl_scroll_zoom.dart';
 import 'editor_page.dart' show InteractiveLineCrop, lineSharesColumnBand;
 
 /// 行内重切（全屏，从全书墨迹归类页双击字格进入）：展示该字所在行的
@@ -52,6 +57,11 @@ class LineResegPage extends StatefulWidget {
   State<LineResegPage> createState() => _LineResegPageState();
 }
 
+// ── Ctrl+滚轮字卡缩放（与其他校对界面同款交互） ──
+const double kResegChipSize = 60.0;
+const double kResegChipMinZoom = 0.5;
+const double kResegChipMaxZoom = 3.0;
+
 class _LineResegPageState extends State<LineResegPage> {
   /// 页面图解码上限（最长边）：与墨迹校验调试页同一取值理由。
   static const int _pageImageMaxSide = 2200;
@@ -74,8 +84,25 @@ class _LineResegPageState extends State<LineResegPage> {
   String? _error;
 
   String? _selectedId;
+
+  /// Shift+单击加入的多选集（合并/批量删除快捷键的选择源，草稿字 id）。
+  final Set<String> _multiSelectedIds = {};
+
+  /// 键盘快捷键配置（与校对界面同一份：设置 → 快捷键）。
+  EditorShortcutSettings _shortcuts = const EditorShortcutSettings();
+  final FocusNode _keyboardFocus = FocusNode();
+
   bool _dirty = false;
   bool _processing = false;
+
+  double _chipZoom = 1.0;
+
+  void _zoomChips(double factor) => setState(() {
+    _chipZoom = (_chipZoom * factor).clamp(
+      kResegChipMinZoom,
+      kResegChipMaxZoom,
+    );
+  });
 
   /// 几何被改动过的草稿字 id：应用时这些字按草稿换算回页面坐标生成
   /// 新字块（确认状态已随编辑重置）；未在集合里的字直接沿用原实例。
@@ -105,11 +132,17 @@ class _LineResegPageState extends State<LineResegPage> {
     );
     _pageLine.chars = [...line.chars];
     _loadCropImage();
+    EditorShortcutSettings.load().then((s) {
+      if (mounted) setState(() => _shortcuts = s);
+    });
+    ImeVirtualKeyBridge.addListener(_onImeVirtualKey);
   }
 
   @override
   void dispose() {
+    ImeVirtualKeyBridge.removeListener(_onImeVirtualKey);
     _pageImage?.dispose();
+    _keyboardFocus.dispose();
     super.dispose();
   }
 
@@ -214,7 +247,17 @@ class _LineResegPageState extends State<LineResegPage> {
     });
   }
 
-  void _onCharSelected(CharBlock? c) => setState(() => _selectedId = c?.id);
+  void _onCharSelected(CharBlock? c) => setState(() {
+    _selectedId = c?.id;
+    // 普通单击回到单选语义：清空 Shift 多选集。
+    if (_multiSelectedIds.isNotEmpty) _multiSelectedIds.clear();
+  });
+
+  /// Shift+单击字框：加入/移出多选集（合并与批量删除快捷键的选择源）。
+  void _onCharMultiSelect(CharBlock c) => setState(() {
+    if (!_multiSelectedIds.remove(c.id)) _multiSelectedIds.add(c.id);
+    _selectedId = c.id;
+  });
 
   /// 删除草稿字框（行图 Shift 单击与「删除」按钮共用：按 id 移除，
   /// 删的是当前选中字时同步清选中）。
@@ -223,11 +266,106 @@ class _LineResegPageState extends State<LineResegPage> {
     setState(() {
       _draft!.chars.removeWhere((c) => c.id == id);
       if (_selectedId == id) _selectedId = null;
+      _multiSelectedIds.remove(id);
       _dirty = true;
     });
   }
 
-  void _deleteSelected() => _deleteCharById(_selectedId ?? '');
+  /// 删除所选：多选集非空时整组删除，否则删除当前选中（快捷键与
+  /// 「删除所选框」按钮共用）。
+  void _deleteSelected() {
+    if (_multiSelectedIds.isNotEmpty) {
+      final ids = Set<String>.of(_multiSelectedIds);
+      setState(() {
+        _draft!.chars.removeWhere((c) => ids.contains(c.id));
+        if (_selectedId != null && ids.contains(_selectedId)) {
+          _selectedId = null;
+        }
+        _multiSelectedIds.clear();
+        _touchedIds.removeAll(ids);
+        _dirty = true;
+      });
+      return;
+    }
+    _deleteCharById(_selectedId ?? '');
+  }
+
+  /// 快捷键合并所选：恰好选中两个字框时并为一框——矩形取并集、文字
+  /// 按阅读序拼接；合并框按本页规则重置为待确认（几何已改动）。
+  void _mergeSelected() {
+    final draft = _draft;
+    if (draft == null || _processing) return;
+    final sel = draft.chars
+        .where((c) => _multiSelectedIds.contains(c.id))
+        .toList();
+    if (sel.length != 2) {
+      _hint(
+        '合并识别框：先按住 Shift 依次点选两个字框'
+        '（当前 ${_multiSelectedIds.length} 个）',
+      );
+      return;
+    }
+    final settings = widget.project.settingsAt(widget.pageIndex);
+    final horizontal = draft.orientation == 'horizontal';
+    final merged =
+        mergeCharBoxes(
+            sel[0],
+            sel[1],
+            horizontal: horizontal,
+            rtl: horizontal && settings.horizontalDir == 'rtl',
+          )
+          // 本页口径：几何被改动过的字一律重置为待确认。
+          .copyWith(status: AnnotationStatus.proposed, confirmed: false);
+    // 合并框沿用阅读序在前的框 id，落位到它的原位置（apply 时按几何
+    // 重排，这里只管显示顺序自然）。
+    final anchor = draft.chars.indexWhere((c) => c.id == merged.id);
+    setState(() {
+      draft.chars.removeWhere((c) => c.id == sel[0].id || c.id == sel[1].id);
+      draft.chars.insert(anchor.clamp(0, draft.chars.length), merged);
+      _multiSelectedIds.clear();
+      _touchedIds
+        ..remove(sel[1].id)
+        ..add(merged.id);
+      _selectedId = merged.id;
+      _dirty = true;
+    });
+    _hint('已合并为 1 个识别框（合并框重置为待确认）');
+  }
+
+  /// 底部提示条（页面内引导文案）。
+  void _hint(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message), duration: const Duration(seconds: 2)));
+  }
+
+  /// 中文输入法下的合并/删除（原生层经 [ImeVirtualKeyBridge] 投递），
+  /// 与 [_onKeyEvent] 同口径：仅本页键盘焦点时生效。
+  void _onImeVirtualKey(int vk) {
+    if (!_keyboardFocus.hasFocus || _processing || _draft == null) return;
+    if (_shortcuts.mergeChars.matchesVirtualKey(vk)) {
+      _mergeSelected();
+    } else if (_shortcuts.deleteChars.matchesVirtualKey(vk)) {
+      _deleteSelected();
+    }
+  }
+
+  /// 键盘快捷键（合并/删除识别框，按键与校对界面同一配置）。
+  KeyEventResult _onKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent || _processing || _draft == null) {
+      return KeyEventResult.ignored;
+    }
+    if (event.logicalKey.keyId == _shortcuts.mergeChars.keyId) {
+      _mergeSelected();
+      return KeyEventResult.handled;
+    }
+    if (event.logicalKey.keyId == _shortcuts.deleteChars.keyId) {
+      _deleteSelected();
+      return KeyEventResult.handled;
+    }
+    return KeyEventResult.ignored;
+  }
 
   // ── 重新切分 / 识别填字（后端 segment_region，GPU 识别门）──
 
@@ -483,7 +621,12 @@ class _LineResegPageState extends State<LineResegPage> {
             '行 ${widget.lineIndex + 1}',
           ),
         ),
-        body: _buildBody(selected),
+        body: Focus(
+          focusNode: _keyboardFocus,
+          autofocus: true,
+          onKeyEvent: _onKeyEvent,
+          child: _buildBody(selected),
+        ),
       ),
     );
   }
@@ -596,6 +739,8 @@ class _LineResegPageState extends State<LineResegPage> {
           ),
           Text(
             '行图上：拖角调整大小 · 拖动移动 · 空白处拖动画新框；'
+            'Shift+单击多选（合并快捷键 ${_shortcuts.mergeChars.label} / '
+            '删除快捷键 ${_shortcuts.deleteChars.label}）；'
             '改动过的字会重置为待确认',
             style: TextStyle(fontSize: 11, color: Colors.grey.shade600),
           ),
@@ -665,7 +810,8 @@ class _LineResegPageState extends State<LineResegPage> {
       onCharUpdated: _onCharUpdated,
       onCharAdded: _onCharAdded,
       onCharSelected: _onCharSelected,
-      onCharDeleted: (c) => _deleteCharById(c.id),
+      onCharMultiSelect: _onCharMultiSelect,
+      multiSelectedIds: _multiSelectedIds,
     );
     final chips = _buildChips(draft, isVertical);
     if (isVertical) {
@@ -689,13 +835,15 @@ class _LineResegPageState extends State<LineResegPage> {
   }
 
   /// 字卡（与编辑器单字识别行卡片同风格：裁切图 + 文字 + 状态色边框，
-  /// 竖排行纵向排列、横排行横向排列），点击选中。
+  /// 竖排行纵向排列、横排行横向排列），点击选中；Ctrl+滚轮缩放字卡。
   Widget _buildChips(LineBlock draft, bool isVertical) {
+    final cell = kResegChipSize * _chipZoom;
     final chips = [
       for (final c in draft.chars)
         _ResegChip(
           char: c,
           image: _pageImage!,
+          cellSize: cell,
           selected: c.id == _selectedId,
           onTap: () => _onCharSelected(c),
         ),
@@ -712,7 +860,10 @@ class _LineResegPageState extends State<LineResegPage> {
       return ListView(
         children: [
           for (final c in chips)
-            Padding(padding: const EdgeInsets.only(bottom: 4), child: c),
+            Padding(
+              padding: const EdgeInsets.only(bottom: 4),
+              child: CtrlScrollZoomSurface(onZoom: _zoomChips, child: c),
+            ),
         ],
       );
     }
@@ -720,7 +871,10 @@ class _LineResegPageState extends State<LineResegPage> {
       scrollDirection: Axis.horizontal,
       children: [
         for (final c in chips)
-          Padding(padding: const EdgeInsets.only(right: 4), child: c),
+          Padding(
+            padding: const EdgeInsets.only(right: 4),
+            child: CtrlScrollZoomSurface(onZoom: _zoomChips, child: c),
+          ),
       ],
     );
   }
@@ -768,16 +922,20 @@ class _ResegChip extends StatelessWidget {
   final bool selected;
   final VoidCallback onTap;
 
+  /// 字卡边长（Ctrl+滚轮缩放由页面状态折算传入）。
+  final double cellSize;
+
   const _ResegChip({
     required this.char,
     required this.image,
     required this.selected,
     required this.onTap,
+    this.cellSize = kResegChipSize,
   });
 
   @override
   Widget build(BuildContext context) {
-    const cell = 60.0;
+    final cell = cellSize;
     final confirmed = char.status == AnnotationStatus.confirmed;
     final empty = char.text.isEmpty;
     final borderColor = selected
@@ -803,7 +961,7 @@ class _ResegChip extends StatelessWidget {
             child: ClipRRect(
               borderRadius: BorderRadius.circular(3),
               child: CustomPaint(
-                size: const Size(cell, cell),
+                size: Size(cell, cell),
                 painter: _CharCropPainter(
                   image: image,
                   srcRect: Rect.fromLTWH(

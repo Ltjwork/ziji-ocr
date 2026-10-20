@@ -109,13 +109,13 @@ class SystemStats {
       : vramUsedBytes! / vramTotalBytes!;
 
   factory SystemStats.fromJson(Map<String, dynamic> j) => SystemStats(
-        cpuPercent: (j['cpu_percent'] as num?)?.toDouble() ?? 0,
-        memoryUsedBytes: (j['memory_used_bytes'] as num?)?.toInt() ?? 0,
-        memoryTotalBytes: (j['memory_total_bytes'] as num?)?.toInt() ?? 0,
-        gpuUtilPercent: (j['gpu_util_percent'] as num?)?.toDouble(),
-        vramUsedBytes: (j['vram_used_bytes'] as num?)?.toInt(),
-        vramTotalBytes: (j['vram_total_bytes'] as num?)?.toInt(),
-      );
+    cpuPercent: (j['cpu_percent'] as num?)?.toDouble() ?? 0,
+    memoryUsedBytes: (j['memory_used_bytes'] as num?)?.toInt() ?? 0,
+    memoryTotalBytes: (j['memory_total_bytes'] as num?)?.toInt() ?? 0,
+    gpuUtilPercent: (j['gpu_util_percent'] as num?)?.toDouble(),
+    vramUsedBytes: (j['vram_used_bytes'] as num?)?.toInt(),
+    vramTotalBytes: (j['vram_total_bytes'] as num?)?.toInt(),
+  );
 }
 
 /// 识别服务进程树（服务 + 常驻 Kraken daemon）的资源占用快照。
@@ -429,8 +429,11 @@ class RegionPrelabelResult {
       RegionPrelabelResult(
         suggestions: (j['suggestions'] as List? ?? const [])
             .whereType<Map>()
-            .map((e) =>
-                RegionPrelabelSuggestion.fromJson(Map<String, dynamic>.from(e)))
+            .map(
+              (e) => RegionPrelabelSuggestion.fromJson(
+                Map<String, dynamic>.from(e),
+              ),
+            )
             .toList(),
         neighborsChecked: (j['neighbors_checked'] as num?)?.toInt() ?? 0,
       );
@@ -447,8 +450,11 @@ class RegionRefineResult {
       RegionRefineResult(
         regions: (j['regions'] as List? ?? const [])
             .whereType<Map>()
-            .map((e) =>
-                RegionPrelabelSuggestion.fromJson(Map<String, dynamic>.from(e)))
+            .map(
+              (e) => RegionPrelabelSuggestion.fromJson(
+                Map<String, dynamic>.from(e),
+              ),
+            )
             .toList(),
         dropped: (j['dropped'] as List? ?? const [])
             .whereType<Map>()
@@ -492,6 +498,7 @@ class PagePrelabelMaterial {
 
 class PythonService {
   static Process? _process;
+
   /// 启动流程进行中（应用启动或自动重启）：期间失联守卫不再拉第二个
   /// 后端进程。
   static bool _starting = false;
@@ -511,8 +518,10 @@ class PythonService {
     String startupLabel = '应用启动',
   }) {
     _starting = true;
-    return _startBackend(pythonServiceDir, startupLabel)
-        .whenComplete(() => _starting = false);
+    return _startBackend(
+      pythonServiceDir,
+      startupLabel,
+    ).whenComplete(() => _starting = false);
   }
 
   static Future<void> _startBackend(
@@ -611,16 +620,15 @@ class PythonService {
         // 因）。启动逻辑放 run_backend_console.cmd，start 只调裸文件名
         // （已实测：exitCode=0 且批处理正常执行）。标题也不用 start 传
         // （无空格的标题不加引号会被当命令），批处理内 title 设置。
-        final launched = await Process.run('cmd', [
-          '/c',
-          'start',
-          '/D',
-          pythonServiceDir,
-          'run_backend_console.cmd',
-        ], environment: {
-          ...Platform.environment,
-          if (krakenWorkersEnv != null) 'OCR_KRAKEN_WORKERS': krakenWorkersEnv,
-        });
+        final launched = await Process.run(
+          'cmd',
+          ['/c', 'start', '/D', pythonServiceDir, 'run_backend_console.cmd'],
+          environment: {
+            ...Platform.environment,
+            if (krakenWorkersEnv != null)
+              'OCR_KRAKEN_WORKERS': krakenWorkersEnv,
+          },
+        );
         if (launched.exitCode != 0) {
           _addLog(
             'app',
@@ -768,7 +776,8 @@ class PythonService {
 
   static Future<Map<String, dynamic>?> _readHealth() async {
     try {
-      final r = await http.get(Uri.parse('$_base/health'))
+      final r = await http
+          .get(Uri.parse('$_base/health'))
           .timeout(const Duration(seconds: 1));
       if (r.statusCode != 200) return null;
       final data = jsonDecode(r.body);
@@ -870,18 +879,38 @@ class PythonService {
   }
 
   static void stop() {
+    // 保留同步入口供应用 dispose 使用；需要确认退出完成的调用方使用
+    // stopAndWait，避免安装器启动时仍有 DLL/后端文件被占用。
+    unawaited(stopAndWait());
+  }
+
+  /// 停止后端并等待直接进程及其监听端口释放。
+  static Future<bool> stopAndWait() async {
     _addLog('app', '正在停止 Python 后端。');
     _stopServiceLogFollower();
-    if (_consoleWindowMode && _process == null) {
-      // 窗口模式没有直接子进程句柄：按端口结束进程树（taskkill /T 连
-      // 同常驻 kraken worker）。用户直接关控制台窗口也是合法的停止方
-      // 式（Ctrl+C 走 uvicorn 优雅退出，kraken daemon 会被干净关闭）。
-      _consoleWindowMode = false;
-      // ignore: unawaited_futures
-      _stopBackendOnPort();
-    }
-    _process?.kill();
+    final process = _process;
     _process = null;
+    // 本会话从未启动过后端（无直接子进程、未走过独立控制台模式）：
+    // 没有本应用可停的进程，端口若被占用也是外部实例的事——直接返回，
+    // 不做 20×250ms 的端口等待（此前无条件等待让应用退出路径白等、
+    // widget 冒烟测试销毁时留下挂起计时器而必挂）。
+    if (process == null && !_consoleWindowMode) return true;
+    if (process != null) {
+      try {
+        process.kill();
+        await process.exitCode.timeout(const Duration(seconds: 5));
+      } catch (_) {
+        // 进程已退出或无法读取 exitCode，继续用端口状态确认。
+      }
+    }
+    // conda run 会再派生 Python 子进程；Windows 上仅 kill 直接句柄
+    // 可能留下子进程，所以统一按服务端口结束整棵进程树。
+    if (Platform.isWindows && (_consoleWindowMode || process != null)) {
+      _consoleWindowMode = false;
+      final stopped = await _stopBackendOnPort();
+      if (!stopped) return false;
+    }
+    return _waitUntilPortReleased();
   }
 
   // ── 后端失联自动恢复 ─────────────────────────────────────────────────
@@ -916,20 +945,16 @@ class PythonService {
       await start(dir, startupLabel: '后端自动重启');
       _addLog('app', '后端自动重启成功，服务已恢复。');
     } catch (e) {
-      _addLog(
-        'app',
-        '后端自动重启失败：$e。2 分钟冷却后才会再试；也可重启应用手动拉起。',
-        isError: true,
-      );
+      _addLog('app', '后端自动重启失败：$e。2 分钟冷却后才会再试；也可重启应用手动拉起。', isError: true);
     }
   }
 
   /// 失联时给用户的中文指引（按自动重启所处阶段选词）。
   static String _backendDownMessage() => _reviveTask != null
       ? '后端服务不可达（后端进程已退出，例如控制台窗口被关闭或系统重启过）。'
-          '正在自动重启后端（约需半分钟），完成后请重试本操作'
+            '正在自动重启后端（约需半分钟），完成后请重试本操作'
       : '后端服务不可达，且自动重启未成功或仍在冷却（详见后台日志）。'
-          '请检查后端控制台窗口，或重启应用';
+            '请检查后端控制台窗口，或重启应用';
 
   /// 测试注入的 HTTP 客户端（null = 真实网络）。widget 测试的 FakeAsync
   /// 区里真实 socket 永不完成（测试框架还会把 HttpClient 全局拦截成
@@ -965,6 +990,49 @@ class PythonService {
     });
   }
 
+  /// 插件桥的后端代理出口（外挂插件页面经宿主调本地后端：缩略图等）。
+  /// 只暴露 JSON GET/POST，复用交互请求的统一守卫（连接级失败转中文
+  /// 提示并触发自动重启）；非 200 按异常抛出（带响应体摘要）。路径
+  /// 变化时由插件 API 版本（manifest api_version）背书，不走
+  /// BACKEND_BUILD 握手。
+  static Future<Map<String, dynamic>> pluginBackendGet(
+    String path,
+    Map<String, String>? query,
+  ) async {
+    final uri = Uri.parse('$_base${path.startsWith('/') ? path : '/$path'}')
+        .replace(queryParameters: query);
+    final r = await _get(uri).timeout(const Duration(seconds: 60));
+    return _decodePluginBackendJson(r, uri);
+  }
+
+  static Future<Map<String, dynamic>> pluginBackendPost(
+    String path,
+    Map<String, dynamic> body,
+  ) async {
+    final uri = Uri.parse('$_base${path.startsWith('/') ? path : '/$path'}');
+    final r = await _post(
+      uri,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode(body),
+    ).timeout(const Duration(minutes: 3));
+    return _decodePluginBackendJson(r, uri);
+  }
+
+  static Map<String, dynamic> _decodePluginBackendJson(
+    http.Response r,
+    Uri uri,
+  ) {
+    if (r.statusCode != 200) {
+      final detail = r.body.length > 300 ? '${r.body.substring(0, 300)}…' : r.body;
+      throw Exception('后端 $uri 失败（HTTP ${r.statusCode}）：$detail');
+    }
+    final decoded = jsonDecode(r.body);
+    if (decoded is! Map) {
+      throw Exception('后端 $uri 响应不是 JSON 对象');
+    }
+    return Map<String, dynamic>.from(decoded);
+  }
+
   /// 识别产出统一打"原始 OCR 文字"基线（正确识别率统计用）：后端识别
   /// 响应解析出的行在这里把每个字的 [CharBlock.origText] 设为当前 text
   /// ——此后人工改字/AI 改写都不再碰它，text != origText 即"识别后被
@@ -996,11 +1064,10 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /transform_page op=$op path=$imagePath');
     final r = await _post(
-          Uri.parse('$_base/transform_page'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'image_path': imagePath, 'op': op}),
-        )
-        .timeout(const Duration(seconds: 120));
+      Uri.parse('$_base/transform_page'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'image_path': imagePath, 'op': op}),
+    ).timeout(const Duration(seconds: 120));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -1023,16 +1090,15 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /split_page path=$imagePath ratio=$spineRatio');
     final r = await _post(
-          Uri.parse('$_base/split_page'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'image_path': imagePath,
-            'spine_ratio': spineRatio,
-            if (leftPath != null) 'left_path': leftPath,
-            if (rightPath != null) 'right_path': rightPath,
-          }),
-        )
-        .timeout(const Duration(seconds: 120));
+      Uri.parse('$_base/split_page'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'image_path': imagePath,
+        'spine_ratio': spineRatio,
+        if (leftPath != null) 'left_path': leftPath,
+        if (rightPath != null) 'right_path': rightPath,
+      }),
+    ).timeout(const Duration(seconds: 120));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -1053,11 +1119,10 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /detect_page_quad path=$imagePath');
     final r = await _post(
-          Uri.parse('$_base/detect_page_quad'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'image_path': imagePath}),
-        )
-        .timeout(const Duration(seconds: 120));
+      Uri.parse('$_base/detect_page_quad'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'image_path': imagePath}),
+    ).timeout(const Duration(seconds: 120));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -1100,23 +1165,22 @@ class PythonService {
     });
     try {
       final r = await _post(
-            Uri.parse('$_base/dewarp_page'),
-            headers: {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'image_path': imagePath,
-              'corners': corners,
-              if (edgeMids != null)
-                'edge_mids': edgeMids.map((k, v) => MapEntry(k, v)),
-              'grayscale': grayscale,
-              'sharpen': sharpen,
-              'debleed': debleed,
-              'debleed_strength': debleedStrength,
-              'preview': preview,
-              'preview_max_px': previewMaxPx,
-              if (outPath != null) 'out_path': outPath,
-            }),
-          )
-          .timeout(const Duration(seconds: 300));
+        Uri.parse('$_base/dewarp_page'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'image_path': imagePath,
+          'corners': corners,
+          if (edgeMids != null)
+            'edge_mids': edgeMids.map((k, v) => MapEntry(k, v)),
+          'grayscale': grayscale,
+          'sharpen': sharpen,
+          'debleed': debleed,
+          'debleed_strength': debleedStrength,
+          'preview': preview,
+          'preview_max_px': previewMaxPx,
+          if (outPath != null) 'out_path': outPath,
+        }),
+      ).timeout(const Duration(seconds: 300));
       if (r.statusCode != 200) {
         _addLog(
           'http',
@@ -1136,8 +1200,9 @@ class PythonService {
   /// 后端不可达时按本机逻辑核保守回退，保证批量流程不因它中断。
   static Future<Map<String, dynamic>> deskewSizing() async {
     try {
-      final r = await _get(Uri.parse('$_base/deskew_sizing'))
-          .timeout(const Duration(seconds: 10));
+      final r = await _get(
+        Uri.parse('$_base/deskew_sizing'),
+      ).timeout(const Duration(seconds: 10));
       if (r.statusCode == 200) {
         return jsonDecode(r.body) as Map<String, dynamic>;
       }
@@ -1174,26 +1239,25 @@ class PythonService {
     _addLog(
       'http',
       'POST /stitch_pages a=$imageA b=$imageB dir=$direction '
-      'preview=$preview overlap=${overlap ?? 'auto'} offset=${offset ?? 'auto'}',
+          'preview=$preview overlap=${overlap ?? 'auto'} offset=${offset ?? 'auto'}',
     );
     final r = await _post(
-          Uri.parse('$_base/stitch_pages'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'image_a': imageA,
-            'image_b': imageB,
-            'direction': direction,
-            'auto_trim': autoTrim,
-            'auto_align': autoAlign,
-            if (overlap != null) 'overlap': overlap,
-            if (offset != null) 'offset': offset,
-            'seam_fade': seamFade,
-            'preview': preview,
-            'preview_max_px': previewMaxPx,
-            if (outPath != null) 'out_path': outPath,
-          }),
-        )
-        .timeout(const Duration(seconds: 120));
+      Uri.parse('$_base/stitch_pages'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'image_a': imageA,
+        'image_b': imageB,
+        'direction': direction,
+        'auto_trim': autoTrim,
+        'auto_align': autoAlign,
+        if (overlap != null) 'overlap': overlap,
+        if (offset != null) 'offset': offset,
+        'seam_fade': seamFade,
+        'preview': preview,
+        'preview_max_px': previewMaxPx,
+        if (outPath != null) 'out_path': outPath,
+      }),
+    ).timeout(const Duration(seconds: 120));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -1297,18 +1361,17 @@ class PythonService {
     List<Map<String, dynamic>>? chars, // 显式参考单字 [{text,x,y,w,h}]
   }) async {
     final r = await _post(
-          Uri.parse('$_base/char_cls/evaluate'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'project_dir': projectDir,
-            'image_path': imagePath,
-            'use_models': useModels,
-            'test_model_path': testModelPath,
-            'limit': limit,
-            if (chars != null) 'chars': chars,
-          }),
-        )
-        .timeout(const Duration(minutes: 5));
+      Uri.parse('$_base/char_cls/evaluate'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'project_dir': projectDir,
+        'image_path': imagePath,
+        'use_models': useModels,
+        'test_model_path': testModelPath,
+        'limit': limit,
+        if (chars != null) 'chars': chars,
+      }),
+    ).timeout(const Duration(minutes: 5));
     if (r.statusCode != 200) {
       throw Exception(_detailOf(r.body));
     }
@@ -1340,7 +1403,8 @@ class PythonService {
     });
     final http.Response r;
     try {
-      r = await _post(
+      r =
+          await _post(
             Uri.parse('$_base/recognition_eval'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
@@ -1348,8 +1412,7 @@ class PythonService {
               'limit': limit,
               'rebuild': rebuild,
             }),
-          )
-          .timeout(
+          ).timeout(
             const Duration(minutes: 20),
             onTimeout: () {
               throw TimeoutException('识别消融评测超时（20 分钟）——可减少评测行数后重试');
@@ -1385,7 +1448,8 @@ class PythonService {
   /// 是旧版本时返回 null（页面按"还没有评测集"处理）。
   static Future<Map<String, dynamic>?> recognitionEvalSet() async {
     try {
-      final r = await http.get(Uri.parse('$_base/recognition_eval/set'))
+      final r = await http
+          .get(Uri.parse('$_base/recognition_eval/set'))
           .timeout(const Duration(seconds: 30));
       if (r.statusCode != 200) return null;
       final decoded = jsonDecode(r.body);
@@ -1408,9 +1472,7 @@ class PythonService {
     );
     final r = await _get(uri).timeout(const Duration(seconds: 30));
     if (r.statusCode == 404) {
-      throw Exception(
-        '基准目录不可用：$benchDir（需要样张图片 + gt/*.json 基准释文）',
-      );
+      throw Exception('基准目录不可用：$benchDir（需要样张图片 + gt/*.json 基准释文）');
     }
     if (r.statusCode != 200) {
       throw Exception('bench cases failed: ${r.body}');
@@ -1418,9 +1480,7 @@ class PythonService {
     final decoded = jsonDecode(r.body);
     final cases = decoded is Map ? decoded['cases'] : null;
     if (cases is! List) throw Exception('基准样张返回格式异常');
-    return [
-      for (final c in cases) Map<String, dynamic>.from(c as Map),
-    ];
+    return [for (final c in cases) Map<String, dynamic>.from(c as Map)];
   }
 
   /// 提交一次朝代基准评测（preds 每项含 id/pred_text/line_count/
@@ -1430,11 +1490,10 @@ class PythonService {
     required List<Map<String, dynamic>> preds,
   }) async {
     final r = await _post(
-          Uri.parse('$_base/bench/dynasty/eval'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'bench_dir': benchDir, 'preds': preds}),
-        )
-        .timeout(const Duration(seconds: 60));
+      Uri.parse('$_base/bench/dynasty/eval'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'bench_dir': benchDir, 'preds': preds}),
+    ).timeout(const Duration(seconds: 60));
     if (r.statusCode == 404) {
       throw Exception(
         '当前识别服务是旧版本（没有朝代基准评测接口）。'
@@ -1463,9 +1522,7 @@ class PythonService {
     final decoded = jsonDecode(r.body);
     final runs = decoded is Map ? decoded['runs'] : null;
     if (runs is! List) return const [];
-    return [
-      for (final run in runs) Map<String, dynamic>.from(run as Map),
-    ];
+    return [for (final run in runs) Map<String, dynamic>.from(run as Map)];
   }
 
   /// Kraken 识别模型微调：导出数据并启动训练（后台任务）。
@@ -1475,15 +1532,14 @@ class PythonService {
     int maxLines = 2000,
   }) async {
     final r = await _post(
-          Uri.parse('$_base/kraken/train/start'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'project_dir': projectDir,
-            'epochs': epochs,
-            'max_lines': maxLines,
-          }),
-        )
-        .timeout(const Duration(seconds: 120));
+      Uri.parse('$_base/kraken/train/start'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'project_dir': projectDir,
+        'epochs': epochs,
+        'max_lines': maxLines,
+      }),
+    ).timeout(const Duration(seconds: 120));
     if (r.statusCode == 404) {
       throw Exception(
         '当前识别服务是旧版本（没有 Kraken 微调接口）。'
@@ -1517,8 +1573,9 @@ class PythonService {
 
   /// Kraken 微调任务状态列表。
   static Future<List<Map<String, dynamic>>> krakenStatus() async {
-    final r = await _get(Uri.parse('$_base/kraken/status'))
-        .timeout(const Duration(seconds: 15));
+    final r = await _get(
+      Uri.parse('$_base/kraken/status'),
+    ).timeout(const Duration(seconds: 15));
     if (r.statusCode != 200) {
       throw Exception('kraken/status failed: ${r.body}');
     }
@@ -1530,11 +1587,10 @@ class PythonService {
 
   static Future<void> krakenStop(String taskId) async {
     final r = await _post(
-          Uri.parse('$_base/kraken/train/stop'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'task_id': taskId}),
-        )
-        .timeout(const Duration(seconds: 15));
+      Uri.parse('$_base/kraken/train/stop'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'task_id': taskId}),
+    ).timeout(const Duration(seconds: 15));
     if (r.statusCode != 200) {
       throw Exception('kraken/stop failed: ${r.body}');
     }
@@ -1544,7 +1600,8 @@ class PythonService {
   /// 时返回 null（首页轮询按"暂不可用"展示，不报错打扰）。
   static Future<ServiceStats?> fetchProcessStats() async {
     try {
-      final r = await http.get(Uri.parse('$_base/process_stats'))
+      final r = await http
+          .get(Uri.parse('$_base/process_stats'))
           .timeout(const Duration(seconds: 5));
       if (r.statusCode != 200) return null;
       final decoded = jsonDecode(r.body);
@@ -1559,11 +1616,13 @@ class PythonService {
   /// 覆盖回硬件自动决策。识别进行中后端 409；重建要逐个加载模型，耗时可
   /// 达数分钟，HTTP 超时放宽到 5 分钟。返回 {size, planned, why}。
   static Future<Map<String, dynamic>> resizeKrakenPool(int? workers) async {
-    final r = await http.post(
-      Uri.parse('$_base/kraken/pool/resize'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'workers': workers}),
-    ).timeout(const Duration(minutes: 5));
+    final r = await http
+        .post(
+          Uri.parse('$_base/kraken/pool/resize'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'workers': workers}),
+        )
+        .timeout(const Duration(minutes: 5));
     final decoded = jsonDecode(r.body);
     if (r.statusCode != 200) {
       throw Exception(
@@ -1577,11 +1636,13 @@ class PythonService {
   /// 对识别进程池发一次单行识别（进程数压力测试探针）。imagePath 为空时
   /// 后端从书库自选样本。返回 {elapsed_s, pool_size, text_len}。
   static Future<Map<String, dynamic>> krakenProbe({String? imagePath}) async {
-    final r = await http.post(
-      Uri.parse('$_base/kraken/probe'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({'image_path': imagePath}),
-    ).timeout(const Duration(minutes: 3));
+    final r = await http
+        .post(
+          Uri.parse('$_base/kraken/probe'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({'image_path': imagePath}),
+        )
+        .timeout(const Duration(minutes: 3));
     final decoded = jsonDecode(r.body);
     if (r.statusCode != 200) {
       throw Exception(
@@ -1645,16 +1706,13 @@ class PythonService {
     required String imagePath,
     required List<Map<String, dynamic>> lines,
   }) async {
-    _addLog(
-      'http',
-      'POST /refresh_full_text_check lines=${lines.length}',
-    );
-    final r = await _post(
+    _addLog('http', 'POST /refresh_full_text_check lines=${lines.length}');
+    final r =
+        await _post(
           Uri.parse('$_base/refresh_full_text_check'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({'image_path': imagePath, 'lines': lines}),
-        )
-        .timeout(
+        ).timeout(
           const Duration(seconds: 60),
           onTimeout: () => throw TimeoutException('刷新整页对照超时（1 分钟）'),
         );
@@ -1688,7 +1746,8 @@ class PythonService {
       'POST /read_page_text image_path=$imagePath '
           'orientation=${settings.orientation} engine=${settings.engine}',
     );
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/read_page_text'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -1708,8 +1767,7 @@ class PythonService {
                 settings.paddleModel.startsWith('PaddleOCR-VL'))
               'vl_predict': settings.vlPredict,
           }),
-        )
-        .timeout(
+        ).timeout(
           // VL 0.9B 首次推理含权重编译、且常与 kraken 池共享显存（被挤时
           // 退 CPU 会到分钟级）——后端单请求超时已放宽到 15 分钟，客户端
           // 必须不短于它，否则先被这里掐断报超时。
@@ -1858,7 +1916,8 @@ class PythonService {
     });
     final http.Response r;
     try {
-      r = await _post(
+      r =
+          await _post(
             Uri.parse('$_base/segment'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
@@ -1879,8 +1938,7 @@ class PythonService {
               if (gateRegions != null && gateRegions.isNotEmpty)
                 'gate_regions': gateRegions,
             }),
-          )
-          .timeout(
+          ).timeout(
             const Duration(minutes: 10),
             onTimeout: () {
               throw TimeoutException(
@@ -2074,7 +2132,8 @@ class PythonService {
           '${expectedCharCount != null ? ' expectedCharCount=$expectedCharCount' : ''}'
           '${!expand ? ' no-expand' : ''}',
     );
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/segment_region'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -2109,8 +2168,7 @@ class PythonService {
             // 才能与新服务的缺省 true 区分开。
             if (!expand) 'expand': false,
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(minutes: 5),
           onTimeout: () {
             throw TimeoutException('单行识别超时（5 分钟）——GPU 被其他程序占用时识别会显著变慢，请稍后重试');
@@ -2176,40 +2234,39 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /analyze_layout lines=${lines.length}');
     final r = await _post(
-          Uri.parse('$_base/analyze_layout'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'image_path': imagePath,
-            'orientation': settings.orientation,
-            'horizontal_dir': settings.horizontalDir,
-            'vertical_dir': settings.verticalDir,
-            'lines': [
-              for (final l in lines)
-                {
-                  'id': l.id,
-                  'x': l.x,
-                  'y': l.y,
-                  'w': l.w,
-                  'h': l.h,
-                  'chars': [
-                    for (final c in l.chars)
-                      {
-                        'id': c.id,
-                        'x': c.x,
-                        'y': c.y,
-                        'w': c.w,
-                        'h': c.h,
-                        'text': c.text,
-                        'type': c.type,
-                        'col': c.col,
-                        'order': c.order,
-                      },
-                  ],
-                },
-            ],
-          }),
-        )
-        .timeout(const Duration(minutes: 2));
+      Uri.parse('$_base/analyze_layout'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'image_path': imagePath,
+        'orientation': settings.orientation,
+        'horizontal_dir': settings.horizontalDir,
+        'vertical_dir': settings.verticalDir,
+        'lines': [
+          for (final l in lines)
+            {
+              'id': l.id,
+              'x': l.x,
+              'y': l.y,
+              'w': l.w,
+              'h': l.h,
+              'chars': [
+                for (final c in l.chars)
+                  {
+                    'id': c.id,
+                    'x': c.x,
+                    'y': c.y,
+                    'w': c.w,
+                    'h': c.h,
+                    'text': c.text,
+                    'type': c.type,
+                    'col': c.col,
+                    'order': c.order,
+                  },
+              ],
+            },
+        ],
+      }),
+    ).timeout(const Duration(minutes: 2));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -2234,11 +2291,10 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /region_prelabel page=$pageId');
     final r = await _post(
-          Uri.parse('$_base/region_prelabel'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'project_dir': projectDir, 'page_id': pageId}),
-        )
-        .timeout(const Duration(minutes: 2));
+      Uri.parse('$_base/region_prelabel'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'project_dir': projectDir, 'page_id': pageId}),
+    ).timeout(const Duration(minutes: 2));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -2254,7 +2310,10 @@ class PythonService {
     final result = RegionPrelabelResult.fromJson(
       Map<String, dynamic>.from(decoded),
     );
-    _addLog('http', 'POST /region_prelabel ok suggestions=${result.suggestions.length}');
+    _addLog(
+      'http',
+      'POST /region_prelabel ok suggestions=${result.suggestions.length}',
+    );
     return result;
   }
 
@@ -2266,14 +2325,13 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /region_refine regions=${regions.length}');
     final r = await _post(
-          Uri.parse('$_base/region_refine'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'image_path': imagePath,
-            'regions': [for (final s in regions) s.toRequest()],
-          }),
-        )
-        .timeout(const Duration(minutes: 2));
+      Uri.parse('$_base/region_refine'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'image_path': imagePath,
+        'regions': [for (final s in regions) s.toRequest()],
+      }),
+    ).timeout(const Duration(minutes: 2));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -2301,16 +2359,15 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /page_prelabel_image maxSide=$maxSide');
     final r = await _post(
-          Uri.parse('$_base/page_prelabel_image'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'image_path': imagePath,
-            'max_side': maxSide,
-            'regions': regions,
-            'grid_div': gridDiv,
-          }),
-        )
-        .timeout(const Duration(minutes: 2));
+      Uri.parse('$_base/page_prelabel_image'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'image_path': imagePath,
+        'max_side': maxSide,
+        'regions': regions,
+        'grid_div': gridDiv,
+      }),
+    ).timeout(const Duration(minutes: 2));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -2343,7 +2400,8 @@ class PythonService {
       'POST /segment_lines_in_region rect=($x,$y,$w,$h) '
           'orientation=${settings.orientation}',
     );
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/segment_lines_in_region'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -2362,8 +2420,7 @@ class PythonService {
             if (gateRegions != null && gateRegions.isNotEmpty)
               'gate_regions': gateRegions,
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(minutes: 10),
           onTimeout: () {
             throw TimeoutException('区域识别超时（10 分钟）——GPU 被其他程序占用时识别会显著变慢，请稍后重试');
@@ -2420,14 +2477,16 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /detect_tables');
     final r = await _post(
-          Uri.parse('$_base/detect_tables'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'image_path': imagePath}),
-        )
-        .timeout(const Duration(seconds: 120));
+      Uri.parse('$_base/detect_tables'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'image_path': imagePath}),
+    ).timeout(const Duration(seconds: 120));
     if (r.statusCode != 200) {
-      _addLog('http', 'POST /detect_tables failed ${r.statusCode} ${r.body}',
-          isError: true);
+      _addLog(
+        'http',
+        'POST /detect_tables failed ${r.statusCode} ${r.body}',
+        isError: true,
+      );
       throw Exception('detect_tables failed: ${_detailOf(r.body)}');
     }
     final data = jsonDecode(r.body) as Map<String, dynamic>;
@@ -2456,7 +2515,8 @@ class PythonService {
       'POST /recognize_table rect=($x,$y,$w,$h) '
           'orientation=${settings.orientation}',
     );
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/recognize_table'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -2469,8 +2529,7 @@ class PythonService {
             'horizontal_dir': settings.horizontalDir,
             'vertical_dir': settings.verticalDir,
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(minutes: 10),
           onTimeout: () => throw TimeoutException('表格识别超时（10 分钟）'),
         );
@@ -2478,14 +2537,19 @@ class PythonService {
       throw TableGridNotFoundException(_detailOf(r.body));
     }
     if (r.statusCode != 200) {
-      _addLog('http',
-          'POST /recognize_table failed ${r.statusCode} ${r.body}',
-          isError: true);
+      _addLog(
+        'http',
+        'POST /recognize_table failed ${r.statusCode} ${r.body}',
+        isError: true,
+      );
       throw Exception('recognize_table failed: ${_detailOf(r.body)}');
     }
     final data = jsonDecode(r.body) as Map<String, dynamic>;
-    final table = TableAnnotation.fromRecognition(data,
-        id: id, regionUid: regionUid);
+    final table = TableAnnotation.fromRecognition(
+      data,
+      id: id,
+      regionUid: regionUid,
+    );
     _addLog(
       'http',
       'POST /recognize_table ok ${table.rows}x${table.cols} '
@@ -2525,7 +2589,8 @@ class PythonService {
           'text=${opts.textSource} roughness=${opts.roughness}'
           '${textBoxes != null && textBoxes.isNotEmpty ? ' 文字框×${textBoxes.length}' : ''}',
     );
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/export_excalidraw'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -2544,8 +2609,7 @@ class PythonService {
               'text_boxes': textBoxes,
             'debug_images': debugImages,
           }),
-        )
-        .timeout(
+        ).timeout(
           timeout,
           onTimeout: () {
             throw TimeoutException(
@@ -2587,25 +2651,24 @@ class PythonService {
           '(rect=${lines.isNotEmpty ? '(${lines.first['x']},${lines.first['y']},${lines.first['w']},${lines.first['h']})' : 'auto'})',
     );
     final r = await _post(
-          Uri.parse('$_base/debug_char_split'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'image_path': imagePath,
-            'orientation': orientation,
-            'lines': lines
-                .map(
-                  (l) => {
-                    'x': l['x'],
-                    'y': l['y'],
-                    'w': l['w'],
-                    'h': l['h'],
-                    'expected_count': l['expected_count'] ?? 0,
-                  },
-                )
-                .toList(),
-          }),
-        )
-        .timeout(const Duration(seconds: 120));
+      Uri.parse('$_base/debug_char_split'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'image_path': imagePath,
+        'orientation': orientation,
+        'lines': lines
+            .map(
+              (l) => {
+                'x': l['x'],
+                'y': l['y'],
+                'w': l['w'],
+                'h': l['h'],
+                'expected_count': l['expected_count'] ?? 0,
+              },
+            )
+            .toList(),
+      }),
+    ).timeout(const Duration(seconds: 120));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -2689,22 +2752,21 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /recognize_char rect=($x,$y,$w,$h)');
     final r = await _post(
-          Uri.parse('$_base/recognize_char'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'image_path': imagePath,
-            'x': x,
-            'y': y,
-            'w': w,
-            'h': h,
-            'orientation': orientation,
-            'horizontal_dir': horizontalDir,
-            'top_k': topK.clamp(1, 10),
-            'engine': engine,
-            if (engine == 'paddle') 'paddle_model': paddleModel,
-          }),
-        )
-        .timeout(const Duration(seconds: 120));
+      Uri.parse('$_base/recognize_char'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'image_path': imagePath,
+        'x': x,
+        'y': y,
+        'w': w,
+        'h': h,
+        'orientation': orientation,
+        'horizontal_dir': horizontalDir,
+        'top_k': topK.clamp(1, 10),
+        'engine': engine,
+        if (engine == 'paddle') 'paddle_model': paddleModel,
+      }),
+    ).timeout(const Duration(seconds: 120));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -2765,7 +2827,8 @@ class PythonService {
       'http',
       'POST /char_clusters blocks=${blocks.length} threshold=$threshold',
     );
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/char_clusters'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -2773,8 +2836,7 @@ class PythonService {
             'blocks': blocks.map((b) => b.toJson()).toList(),
             'threshold': threshold,
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(seconds: 60),
           onTimeout: () {
             throw TimeoutException('墨迹归类超时，请稍后重试');
@@ -2834,7 +2896,8 @@ class PythonService {
           'chars=${pages.fold<int>(0, (s, p) => s + p.blocks.length)} '
           'threshold=$threshold',
     );
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/char_clusters_batch'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -2863,8 +2926,7 @@ class PythonService {
                 .toList(),
             'threshold': threshold,
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(minutes: 15),
           onTimeout: () {
             throw TimeoutException('全书墨迹归类超时（页数过多时可缩小范围分批进行）');
@@ -2931,7 +2993,8 @@ class PythonService {
   }) async {
     if (items.isEmpty) return const [];
     _addLog('http', 'POST /char_thumbnails items=${items.length} size=$size');
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/char_thumbnails'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -2948,8 +3011,7 @@ class PythonService {
                 .toList(),
             'size': size,
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(minutes: 3),
           onTimeout: () {
             throw TimeoutException('字块缩略图获取超时');
@@ -2964,8 +3026,7 @@ class PythonService {
       throw Exception('char_thumbnails failed: ${r.body}');
     }
     // 响应是 40 张 224px PNG 的 base64（MB 级）：解码搬后台 isolate。
-    final data =
-        await decodeJsonInIsolate(r.body) as Map<String, dynamic>;
+    final data = await decodeJsonInIsolate(r.body) as Map<String, dynamic>;
     return ((data['thumbs'] as List?) ?? const [])
         .map((e) => e?.toString())
         .toList();
@@ -2983,7 +3044,8 @@ class PythonService {
       'http',
       'POST /line_thumbnails items=${items.length} maxSide=$maxSide',
     );
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/line_thumbnails'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -3005,8 +3067,7 @@ class PythonService {
             ],
             'max_side': maxSide,
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(minutes: 3),
           onTimeout: () {
             throw TimeoutException('行条裁图获取超时');
@@ -3021,8 +3082,7 @@ class PythonService {
       throw Exception('line_thumbnails failed: ${r.body}');
     }
     // 响应含 1536px 行图 base64（MB 级）：解码搬后台 isolate。
-    final data =
-        await decodeJsonInIsolate(r.body) as Map<String, dynamic>;
+    final data = await decodeJsonInIsolate(r.body) as Map<String, dynamic>;
     return ((data['thumbs'] as List?) ?? const [])
         .map((e) => e?.toString())
         .toList();
@@ -3036,7 +3096,8 @@ class PythonService {
   }) async {
     if (items.isEmpty) return const [];
     _addLog('http', 'POST /line_ink items=${items.length}');
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/line_ink'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -3055,8 +3116,7 @@ class PythonService {
                 },
             ],
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(minutes: 2),
           onTimeout: () {
             throw TimeoutException('行墨迹测量超时');
@@ -3094,7 +3154,8 @@ class PythonService {
   ) async {
     if (rects.isEmpty) return const [];
     _addLog('http', 'POST /region_ink rects=${rects.length}');
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/region_ink'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -3109,8 +3170,7 @@ class PythonService {
                 },
             ],
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(seconds: 30),
           onTimeout: () {
             throw TimeoutException('版面区墨迹检测超时');
@@ -3159,7 +3219,8 @@ class PythonService {
     bool debug = false,
   }) async {
     _addLog('http', 'POST /verify_char id=${block.id} text=${block.text}');
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/verify_char'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -3173,8 +3234,7 @@ class PythonService {
             'cls_rank': _clsRankOf(block),
             'debug': debug,
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(seconds: 60),
           onTimeout: () {
             throw TimeoutException('单字墨迹校验超时');
@@ -3206,7 +3266,8 @@ class PythonService {
     String? projectDir,
   }) async {
     _addLog('http', 'POST /verify_chars_batch blocks=${blocks.length}');
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/verify_chars_batch'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -3227,8 +3288,7 @@ class PythonService {
                 )
                 .toList(),
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(minutes: 5),
           onTimeout: () {
             throw TimeoutException('整页墨迹校验超时，请稍后重试');
@@ -3301,8 +3361,9 @@ class PythonService {
 
   /// 比对模型训练任务列表与已训模型（含激活状态）。
   static Future<Map<String, dynamic>> verifyTrainStatus() async {
-    final r = await _get(Uri.parse('$_base/verify/train/status'))
-        .timeout(const Duration(seconds: 30));
+    final r = await _get(
+      Uri.parse('$_base/verify/train/status'),
+    ).timeout(const Duration(seconds: 30));
     if (r.statusCode != 200) {
       throw Exception('verify/train/status failed: ${r.body}');
     }
@@ -3358,11 +3419,10 @@ class PythonService {
   ) async {
     _addLog('http', 'POST $path');
     final r = await _post(
-          Uri.parse('$_base$path'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode(body),
-        )
-        .timeout(const Duration(minutes: 5));
+      Uri.parse('$_base$path'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode(body),
+    ).timeout(const Duration(minutes: 5));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -3387,7 +3447,8 @@ class PythonService {
           'layout=${settings.layoutMode} orientation=${settings.orientation} '
           'h_dir=${settings.horizontalDir} v_dir=${settings.verticalDir}',
     );
-    final r = await _post(
+    final r =
+        await _post(
           Uri.parse('$_base/segment'),
           headers: {'Content-Type': 'application/json'},
           body: jsonEncode({
@@ -3398,8 +3459,7 @@ class PythonService {
             'vertical_dir': settings.verticalDir,
             'debug': true,
           }),
-        )
-        .timeout(
+        ).timeout(
           const Duration(minutes: 10),
           onTimeout: () {
             throw TimeoutException('整页识别超时（10 分钟）——GPU 被其他程序占用时识别会显著变慢，请稍后重试');
@@ -3572,11 +3632,10 @@ class PythonService {
   /// 超时放宽到 120s（与训练前检测一致），配合训练页失败降级。
   static Future<Map<String, dynamic>> trainStats(String projectDir) async {
     final r = await _get(
-          Uri.parse(
-            '$_base/train/stats?project_dir=${Uri.encodeComponent(projectDir)}',
-          ),
-        )
-        .timeout(const Duration(seconds: 120));
+      Uri.parse(
+        '$_base/train/stats?project_dir=${Uri.encodeComponent(projectDir)}',
+      ),
+    ).timeout(const Duration(seconds: 120));
     if (r.statusCode != 200) {
       throw Exception('train/stats failed: ${r.body}');
     }
@@ -3591,15 +3650,14 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /train/datasets layers=$layers force=$force');
     final r = await _post(
-          Uri.parse('$_base/train/datasets'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'project_dir': projectDir,
-            'layers': layers,
-            'force': force,
-          }),
-        )
-        .timeout(const Duration(minutes: 10));
+      Uri.parse('$_base/train/datasets'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'project_dir': projectDir,
+        'layers': layers,
+        'force': force,
+      }),
+    ).timeout(const Duration(minutes: 10));
     if (r.statusCode != 200) {
       throw Exception('train/datasets failed: ${r.body}');
     }
@@ -3616,15 +3674,14 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /train/export layers=$layers force=$force');
     final r = await _post(
-          Uri.parse('$_base/train/export'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'project_dir': projectDir,
-            'layers': layers,
-            'force': force,
-          }),
-        )
-        .timeout(const Duration(minutes: 10));
+      Uri.parse('$_base/train/export'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'project_dir': projectDir,
+        'layers': layers,
+        'force': force,
+      }),
+    ).timeout(const Duration(minutes: 10));
     if (r.statusCode != 200) {
       throw Exception('train/export failed: ${r.body}');
     }
@@ -3633,8 +3690,9 @@ class PythonService {
 
   /// 数据集/训练模型根目录配置（train_paths.json，机器本地）。
   static Future<Map<String, dynamic>> trainPathsGet() async {
-    final r = await _get(Uri.parse('$_base/train/paths'))
-        .timeout(const Duration(seconds: 15));
+    final r = await _get(
+      Uri.parse('$_base/train/paths'),
+    ).timeout(const Duration(seconds: 15));
     if (r.statusCode != 200) {
       throw Exception('train/paths failed: ${r.body}');
     }
@@ -3651,14 +3709,13 @@ class PythonService {
       'POST /train/paths datasetRoot=$datasetRoot trainedRoot=$trainedRoot',
     );
     final r = await _post(
-          Uri.parse('$_base/train/paths'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'dataset_root': datasetRoot,
-            'trained_root': trainedRoot,
-          }),
-        )
-        .timeout(const Duration(seconds: 30));
+      Uri.parse('$_base/train/paths'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'dataset_root': datasetRoot,
+        'trained_root': trainedRoot,
+      }),
+    ).timeout(const Duration(seconds: 30));
     if (r.statusCode != 200) {
       throw Exception('train/paths set failed: ${r.body}');
     }
@@ -3672,11 +3729,10 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /models/delete_run layer=$layer run=$runDir');
     final r = await _post(
-          Uri.parse('$_base/models/delete_run'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'layer': layer, 'run_dir': runDir}),
-        )
-        .timeout(const Duration(seconds: 120));
+      Uri.parse('$_base/models/delete_run'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'layer': layer, 'run_dir': runDir}),
+    ).timeout(const Duration(seconds: 120));
     if (r.statusCode != 200) {
       throw Exception('models/delete_run failed: ${r.body}');
     }
@@ -3691,11 +3747,10 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /models/delete_checkpoint layer=$layer');
     final r = await _post(
-          Uri.parse('$_base/models/delete_checkpoint'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'layer': layer, 'path': path}),
-        )
-        .timeout(const Duration(seconds: 30));
+      Uri.parse('$_base/models/delete_checkpoint'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'layer': layer, 'path': path}),
+    ).timeout(const Duration(seconds: 30));
     if (r.statusCode != 200) {
       throw Exception('models/delete_checkpoint failed: ${r.body}');
     }
@@ -3709,11 +3764,10 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /models/import layer=$layer');
     final r = await _post(
-          Uri.parse('$_base/models/import'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'layer': layer, 'path': path}),
-        )
-        .timeout(const Duration(seconds: 300));
+      Uri.parse('$_base/models/import'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'layer': layer, 'path': path}),
+    ).timeout(const Duration(seconds: 300));
     if (r.statusCode != 200) {
       throw Exception('models/import failed: ${r.body}');
     }
@@ -3724,8 +3778,9 @@ class PythonService {
   /// {root, totalMb, runs: [{layer, runDir, name, registered, finished,
   ///  trained, epochsCount, epochsMb, bestMb, sizeMb}]}
   static Future<Map<String, dynamic>> modelCleanupScan() async {
-    final r = await _get(Uri.parse('$_base/models/cleanup_scan'))
-        .timeout(const Duration(seconds: 60));
+    final r = await _get(
+      Uri.parse('$_base/models/cleanup_scan'),
+    ).timeout(const Duration(seconds: 60));
     if (r.statusCode != 200) {
       throw Exception('models/cleanup_scan failed: ${r.body}');
     }
@@ -3742,12 +3797,10 @@ class PythonService {
   }) async {
     _addLog('http', 'POST /models/cleanup layer=$layer action=$action');
     final r = await _post(
-          Uri.parse('$_base/models/cleanup'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'layer': layer, 'run_dir': runDir,
-                             'action': action}),
-        )
-        .timeout(const Duration(seconds: 300));
+      Uri.parse('$_base/models/cleanup'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'layer': layer, 'run_dir': runDir, 'action': action}),
+    ).timeout(const Duration(seconds: 300));
     if (r.statusCode != 200) {
       throw Exception('models/cleanup failed: ${r.body}');
     }
@@ -3757,11 +3810,10 @@ class PythonService {
   /// run 目录磁盘占用（删除确认框展示用）。
   static Future<double> modelRunSize(String runDir) async {
     final r = await _get(
-          Uri.parse(
-            '$_base/models/run_size?run_dir=${Uri.encodeQueryComponent(runDir)}',
-          ),
-        )
-        .timeout(const Duration(seconds: 30));
+      Uri.parse(
+        '$_base/models/run_size?run_dir=${Uri.encodeQueryComponent(runDir)}',
+      ),
+    ).timeout(const Duration(seconds: 30));
     if (r.statusCode != 200) {
       throw Exception('models/run_size failed: ${r.body}');
     }
@@ -3788,20 +3840,19 @@ class PythonService {
           'imgsz=$imgsz device=$device savePeriod=$savePeriod',
     );
     final r = await _post(
-          Uri.parse('$_base/train/start'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'project_dir': projectDir,
-            'layer': layer,
-            'base_model': baseModel,
-            'epochs': epochs,
-            'imgsz': imgsz,
-            'batch': batch,
-            'device': device,
-            'save_period': savePeriod,
-          }),
-        )
-        .timeout(const Duration(seconds: 60));
+      Uri.parse('$_base/train/start'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'project_dir': projectDir,
+        'layer': layer,
+        'base_model': baseModel,
+        'epochs': epochs,
+        'imgsz': imgsz,
+        'batch': batch,
+        'device': device,
+        'save_period': savePeriod,
+      }),
+    ).timeout(const Duration(seconds: 60));
     if (r.statusCode != 200) {
       throw Exception('train/start failed: ${r.body}');
     }
@@ -3810,8 +3861,9 @@ class PythonService {
 
   /// 训练任务状态列表（含进度与日志尾）。
   static Future<List<Map<String, dynamic>>> trainStatus() async {
-    final r = await _get(Uri.parse('$_base/train/status'))
-        .timeout(const Duration(seconds: 15));
+    final r = await _get(
+      Uri.parse('$_base/train/status'),
+    ).timeout(const Duration(seconds: 15));
     if (r.statusCode != 200) {
       throw Exception('train/status failed: ${r.body}');
     }
@@ -3823,11 +3875,10 @@ class PythonService {
 
   static Future<void> stopTraining(String taskId) async {
     final r = await _post(
-          Uri.parse('$_base/train/stop'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'task_id': taskId}),
-        )
-        .timeout(const Duration(seconds: 15));
+      Uri.parse('$_base/train/stop'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'task_id': taskId}),
+    ).timeout(const Duration(seconds: 15));
     if (r.statusCode != 200) {
       throw Exception('train/stop failed: ${r.body}');
     }
@@ -3836,9 +3887,9 @@ class PythonService {
   /// 训练曲线（/train/curve）：逐 epoch 指标/损失（results.csv）+ 已存
   /// 中间检查点清单。runDir 支持进行中任务与注册表历史 run。
   static Future<Map<String, dynamic>> trainCurve(String runDir) async {
-    final r = await _get(Uri.parse(
-            '$_base/train/curve?run_dir=${Uri.encodeComponent(runDir)}'))
-        .timeout(const Duration(seconds: 30));
+    final r = await _get(
+      Uri.parse('$_base/train/curve?run_dir=${Uri.encodeComponent(runDir)}'),
+    ).timeout(const Duration(seconds: 30));
     if (r.statusCode != 200) {
       throw Exception('train/curve failed: ${r.body}');
     }
@@ -3847,8 +3898,9 @@ class PythonService {
 
   /// 模型注册表：每层当前启用模型与历史 run。
   static Future<Map<String, Map<String, dynamic>>> listModels() async {
-    final r = await _get(Uri.parse('$_base/models'))
-        .timeout(const Duration(seconds: 15));
+    final r = await _get(
+      Uri.parse('$_base/models'),
+    ).timeout(const Duration(seconds: 15));
     if (r.statusCode != 200) {
       throw Exception('models failed: ${r.body}');
     }
@@ -3860,11 +3912,10 @@ class PythonService {
 
   static Future<void> activateModel(String layer, {String? modelPath}) async {
     final r = await _post(
-          Uri.parse('$_base/models/activate'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'layer': layer, 'model_path': modelPath}),
-        )
-        .timeout(const Duration(seconds: 60));
+      Uri.parse('$_base/models/activate'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'layer': layer, 'model_path': modelPath}),
+    ).timeout(const Duration(seconds: 60));
     if (r.statusCode != 200) {
       throw Exception('models/activate failed: ${r.body}');
     }
@@ -3872,11 +3923,10 @@ class PythonService {
 
   static Future<void> deactivateModel(String layer) async {
     final r = await _post(
-          Uri.parse('$_base/models/deactivate'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'layer': layer}),
-        )
-        .timeout(const Duration(seconds: 60));
+      Uri.parse('$_base/models/deactivate'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'layer': layer}),
+    ).timeout(const Duration(seconds: 60));
     if (r.statusCode != 200) {
       throw Exception('models/deactivate failed: ${r.body}');
     }
@@ -3890,11 +3940,10 @@ class PythonService {
   static Future<Map<String, dynamic>> packModels({String? packVersion}) async {
     _addLog('http', 'POST /models/pack');
     final r = await _post(
-          Uri.parse('$_base/models/pack'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({'pack_version': packVersion ?? ''}),
-        )
-        .timeout(const Duration(minutes: 10));
+      Uri.parse('$_base/models/pack'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'pack_version': packVersion ?? ''}),
+    ).timeout(const Duration(minutes: 10));
     if (r.statusCode != 200) {
       _addLog(
         'http',
@@ -3975,8 +4024,9 @@ class PythonService {
   /// 服务未运行或查询失败返回 null（调用方走本地兜底）。
   static Future<Map<String, dynamic>?> cleanupStatus() async {
     try {
-      final r = await _get(Uri.parse('$_base/cleanup/status'))
-          .timeout(const Duration(seconds: 15));
+      final r = await _get(
+        Uri.parse('$_base/cleanup/status'),
+      ).timeout(const Duration(seconds: 15));
       if (r.statusCode != 200) return null;
       final decoded = jsonDecode(r.body);
       if (decoded is! Map) return null;
@@ -4016,10 +4066,12 @@ class PythonService {
     await for (final e in dumpsDir.list()) {
       if (e is File && e.path.toLowerCase().endsWith('.dmp')) files.add(e);
     }
-    files.sort((a, b) =>
-        (a.lastModifiedSync()).compareTo(b.lastModifiedSync()));
-    final doomed =
-        keepLast > 0 ? files.sublist(0, files.length - keepLast) : files;
+    files.sort(
+      (a, b) => (a.lastModifiedSync()).compareTo(b.lastModifiedSync()),
+    );
+    final doomed = keepLast > 0
+        ? files.sublist(0, files.length - keepLast)
+        : files;
     var freed = 0;
     for (final f in doomed) {
       try {

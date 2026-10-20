@@ -2,166 +2,174 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../services/changelog_service.dart';
+import '../widgets/release_markdown.dart';
 
-/// 更新日志页：按版本分节展示 CHANGELOG.md（第一条即当前版本），支持
-/// 一键复制某版本 / 全部 markdown——上传 GitHub 时直接贴进 Release
-/// 发布说明。
+/// 在线查看 GitHub Releases，保留发布说明原文供选择和复制。
 class ChangelogPage extends StatefulWidget {
-  const ChangelogPage({super.key});
+  const ChangelogPage({super.key, this.service});
+
+  final ChangelogService? service;
 
   @override
   State<ChangelogPage> createState() => _ChangelogPageState();
 }
 
 class _ChangelogPageState extends State<ChangelogPage> {
-  List<ChangelogEntry> _entries = const [];
-  bool _loading = true;
+  late final ChangelogService _service;
+  final List<ChangelogEntry> _entries = [];
+  bool _loading = false;
+  String? _error;
+  int? _nextPage = 1;
+  bool _retryRefresh = true;
 
   @override
   void initState() {
     super.initState();
-    _load();
+    _service = widget.service ?? ChangelogService();
+    _load(refresh: true);
   }
 
-  Future<void> _load() async {
-    final entries = await ChangelogService.load();
-    if (!mounted) return;
+  @override
+  void dispose() {
+    if (widget.service == null) _service.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load({bool refresh = false}) async {
+    if (_loading || (!refresh && _nextPage == null)) return;
     setState(() {
-      _entries = entries;
-      _loading = false;
+      _loading = true;
+      _error = null;
+      _retryRefresh = refresh;
     });
+    try {
+      final result = await _service.load(page: refresh ? 1 : _nextPage!);
+      if (!mounted) return;
+      setState(() {
+        if (refresh) _entries.clear();
+        final ids = _entries.map((e) => e.id).toSet();
+        for (final entry in result.entries) {
+          if (ids.add(entry.id)) _entries.add(entry);
+        }
+        _nextPage = result.nextPage;
+      });
+    } catch (e) {
+      if (mounted) setState(() => _error = '读取 GitHub 更新日志失败：$e');
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
   }
 
-  Future<void> _copy(String title, String markdown) async {
+  Future<void> _copy(String markdown) async {
     await Clipboard.setData(ClipboardData(text: markdown));
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('已复制$title 的更新日志（GitHub 发布说明可直接粘贴）')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('已复制发布说明')));
   }
+
+  String _markdown(ChangelogEntry entry) =>
+      '## ${entry.version}\n\n${entry.markdown}';
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('更新日志'),
+        title: const Text('GitHub 更新日志'),
         actions: [
           if (_entries.isNotEmpty)
-            TextButton.icon(
-              onPressed: () => _copy(
-                '本版本（${_entries.first.version}）',
-                '## ${_entries.first.version}\n\n${_entries.first.markdown}',
-              ),
-              icon: const Icon(Icons.copy, size: 18),
-              label: const Text('复制本版本'),
+            IconButton(
+              tooltip: '复制已加载日志',
+              onPressed: () => _copy(_entries.map(_markdown).join('\n\n')),
+              icon: const Icon(Icons.copy_all),
             ),
-          if (_entries.length > 1)
-            TextButton.icon(
-              onPressed: () => _copy(
-                '全部',
-                _entries
-                    .map((e) => '## ${e.version}\n\n${e.markdown}')
-                    .join('\n\n'),
-              ),
-              icon: const Icon(Icons.copy_all, size: 18),
-              label: const Text('全部'),
-            ),
+          IconButton(
+            tooltip: '刷新',
+            onPressed: _loading ? null : () => _load(refresh: true),
+            icon: const Icon(Icons.refresh),
+          ),
         ],
       ),
-      body: _loading
-          ? const Center(child: CircularProgressIndicator())
-          : _entries.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.search_off, size: 40, color: Colors.grey),
-                      const SizedBox(height: 12),
-                      const Text('未找到 CHANGELOG.md'),
-                      const SizedBox(height: 4),
-                      Text(
-                        '开发运行时它位于项目根目录（python_service 上级）；'
-                        '安装版随安装目录携带',
-                        style: const TextStyle(fontSize: 12, color: Colors.grey),
-                      ),
-                    ],
+      body: ListView(
+        padding: const EdgeInsets.all(12),
+        children: [
+          for (var index = 0; index < _entries.length; index++)
+            _entryCard(_entries[index], index),
+          if (_loading)
+            const Padding(
+              padding: EdgeInsets.all(24),
+              child: Center(child: CircularProgressIndicator()),
+            )
+          else if (_error != null)
+            Padding(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                children: [
+                  Text(
+                    _error!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
                   ),
-                )
-              : ListView.builder(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: _entries.length,
-                  itemBuilder: (context, index) {
-                    final entry = _entries[index];
-                    return Card(
-                      child: Theme(
-                        // 去掉 ExpansionTile 默认的 3px 顶部间距
-                        data: Theme.of(context)
-                            .copyWith(dividerColor: Colors.transparent),
-                        child: ExpansionTile(
-                          initiallyExpanded: index == 0,
-                          title: Row(
-                            children: [
-                              Text(
-                                entry.version,
-                                style: const TextStyle(
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                              if (index == 0) ...[
-                                const SizedBox(width: 8),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 6,
-                                    vertical: 1,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: Theme.of(context)
-                                        .colorScheme
-                                        .primary
-                                        .withValues(alpha: 0.12),
-                                    borderRadius: BorderRadius.circular(8),
-                                  ),
-                                  child: Text(
-                                    '本版本',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: Theme.of(context)
-                                          .colorScheme
-                                          .primary,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ],
-                          ),
-                          trailing: IconButton(
-                            tooltip: '复制此版本（GitHub 发布说明用）',
-                            icon: const Icon(Icons.copy, size: 18),
-                            onPressed: () => _copy(
-                              entry.version,
-                              '## ${entry.version}\n\n${entry.markdown}',
-                            ),
-                          ),
-                          children: [
-                            Padding(
-                              padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
-                              child: Align(
-                                alignment: Alignment.centerLeft,
-                                child: SelectableText(
-                                  entry.markdown,
-                                  style: const TextStyle(
-                                    fontSize: 12.5,
-                                    height: 1.55,
-                                  ),
-                                ),
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    );
-                  },
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: () => _load(refresh: _retryRefresh),
+                    icon: const Icon(Icons.refresh),
+                    label: const Text('重试'),
+                  ),
+                ],
+              ),
+            )
+          else ...[
+            if (_entries.isEmpty)
+              const Padding(
+                padding: EdgeInsets.all(24),
+                child: Center(child: Text('GitHub 暂无正式版本发布记录')),
+              ),
+            if (_nextPage != null)
+              Center(
+                child: TextButton.icon(
+                  onPressed: _load,
+                  icon: const Icon(Icons.expand_more),
+                  label: const Text('加载更多'),
                 ),
+              ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _entryCard(ChangelogEntry entry, int index) {
+    final date = entry.publishedAt
+        ?.toLocal()
+        .toIso8601String()
+        .split('T')
+        .first;
+    return Card(
+      child: ExpansionTile(
+        key: ValueKey(entry.id),
+        initiallyExpanded: index == 0,
+        title: Text(
+          entry.title,
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+        subtitle: Text([entry.version, if (date != null) date].join(' · ')),
+        trailing: IconButton(
+          tooltip: '复制发布说明',
+          icon: const Icon(Icons.copy, size: 18),
+          onPressed: () => _copy(_markdown(entry)),
+        ),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 12),
+            child: Align(
+              alignment: Alignment.centerLeft,
+              child: ReleaseMarkdown(data: entry.markdown),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

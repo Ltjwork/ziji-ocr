@@ -15,13 +15,19 @@ class _AllowHttpOverrides extends HttpOverrides {
   }
 }
 
+// 真实响应 fixture（%TEMP% 里由录制会话生成）不在本机时跳过：
+// markTestSkipped 在异步回调里同样不可靠，用 test 的 skip: 参数。
+final _fixtureMissing = File('${Directory.systemTemp.path}/segment_mto.json')
+        .existsSync()
+    ? false
+    : '响应文件不存在（本机无录制 fixture）';
+
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
   HttpOverrides.global = _AllowHttpOverrides();
 
   test('ensurePageAnnotation 全流程（真实 main_text_only 响应 + 假后端）', () async {
     final respFile = File('${Directory.systemTemp.path}/segment_mto.json');
-    if (!respFile.existsSync()) markTestSkipped('响应文件不存在');
     final respBody = respFile.readAsStringSync();
 
     SharedPreferences.setMockInitialValues({});
@@ -68,5 +74,5 @@ void main() {
     final saved = File('${tmp.path}${Platform.pathSeparator}annotations'
         '${Platform.pathSeparator}page_005.json');
     expect(saved.existsSync(), isTrue);
-  });
+  }, skip: _fixtureMissing);
 }
