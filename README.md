@@ -1,4 +1,4 @@
-# 字迹 · ZiJi
+   # 字迹 · ZiJi
 
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/平台-Windows-blueviolet)]()
@@ -17,7 +17,7 @@
 
 字迹是为 [**命迹**](https://metafuyou.com) 而做的。
 
-[命迹](https://metafuyou.com) 是一款国风命理排盘软件。做好命迹需要扎实的古籍文献底座——把命理古籍数字化成可检索、可引用的语料，遍寻没有趁手的竖排古籍 OCR 工具，于是自己动手，越做越重，成了这个独立项目。如今两边互为反哺：字迹产出校对语料与识字众包任务，命迹的用户群体参与识字确认，识别模型随之持续变强。
+[命迹](https://metafuyou.com) 是一款国风命理排盘软件。做好命迹需要扎实的古籍文献底座——把命理古籍数字化成可检索、可引用的语料，遍寻没有趁手的竖排古籍 OCR 工具，于是自己动手，越做越重，成了这个独立项目。
 
 如果你对传统命理、古籍数字化感兴趣，欢迎了解命迹：
 
