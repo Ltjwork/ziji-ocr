@@ -1010,7 +1010,7 @@ class _BookOverlayPageState extends State<BookOverlayPage> {
     if (totalRects == 0 || _canvasH <= 0) {
       ScaffoldMessenger.of(
         context,
-      ).showSnackBar(const SnackBar(content: Text('先在叠加图上拖出区域矩形（1~7 切类别）')));
+      ).showSnackBar(const SnackBar(content: Text('先在叠加图上拖出区域矩形（1~8 切类别）')));
       return;
     }
     final drawnDesc = [
@@ -1584,7 +1584,7 @@ class _BookOverlayPageState extends State<BookOverlayPage> {
 
   // ── build ──
 
-  /// 快捷键 1~7 与小键盘 1~7：切换「当前类别」（与单页快设编辑器同一
+  /// 快捷键 1~8 与小键盘 1~8：切换「当前类别」（与单页快设编辑器同一
   /// 词表，键数与 RegionLabel 词表长度对齐）；Del 删除当前框。
   static const List<LogicalKeyboardKey> _digitKeys = [
     LogicalKeyboardKey.digit1,
@@ -1889,7 +1889,7 @@ class _BookOverlayPageState extends State<BookOverlayPage> {
                     _isQuick
                         ? '统一设置：应用只写入叠加范围 · '
                               '空白处拖拽画当前类别框（同类可多个）/ 抓角点调整 / '
-                              '框内拖动移动 · 单击框选中、点空白取消 · 1~7 切类别 · '
+                              '框内拖动移动 · 单击框选中、点空白取消 · 1~8 切类别 · '
                               'Del 删当前框 · 右键平移 · 滚轮缩放 · 只写框不识别，'
                               '写了正文的页设置后一律退回未确认，请逐页查看后自己确认'
                         : '左键拖动画框/移动/拖角点调整 · 右键拖动平移 · 滚轮缩放 · '

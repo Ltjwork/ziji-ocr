@@ -25,6 +25,7 @@ from segmenter import (
     dispose_body_gated_image,
     regions_from_boxes,
 )
+from train_data import LAYER_INFO
 
 
 def _page_with_header(tmp: str) -> str:
@@ -83,6 +84,16 @@ class BuildBodyGatedImageTest(unittest.TestCase):
         ]
         self.assertIsNone(build_body_gated_image(self.image_path, regions))
 
+    def test_hexagram_region_masked_to_background(self):
+        """卦图区（易经插件按手画划区识别）同走排除类门控：区内墨迹抹底，
+        不混进正文识别。"""
+        regions = [{"x": 20, "y": 0, "w": 140, "h": 24, "label": "hexagram"}]
+        gated = build_body_gated_image(self.image_path, regions)
+        self.assertIsNotNone(gated)
+        self.addCleanup(dispose_body_gated_image, gated)
+        masked = cv2.imread(gated)
+        self.assertGreater(int(masked[10, 90, 0]), 200)
+
     def test_dark_page_masks_with_dark_background(self):
         path = os.path.join(self.tmp.name, "dark.png")
         image = np.full((240, 180, 3), 20, dtype=np.uint8)
@@ -100,6 +111,14 @@ class BuildBodyGatedImageTest(unittest.TestCase):
         # 黑底页：页眉白墨被抹成深底色，正文白墨保留。
         self.assertLess(int(masked[10, 90, 0]), 60)
         self.assertGreater(int(masked[65, 45, 0]), 180)
+
+
+class RegionVocabProtocolTest(unittest.TestCase):
+    def test_hexagram_appended_to_region_det_vocab(self):
+        """卦图区进词表：只追加不重排（跨语言协议，末位 id），并归排除类。"""
+        self.assertEqual(LAYER_INFO["region_det"]["names"][-1], "hexagram")
+        self.assertIn("hexagram", seg_layout.REGION_EXCLUDED_LABELS)
+        self.assertNotIn("hexagram", seg_layout.REGION_BODY_LABELS)
 
 
 class AugmentReusePreseededRegionsTest(unittest.TestCase):

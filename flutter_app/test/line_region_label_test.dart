@@ -42,10 +42,11 @@ void main() {
     });
 
     test('类型行配色与区域视图同源（词表外归正文）', () {
-      // 行视图按 RegionLabel 配色画类型框：页眉青、页脚蓝灰、页码绿、
+      // 行视图按 RegionLabel 配色画类型框：页眉蓝、页脚蓝灰、页码绿、
       // 眉批黄棕；正文/未知类型不参与类型配色（保持 indigo）。
+      // 页眉曾为青色（0xFF0097A7），与段视图段落框 teal 几乎同色，改蓝。
       expect(RegionLabel.color(RegionLabel.normalize('header')),
-          const Color(0xFF0097A7));
+          const Color(0xFF1976D2));
       expect(RegionLabel.color(RegionLabel.normalize('page_number')),
           const Color(0xFF2E7D32));
       expect(RegionLabel.normalize('nonsense'), RegionLabel.mainText);

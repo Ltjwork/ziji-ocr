@@ -474,6 +474,15 @@ def _csv_progress(run_dir: str, epochs: int) -> float:
         return 0.0
 
 
+def _csv_rows(run_dir: str) -> int:
+    """results.csv 已完成轮数（train_worker 逐 epoch 追加一行）。"""
+    try:
+        with open(os.path.join(run_dir, "results.csv"), encoding="utf-8") as f:
+            return max(0, sum(1 for _ in f) - 1)
+    except Exception:
+        return 0
+
+
 def _read_done(run_dir: str) -> dict | None:
     try:
         with open(os.path.join(run_dir, "done.json"), encoding="utf-8") as f:
@@ -492,13 +501,47 @@ def _tail(run_dir: str, n: int = 30) -> list[str]:
 
 
 def _task_dict(task: dict) -> dict:
-    return {k: v for k, v in task.items() if k != "proc"}
+    out = {k: v for k, v in task.items() if k not in ("proc", "marks")}
+    out["eta_seconds"] = _eta_seconds(task)
+    return out
+
+
+def _eta_seconds(task: dict) -> float | None:
+    """预计剩余秒数：优先按最近几轮的实测耗时外推；轮界采样不足两个时
+    用总耗时按比例估算（含数据装载开销，前几轮偏保守）。"""
+    epochs = max(1, task.get("epochs") or 1)
+    progress = task.get("progress") or 0.0
+    done = round(progress * epochs)
+    marks = task.get("marks") or []
+    sec_per_epoch = None
+    if len(marks) >= 2 and marks[-1][1] > marks[0][1]:
+        span = marks[-1][0] - marks[0][0]
+        rows = marks[-1][1] - marks[0][1]
+        if span > 0 and rows > 0:
+            sec_per_epoch = span / rows
+    remaining = epochs - done
+    if task.get("status") not in ("starting", "training") or remaining <= 0:
+        return None
+    if sec_per_epoch is not None:
+        return round(sec_per_epoch * remaining, 1)
+    if progress > 0.005:
+        elapsed = time.time() - task.get("started", time.time())
+        return round(elapsed / progress * (1.0 - progress), 1)
+    return None
 
 
 def _monitor(task: dict) -> None:
     proc = task["proc"]
+    last_rows = -1
     while proc.poll() is None:
         task["progress"] = _csv_progress(task["run_dir"], task["epochs"])
+        rows = _csv_rows(task["run_dir"])
+        if rows != last_rows:
+            # 轮界采样（(时刻, 完成轮数)）：估每轮耗时/剩余时间用
+            marks = task.setdefault("marks", [])
+            marks.append((time.time(), rows))
+            del marks[:-8]
+            last_rows = rows
         task["log_tail"] = _tail(task["run_dir"])
         time.sleep(2)
     done = _read_done(task["run_dir"])

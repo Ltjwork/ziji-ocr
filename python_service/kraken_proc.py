@@ -43,6 +43,14 @@ REQUEST_TIMEOUT = 300
 PREWARM_PING_TIMEOUT = 300
 
 
+# 预热扩容让路：识别在途时暂停拉起其余 daemon（CUDA 模型加载会与在途
+# 推理抢同一块 GPU——实测启动预热扩容窗口撞上 VL 整页直读，直读被挤到
+# 分钟级）。轮询间隔 2s；240s 上限与 resize_pool 的等待预算对齐——预热
+# 不能被持续在途的识别无限饿死，到点照常扩容（退化为原有并发行为）。
+PREWARM_YIELD_POLL_S = 2.0
+PREWARM_YIELD_CAP_S = 240.0
+
+
 # 致命（粘性）CUDA 错误标记：illegal memory access / device-side assert
 # 一旦发生，该进程的 CUDA 上下文即告损坏，此后一切 CUDA 调用都返回同
 # 一错误，只有重启进程才能恢复。识别到这些标记时杀掉 daemon 让下次
@@ -85,6 +93,39 @@ def log(msg: str) -> None:
         segmenter.append_debug_trace(f"[kraken-bridge] {msg}")
     except Exception:
         pass
+
+
+def _wait_recognition_idle() -> None:
+    """识别在途时让路：等识别闸门放空再拉起本 daemon（上限见常量）。
+
+    启动预热扩容（k1 就绪后按配置并发拉起其余 daemon）与在途识别并发
+    时，多个 CUDA 模型加载会跟在途推理抢同一块 GPU——实测撞上 VL 整页
+    直读，直读被挤到分钟级。kraken_proc 不反向 import api_base
+    （api_base 顶层 import kraken_bridge，会成环），运行时延迟导入探测；
+    导入失败（异常宿主/测试桩）按无识别处理照常扩容。"""
+    try:
+        from api_base import recognition_in_flight
+    except Exception:
+        return
+    started = time.time()
+    first = True
+    while time.time() - started < PREWARM_YIELD_CAP_S:
+        if not recognition_in_flight():
+            if not first:
+                log(
+                    f"识别闸门已放空，继续预热扩容（让路 "
+                    f"{time.time() - started:.0f}s）"
+                )
+            return
+        if first:
+            first = False
+            log("识别在途，预热扩容让路等待…")
+        time.sleep(PREWARM_YIELD_POLL_S)
+    if not first:
+        log(
+            f"让路等待到上限（{PREWARM_YIELD_CAP_S:.0f}s），照常扩容"
+            "（在途识别仍可能与模型加载争用 GPU）"
+        )
 
 
 
@@ -657,6 +698,9 @@ def _prewarm_pool_inner(pool: _DaemonPool) -> None:
             return
 
         def _start_extra(index: int) -> None:
+            # 识别在途先让路：CUDA 模型加载与在途推理抢同一块 GPU
+            # （VL 整页直读被启动预热扩容挤到分钟级的实测根因）。
+            _wait_recognition_idle()
             tag = f"k{index}"
             extra = _spawn_daemon(tag)
             try:

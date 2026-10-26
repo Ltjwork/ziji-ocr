@@ -39,6 +39,12 @@ class Win32Window {
   // Show the current window. Returns true if the window was successfully shown.
   bool Show();
 
+  // 确保窗口可见（SW_SHOW 不改变尺寸状态）。由 CreateProcess 带
+  // STARTF_USESHOWWINDOW/SW_HIDE 拉起时（如 Dart 的 Process.start），
+  // 第一次 ShowWindow 的参数会被启动信息吞掉而保持隐藏，这里二次强制
+  // 显示，使任何启动器拉起的窗口都可见。
+  bool EnsureVisible();
+
   // Release OS resources associated with window.
   void Destroy();
 

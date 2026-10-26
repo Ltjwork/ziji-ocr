@@ -297,9 +297,10 @@ class SegmenterGeometryTests(unittest.TestCase):
         result = {
             "lines": [
                 {"id": "l0", "x": 10, "y": 20, "w": 12, "h": 70,
-                 "orientation": "vertical", "chars": [
+                 "orientation": "vertical", "text": "甲乙",
+                 "chars": [
                      {"id": "c0", "x": 10, "y": 20, "w": 12, "h": 20, "text": "甲"},  # 中心在区域内
-                     {"id": "c1", "x": 10, "y": 45, "w": 12, "h": 20, "text": "乙"},  # 中心在区域外
+                     {"id": "c1", "x": 10, "y": 45, "w": 12, "h": 20, "text": "乙"},  # 阅读轴中心在区域外 → 裁掉
                  ]},
                 {"id": "l1", "x": 70, "y": 20, "w": 12, "h": 70, "chars": []},
             ],
@@ -307,11 +308,78 @@ class SegmenterGeometryTests(unittest.TestCase):
         }
         filtered = filter_result_to_region(result, (0, 0, 40, 40))
         self.assertEqual(["l0"], [line["id"] for line in filtered["lines"]])
-        # 整行保留：区域外的字不再被裁掉
+        line = filtered["lines"][0]
+        # 按区域沿阅读轴（纵向）裁行：区域外的字不再随整行带入（整页检测
+        # 的行是整列高度、跨相邻段落，整行保留曾把邻段文字混进本段）
+        self.assertEqual([c["text"] for c in line["chars"]], ["甲"])
+        self.assertEqual(line["text"], "甲")
+        # 行框纵向收到区域内
+        self.assertEqual((line["y"], line["h"]), (20, 20))
+        self.assertEqual(1, len(filtered["blocks"]))
+
+    def test_region_filter_drops_line_without_region_chars(self):
+        """外扩巨框的行（如页首横排标题被纵向拉成整页高）即使行中心落进
+        区域，字全在区域阅读轴范围外时整行不返回。"""
+        result = {
+            "lines": [
+                # 巨框行：中心 (30, 30) 在区域 (0,0,40,40) 内，但字在区域下方
+                {"id": "mega", "x": 0, "y": 0, "w": 60, "h": 60,
+                 "orientation": "vertical", "chars": [
+                     {"id": "m0", "x": 10, "y": 50, "w": 12, "h": 20, "text": "题"},
+                 ]},
+            ],
+            "blocks": [],
+        }
+        filtered = filter_result_to_region(result, (0, 0, 40, 40))
+        self.assertEqual([], [line["id"] for line in filtered["lines"]])
+        self.assertEqual([], filtered["blocks"])
+
+    def test_region_filter_keeps_cross_axis_whole_line(self):
+        """跨轴（横向）整行保留：字横向偏出区域（列贴着区域边）不裁，
+        阅读轴在区域内即保留整字的行内容。"""
+        result = {
+            "lines": [
+                {"id": "l0", "x": 30, "y": 0, "w": 20, "h": 40,
+                 "orientation": "vertical", "text": "甲乙",
+                 "chars": [
+                     # 字横向越过区域右缘（x 中心 45 > 40）但纵向在区域内
+                     {"id": "c0", "x": 35, "y": 0, "w": 20, "h": 20, "text": "甲"},
+                     {"id": "c1", "x": 35, "y": 20, "w": 20, "h": 20, "text": "乙"},
+                 ]},
+            ],
+            "blocks": [],
+        }
+        filtered = filter_result_to_region(result, (0, 0, 40, 40))
+        self.assertEqual(["l0"], [line["id"] for line in filtered["lines"]])
+        # 横向不裁：两个字都保留；行框横向不变
         self.assertEqual(
             [c["text"] for c in filtered["lines"][0]["chars"]], ["甲", "乙"]
         )
-        self.assertEqual(2, len(filtered["blocks"]))
+        self.assertEqual(filtered["lines"][0]["x"], 30)
+
+    def test_extend_region_ink_skips_cross_orientation_lines(self):
+        """竖排页里的横排标题行不沿页面阅读轴（纵向）外扩：其行带下方
+        的正文列墨迹会被当成"本行墨迹"，标题被拉成整页高巨框。"""
+        mask = np.zeros((100, 200), dtype=np.uint8)
+        # 横排标题行 y 10..20（x 在竖排列行带之外）；竖排列墨迹 y 40..90
+        mask[10:20, 100:180] = 1
+        mask[40:90, 40:70] = 1
+        result = {
+            "lines": [
+                {"id": "h0", "x": 100, "y": 10, "w": 80, "h": 10,
+                 "orientation": "horizontal", "chars": []},
+                {"id": "v0", "x": 40, "y": 40, "w": 20, "h": 20,
+                 "orientation": "vertical", "chars": []},
+            ],
+        }
+        out = extend_lines_to_region_ink(
+            result, (0, 0, 200, 100), mask, "vertical")
+        by_id = {l["id"]: l for l in out["lines"]}
+        # 横排行保持原框（不被纵向拉长吞进正文列墨迹）
+        self.assertEqual((by_id["h0"]["y"], by_id["h0"]["h"]), (10, 10))
+        # 竖排列正常沿区域内墨迹外扩（pad=2）
+        self.assertEqual(by_id["v0"]["y"], 38)
+        self.assertEqual(by_id["v0"]["h"], 54)
 
     def test_expected_count_prefers_line_ocr_when_geometry_conflicts(self):
         count, source, _ = _choose_expected_count((0, 0, 40, 500), 9)

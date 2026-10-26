@@ -21,7 +21,7 @@ import imaging
 import registry_io
 from train_data import (LAYER_INFO, SERVICE_DIR, WORKER_PATH, trained_root_dir,
     _layer_default_model, _log, _annotation_pages, _is_confirmed, h_dir)
-from train_registry import (active_model_path, list_models,
+from train_registry import (active_model_path, list_models, read_run_meta,
     _load_registry, _save_registry)
 from train_worker import list_checkpoints
 
@@ -31,9 +31,43 @@ from train_worker import list_checkpoints
 
 # ────────────────────────── 训练任务 ──────────────────────────
 
+# ultralytics 训练进度行（verbose 写进 train_log.txt，tqdm 刷新带 ESC[K）：
+#   ...      1/150      6.49G     0.2683 ...      79       1280: 50% ━━━━── 2291/4572 8.4it/s
+#   ↑ epoch/epochs   GPU 显存    各项损失      实例数  imgsz:  进度条   batch/总数
+# 一条正则同时抓 epoch 与本轮 batch 进度（取日志尾部最后一次匹配）。
+_YOLO_STEP_RE = re.compile(
+    r"(\d+)/(\d+)\s+[\d.]+[MG]\s[^\n:]{0,200}:\s*\d+%[^\d]*?(\d+)/(\d+)")
+
+
+def _parse_yolo_steps(text: str) -> tuple[int, int, int, int] | None:
+    """从日志文本解析最近一次进度行 → (epoch, epochs, batch, batches)。
+
+    匹配不到（启动阶段/分类任务早期/日志尚未写出）返回 None。"""
+    match = None
+    for match in _YOLO_STEP_RE.finditer(text):
+        pass
+    if match is None:
+        return None
+    epoch, epochs, batch, batches = (int(g) for g in match.groups())
+    if epochs <= 0 or batches <= 0 or batch > batches or epoch > epochs:
+        return None  # 防御畸形行（如初始化阶段的占位输出）
+    return epoch, epochs, batch, batches
+
+
+def _read_log_tail(path: str, max_bytes: int = 16384) -> str:
+    """读日志尾部一段文本（进度行每条 ~150B，16KB 覆盖最近上百次刷新）。"""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            f.seek(max(0, size - max_bytes))
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
 
 class _Task:
-    def __init__(self, task_id: str, layer: str, epochs: int, run_dir: str, base_model: str = ""):
+    def __init__(self, task_id: str, layer: str, epochs: int, run_dir: str,
+                 base_model: str = "", resumed: bool = False):
         self.id = task_id
         self.layer = layer
         self.epochs = epochs
@@ -43,14 +77,21 @@ class _Task:
         self.proc: subprocess.Popen | None = None
         self.status = "starting"  # starting | training | done | failed | stopped
         self.result: dict | None = None
+        # 断点续训：任务起点已完成的轮数（ETA 按本次续训新练的轮数估算，
+        # 否则 3 秒/119 轮 会算出"还剩 8 秒"的荒谬预计）。
+        self.resumed = resumed
+        self._base_done = 0
+        # 已完成轮数的时间戳采样（(时刻, 完成轮数)，最新在后）：估每轮
+        # 耗时与剩余时间用；由 _monitor 每 2s 轮询时追加，最多留 8 个。
+        self._epoch_marks: list[tuple[float, int]] = []
 
     def to_dict(self) -> dict:
-        progress = self._progress()
+        detail = self._progress_detail()
         return {
             "id": self.id,
             "layer": self.layer,
             "status": self.status,
-            "progress": progress,
+            "progress": detail["overall"],
             "epochs": self.epochs,
             "base_model": self.base_model,
             "started": self.started,
@@ -58,23 +99,110 @@ class _Task:
             "run_dir": self.run_dir,
             "result": self.result,
             "log_tail": self._log_tail(),
+            "resumed": self.resumed,
+            # ── 训练进度明细（前端显示"本轮进度 + 预计完成时间"用）──
+            "epoch": detail["epoch"],
+            "epoch_progress": detail["epoch_progress"],  # 本轮内 0..1，None=未知
+            "batch": detail["batch"],  # {"cur": n, "total": m}，None=未知
+            "sec_per_epoch": detail["sec_per_epoch"],
+            "eta_seconds": detail["eta_seconds"],
+            # 最近一个已落盘的存档轮（epoch{N}.pt；写完静置才算，防读到半截），
+            # 前端据此触发"存档轮测试页识别"。
+            "checkpoint_epoch": self._checkpoint_epoch(),
         }
 
-    def _progress(self) -> float:
-        if self.status in ("done", "failed", "stopped"):
-            return 1.0 if self.status == "done" else self._csv_progress()
-        return self._csv_progress()
-
-    def _csv_progress(self) -> float:
+    def _csv_rows(self) -> int:
+        """results.csv 已写出的轮数（每完成一轮追加一行）。"""
         csv_path = os.path.join(self.run_dir, "train", "results.csv")
         if not os.path.exists(csv_path):
-            return 0.0
+            return 0
         try:
             with open(csv_path, encoding="utf-8") as f:
-                rows = sum(1 for _ in f) - 1
-            return min(1.0, max(0.0, rows / max(1, self.epochs)))
-        except Exception:
-            return 0.0
+                return max(0, sum(1 for _ in f) - 1)
+        except OSError:
+            return 0
+
+    def _progress_detail(self) -> dict:
+        """进度明细：总体/当前轮/每轮耗时/预计剩余。
+
+        总体进度 = (已完成轮数 + 本轮内 batch 进度) / 总轮数——比只数
+        CSV 行（上一版）更平滑，轮内也能看到推进。"""
+        done = self._csv_rows()
+        finished = self.status in ("done", "failed", "stopped")
+        steps = None
+        if not finished:
+            steps = _parse_yolo_steps(
+                _read_log_tail(os.path.join(self.run_dir, "train_log.txt")))
+        if steps is not None:
+            epoch, _, batch, batches = steps
+            batch_frac = batch / batches
+            # 日志轮数是 1 基"正在训练第 N 轮"；已完成 = N-1+本轮内进度。
+            # 与 CSV 行数取大：CSV 在验证结束才落行，日志略超前。
+            done = max(done, min(epoch - 1 + batch_frac, self.epochs))
+            epoch_progress = batch_frac
+            batch_info = {"cur": batch, "total": batches}
+            cur_epoch = min(epoch, self.epochs)
+        else:
+            epoch_progress = None
+            batch_info = None
+            cur_epoch = min(done + (0 if finished else 1), self.epochs) or None
+        overall = 1.0 if self.status == "done" else min(1.0, done / max(1, self.epochs))
+
+        sec_per_epoch = None
+        marks = self._epoch_marks
+        if len(marks) >= 2 and marks[-1][1] > marks[0][1]:
+            span = marks[-1][0] - marks[0][0]
+            rows = marks[-1][1] - marks[0][1]
+            if span > 0 and rows > 0:
+                sec_per_epoch = span / rows
+        eta = None
+        if not finished and overall > 0.005:
+            remaining = self.epochs - done
+            if sec_per_epoch is not None and remaining > 0:
+                eta = sec_per_epoch * remaining
+            else:
+                # 还没攒够两个轮界采样：按本次任务已新练的轮数平均耗时外推
+                # （续训任务从基线轮数起算——否则启动 1 分钟/已"完成"119 轮
+                # 会算出荒谬的预计；练得还不够看时先不给预计）。
+                progressed = done - self._base_done
+                if progressed > 0.05 and remaining > 0:
+                    eta = (time.time() - self.started) / progressed * remaining
+        return {
+            "overall": round(max(0.0, min(1.0, overall)), 4),
+            "epoch": cur_epoch,
+            "epoch_progress": (round(epoch_progress, 4)
+                               if epoch_progress is not None else None),
+            "batch": batch_info,
+            "sec_per_epoch": (round(sec_per_epoch, 1)
+                              if sec_per_epoch is not None else None),
+            "eta_seconds": (round(eta, 1) if eta is not None else None),
+        }
+
+    def _checkpoint_epoch(self) -> int | None:
+        """最新存档轮号（epoch{N}.pt 落盘且静置 ≥5s——torch.save 写大文件
+        需要数秒，避免前端立刻拿去加载读到半截文件）。"""
+        weights = os.path.join(self.run_dir, "train", "weights")
+        best: tuple[int, float] | None = None
+        try:
+            names = os.listdir(weights)
+        except OSError:
+            return None
+        now = time.time()
+        for name in names:
+            m = re.fullmatch(r"epoch(\d+)\.pt", name)
+            if not m:
+                continue
+            path = os.path.join(weights, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if now - mtime < 5.0:
+                continue  # 可能仍在写入
+            epoch = int(m.group(1))
+            if best is None or epoch > best[0]:
+                best = (epoch, mtime)
+        return best[0] if best else None
 
     def _log_tail(self, n: int = 30) -> list[str]:
         log_path = os.path.join(self.run_dir, "train_log.txt")
@@ -103,9 +231,18 @@ _TASK_COUNTER = 0
 def _monitor(task: _Task) -> None:
     """轮询子进程状态，结束后读 done.json 判定成败并登记注册表。"""
     assert task.proc is not None
+    last_rows = -1
     while task.proc.poll() is None:
-        if task.status == "starting" and task._csv_progress() > 0:
-            task.status = "training"
+        rows = task._csv_rows()
+        if rows > 0:
+            # 只从 starting 推进（stop 置的 stopped 不被覆盖回 training）
+            if task.status == "starting":
+                task.status = "training"
+            if rows != last_rows:
+                # 轮界采样：估每轮耗时/剩余时间的依据（见 _progress_detail）
+                task._epoch_marks.append((time.time(), rows))
+                del task._epoch_marks[:-8]
+                last_rows = rows
         time.sleep(2.0)
     done_path = os.path.join(task.run_dir, "done.json")
     if os.path.exists(done_path):
@@ -183,6 +320,78 @@ def start_training(
     ]
     log_file = open(os.path.join(run_dir, "train_log.txt"), "w", encoding="utf-8")
     _log(f"start training {layer}: {' '.join(cmd)}")
+    task.proc = subprocess.Popen(
+        cmd,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        cwd=SERVICE_DIR,
+    )
+    log_file.close()
+    threading.Thread(target=_monitor, args=(task,), daemon=True).start()
+    return task.to_dict()
+
+
+
+
+def resume_training(layer: str, run_dir: str, device: str = "auto") -> dict:
+    """断点续训：从 <run_dir>/train/weights/last.pt 继续上次中断的训练。
+
+    总轮数/数据集/增强/保存目录以检查点内保存的原始参数为准
+    （ultralytics resume 语义：check_resume 用 ckpt_args 整体替换参数，
+    只有 device 等白名单项可覆写），产物继续写回原 run 目录，曲线/注册表
+    按同一 run 累计。第 1 轮结束前中断（还没有 last.pt）或已正常完成
+    （done.json 存在）的 run 不可续训。
+    """
+    global _TASK_COUNTER
+    if layer not in LAYER_INFO:
+        raise ValueError(f"unknown layer: {layer}")
+    if LAYER_INFO[layer]["task"] == "siamese":
+        raise ValueError("墨迹比对模型不支持断点续训")
+    run_dir = os.path.abspath(run_dir)
+    last_pt = os.path.join(run_dir, "train", "weights", "last.pt")
+    if not os.path.isfile(last_pt):
+        raise ValueError(
+            "该训练还没有可续训的检查点（last.pt 不存在——第 1 轮结束前"
+            "中断的只能重新开始）"
+        )
+    if os.path.exists(os.path.join(run_dir, "done.json")):
+        raise ValueError("该训练已正常完成，无需续训（可直接启用或重新训练）")
+    meta = read_run_meta(run_dir)
+    try:
+        epochs = int(meta.get("epochs") or 0)
+    except ValueError:
+        epochs = 0
+    if epochs <= 0:
+        raise ValueError("无法读取原训练的总轮数（train/args.yaml 缺失），不能续训")
+    data_hint = meta.get("data") or ""
+    base_hint = meta.get("model") or ""
+    task_kind = LAYER_INFO[layer]["task"]
+    with _TASK_LOCK:
+        running = [t for t in _TASKS.values() if t.status in ("starting", "training")]
+        if running:
+            raise RuntimeError(f"已有训练任务在进行中: {running[0].id} ({running[0].layer})")
+        _TASK_COUNTER += 1
+        task_id = f"train_{int(time.time())}_{_TASK_COUNTER}"
+        task = _Task(task_id, layer, epochs, run_dir,
+                     base_model=base_hint, resumed=True)
+        # ETA 基线：续训前已完成的轮数（本次耗时只对新增轮数计）
+        task._base_done = task._csv_rows()
+        _TASKS[task_id] = task
+
+    cmd = [
+        sys.executable,
+        WORKER_PATH,
+        "--task", task_kind,
+        "--base", last_pt,
+        "--resume",
+        "--device", device,
+        "--run-dir", run_dir,
+    ]
+    if data_hint:
+        cmd += ["--data", data_hint]
+    # 续训练志接在原日志后面（"w" 会把上次中断前的日志清掉）
+    log_file = open(os.path.join(run_dir, "train_log.txt"), "a", encoding="utf-8")
+    _log(f"resume training {layer}: {' '.join(cmd)}")
     task.proc = subprocess.Popen(
         cmd,
         stdout=log_file,

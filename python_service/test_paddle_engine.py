@@ -20,6 +20,7 @@ from api_segment import (
     SegmentRegionRequest,
     SegmentRequest,
 )
+import paddle_bridge
 import paddle_proc
 from paddle_bridge import PaddleEngineAdapter, _synthesize_seq_chars
 
@@ -623,6 +624,38 @@ class LineModelFallbackTests(unittest.TestCase):
         self.assertGreaterEqual(paddle_proc.read_timeout(), 300.0)
 
 
+class VlSpottingTimeoutTests(unittest.TestCase):
+    """表格识别 VL spotting 的交互档超时：不等 read_page 的 900s 后台
+    预算烧满才回落（2026-10-23 实测显存被挤时 spotting 900s 零成功，
+    单次表格识别 917s；交互预算超时后回落逐字/序列读 ~10s 出结果）。"""
+
+    def test_spot_timeout_is_interactive_budget(self):
+        # 默认档显著小于直读的 900s（env 未设时 180s）。
+        self.assertLessEqual(paddle_bridge.SPOT_TIMEOUT,
+                             paddle_proc.read_timeout())
+        self.assertLess(paddle_bridge.SPOT_TIMEOUT, 600.0)
+
+    def test_spotting_request_uses_spot_timeout(self):
+        captured: dict = {}
+
+        class _Pool:
+            size = 1
+            planned = 1
+
+            def request(self, op, payload=None, timeout=None):
+                captured["op"] = op
+                captured["timeout"] = timeout
+                return {"boxes": [], "texts": [], "confs": []}
+
+        with patch.object(paddle_proc, "ensure_pool", return_value=_Pool()):
+            paddle_bridge.vl_spotting_read(
+                "page.png", {"x": 1, "y": 2, "w": 3, "h": 4},
+                model="PaddleOCR-VL-1.6",
+            )
+        self.assertEqual(captured["op"], "read_spotting")
+        self.assertEqual(captured["timeout"], paddle_bridge.SPOT_TIMEOUT)
+
+
 class VlConfigTests(unittest.TestCase):
     """VL 解析配置（官网演示同款开关）：归一（白名单+默认值）与池签名。"""
 
@@ -675,6 +708,78 @@ class EnsurePoolFirstBuildTests(unittest.TestCase):
                     paddle_proc._pool = None
                     paddle_proc._pool_model = ""
                     paddle_proc._pool_vl_sig = ""
+
+
+
+class VlSpottingTests(unittest.TestCase):
+    """VL spotting（表格识别的质量源）：结果树提取与区域读的坐标偏移。"""
+
+    def test_find_spotting_res_through_wrappers(self):
+        from paddle_worker import _find_spotting_res
+
+        sp = {"rec_polys": [[[0, 0], [9, 0], [9, 9], [0, 9]]],
+              "rec_texts": ["甲"]}
+        # 官网 API 形态：layoutParsingResults[0].prunedResult.spotting_res
+        wrapped = {"layoutParsingResults": [{"prunedResult": {"spotting_res": sp}}]}
+        self.assertIs(_find_spotting_res(wrapped), sp)
+        # 本地 res 包装 / 顶层直挂 / 列表内嵌都命中
+        self.assertIs(_find_spotting_res({"res": {"spotting_res": sp}}), sp)
+        self.assertIs(_find_spotting_res(sp), sp)
+        self.assertIs(_find_spotting_res([{"a": 1}, {"spotting_res": sp}]), sp)
+        self.assertIsNone(_find_spotting_res({"parsing_res_list": []}))
+
+    def test_read_spotting_offsets_boxes_to_absolute(self):
+        from PIL import Image
+
+        import paddle_worker as pw
+
+        with TemporaryDirectory() as tmp:
+            img_path = os.path.join(tmp, "page.png")
+            Image.new("RGB", (80, 60), "white").save(img_path)
+
+            class _FakeVlPipe:
+                def predict(self, input=None, **kw):
+                    self.kwargs = kw
+                    # 裁剪图内的 poly（(5,5)-(14,14)），期望偏移回 (100,80) 起
+                    yield {
+                        "prunedResult": {
+                            "spotting_res": {
+                                "rec_polys": [
+                                    [[5, 5], [14, 5], [14, 14], [5, 14]]
+                                ],
+                                "rec_texts": ["戊、癸"],
+                                "rec_scores": [0.98],
+                            }
+                        }
+                    }
+
+            with patch.object(pw, "_MODEL_NAME", "PaddleOCR-VL-1.6"),                     patch.object(pw, "VL_MODEL_NAMES", {"PaddleOCR-VL-1.6"}),                     patch.object(
+                        pw, "_load_model", return_value=_FakeVlPipe()
+                    ):
+                result = pw._op_read_spotting(
+                    _FakeVlPipe(),
+                    {"image_path": img_path,
+                     "rect": {"x": 100, "y": 80, "w": 80, "h": 60}},
+                )
+        self.assertEqual(result["texts"], ["戊、癸"])
+        self.assertEqual(result["confs"], [0.98])
+        self.assertEqual(result["boxes"], [{"x": 105, "y": 85, "w": 9, "h": 9}])
+
+    def test_read_spotting_rejects_non_vl(self):
+        import paddle_worker as pw
+
+        with patch.object(pw, "_MODEL_NAME", "PP-OCRv6_small_rec"):
+            with self.assertRaises(ValueError):
+                pw._op_read_spotting(
+                    object(), {"image_path": "x.png", "rect": {}}
+                )
+
+    def test_is_vl_model_catalog(self):
+        from paddle_bridge import is_vl_model
+
+        self.assertTrue(is_vl_model("PaddleOCR-VL-1.6"))
+        self.assertFalse(is_vl_model("PP-OCRv6_small_rec"))
+        self.assertFalse(is_vl_model(None))
 
 
 if __name__ == "__main__":

@@ -46,6 +46,12 @@ class ProjectSettings {
   String engine; // 识别引擎：'kraken'（默认）| 'paddle'（PaddleOCR）
   String paddleModel; // paddle 引擎的识别模型（PP-OCRv6_*_rec），kraken 时忽略
 
+  // 整页直读（文本视图）「排除页眉页脚」开关：开 = 识别后剔除落在排除类
+  // 版面区（页眉/页脚/页码/插图/表格/卦图，与标注管线「只识别正文」同
+  // 口径）内的行。书级设置；VL 模型自身的辅助内容忽略（vlParse* 开关）
+  // 独立生效，两者互不影响。默认关 = 历史行为（整页全读）。
+  bool readExcludeHeaderFooter;
+
   // PaddleOCR-VL 解析配置（官网演示同款开关，仅 engine=paddle 且模型为
   // VL 时用于整页直读；书级设置，池按模型+配置绑定）。默认值 = 历史行为。
   bool vlUseDocOrientation; // 文档方向分类
@@ -81,6 +87,7 @@ class ProjectSettings {
     this.verticalDir = 'ttb',
     this.engine = 'kraken',
     this.paddleModel = 'PP-OCRv6_small_rec',
+    this.readExcludeHeaderFooter = false,
     this.vlUseDocOrientation = false,
     this.vlUseDocUnwarping = false,
     this.vlUseLayoutDetection = false,
@@ -158,6 +165,7 @@ class ProjectSettings {
       verticalDir: j['vertical_dir'] as String? ?? 'ttb',
       engine: engine,
       paddleModel: j['paddle_model'] as String? ?? 'PP-OCRv6_small_rec',
+      readExcludeHeaderFooter: j['read_exclude_header_footer'] == true,
       vlUseDocOrientation: j['vl_use_doc_orientation_classify'] == true,
       vlUseDocUnwarping: j['vl_use_doc_unwarping'] == true,
       vlUseLayoutDetection: j['vl_use_layout_detection'] == true,
@@ -195,6 +203,7 @@ class ProjectSettings {
     'vertical_dir': verticalDir,
     'engine': engine,
     'paddle_model': paddleModel,
+    if (readExcludeHeaderFooter) 'read_exclude_header_footer': true,
     if (vlUseDocOrientation) 'vl_use_doc_orientation_classify': true,
     if (vlUseDocUnwarping) 'vl_use_doc_unwarping': true,
     if (vlUseLayoutDetection) 'vl_use_layout_detection': true,
@@ -224,6 +233,7 @@ class ProjectSettings {
     String? verticalDir,
     String? engine,
     String? paddleModel,
+    bool? readExcludeHeaderFooter,
     bool? vlUseDocOrientation,
     bool? vlUseDocUnwarping,
     bool? vlUseLayoutDetection,
@@ -251,6 +261,7 @@ class ProjectSettings {
     verticalDir: verticalDir ?? this.verticalDir,
     engine: engine ?? this.engine,
     paddleModel: paddleModel ?? this.paddleModel,
+    readExcludeHeaderFooter: readExcludeHeaderFooter ?? this.readExcludeHeaderFooter,
     vlUseDocOrientation: vlUseDocOrientation ?? this.vlUseDocOrientation,
     vlUseDocUnwarping: vlUseDocUnwarping ?? this.vlUseDocUnwarping,
     vlUseLayoutDetection: vlUseLayoutDetection ?? this.vlUseLayoutDetection,
@@ -739,10 +750,13 @@ class RegionLabel {
   static const marginNote = 'margin_note';
   static const figure = 'figure';
   static const table = 'table';
+  static const hexagram = 'hexagram';
 
   /// 词表顺序 = 训练类别 id 顺序（YoloExporter region 层按此映射 classId）。
   /// figure/table（+83 表格识别）暂无训练数据、旧模型不产出，人工确认
   /// 的框会进入 region_det 训练集，积累够了即可训出自动检测。
+  /// hexagram（+易经卦图电子化插件）：卦图区由用户手画，插件按划区
+  /// 识别，不做整页自动检测。
   static const all = <String>[
     mainText,
     header,
@@ -751,6 +765,7 @@ class RegionLabel {
     marginNote,
     figure,
     table,
+    hexagram,
   ];
 
   /// 词表外/缺省一律归 main_text（与 Python 侧 name_index 缺省同口径，
@@ -766,19 +781,23 @@ class RegionLabel {
         marginNote => '眉批',
         figure => '图片',
         table => '表格',
+        hexagram => '卦图',
         _ => '正文',
       };
 
   /// 编辑器配色（dart:ui Color，数据模型不依赖 Material；正文沿用旧主区
-  /// deepPurple，眉批/段注避开 cyan/teal）。
+  /// deepPurple，眉批/段注避开 cyan/teal）。页眉也必须避开青色系：
+  /// 段视图正文段框是 teal、段注是 cyan、行排序待定是 teal，页眉框在
+  /// 段/行视图作为底层常显参考，取青色会与段框混成同色。
   static Color color(String label) => switch (label) {
         mainText => const Color(0xFF673AB7),
-        header => const Color(0xFF0097A7),
+        header => const Color(0xFF1976D2),
         footer => const Color(0xFF78909C),
         pageNumber => const Color(0xFF2E7D32),
         marginNote => const Color(0xFF9E7C0C),
         figure => const Color(0xFF6D4C41),
         table => const Color(0xFFAD1457),
+        hexagram => const Color(0xFFBF360C),
         _ => const Color(0xFF673AB7),
       };
 
@@ -788,13 +807,15 @@ class RegionLabel {
       label == mainText || label == marginNote;
 
   /// 排除类：不作为正文边界（与 Python 侧 REGION_EXCLUDED_LABELS 同义；
-  /// 图/表区在后端字检测前被抹底色，格线/插图不再被误切成字）。
+  /// 图/表区在后端字检测前被抹底色，格线/插图不再被误切成字；卦图区
+  /// 的干支由易经插件按划区单独识别，不混进正文）。
   static bool isExcluded(String label) =>
       label == header ||
       label == footer ||
       label == pageNumber ||
       label == figure ||
-      label == table;
+      label == table ||
+      label == hexagram;
 }
 
 class MainRegion implements _RectBox {
@@ -933,6 +954,43 @@ class Paragraph implements _RectBox {
     if (boxConfirmed) 'box_confirmed': true,
     if (uid.isNotEmpty) 'uid': uid,
   };
+
+  /// 列带兜底认领：返回 [paras] 中"列带"含 [line] 中心且纵向距离最近的
+  /// 段；都不含则返回 null。
+  ///
+  /// 列带 = 竖排取段的 x 区间（行中心 x 落入）、横排取 y 区间。段框画得
+  /// 偏短、行框后来外扩时，行中心会掉出段框矩形——只按中心点认领会把
+  /// 同列正文行误当"未归属孤行"（序号校验对孤行按列表原序放行，乱序不
+  /// 标红）。同一列上下两截的段都含该列带时，按行中心到段框纵向边界的
+  /// 距离取最近，各认领各自那部分，不会互相吞并。
+  static Paragraph? nearestByColumnBand(
+    List<Paragraph> paras,
+    LineBlock line, {
+    required bool vertical,
+  }) {
+    final cx = line.x + line.w / 2;
+    final cy = line.y + line.h / 2;
+    Paragraph? best;
+    var bestDist = double.infinity;
+    for (final p in paras) {
+      final inBand = vertical
+          ? cx >= p.x && cx <= p.x + p.w
+          : cy >= p.y && cy <= p.y + p.h;
+      if (!inBand) continue;
+      final dist = vertical
+          ? (cy < p.y
+                ? p.y - cy
+                : (cy > p.y + p.h ? cy - (p.y + p.h) : 0.0))
+          : (cx < p.x
+                ? p.x - cx
+                : (cx > p.x + p.w ? cx - (p.x + p.w) : 0.0));
+      if (dist < bestDist) {
+        bestDist = dist;
+        best = p;
+      }
+    }
+    return best;
+  }
 }
 
 class PageAnnotation {
@@ -1552,8 +1610,8 @@ class PageAnnotation {
       !draftSaved &&
       (lines.any((l) => l.chars.isNotEmpty) || blocks.isNotEmpty);
 
-  /// 已确认的排除类版面区（页眉/页脚/页码/图/表）矩形：其中的行/字/
-  /// 段落框不参与内容层训练数据与本书计数（用户规则：页眉页脚只作为
+  /// 已确认的排除类版面区（页眉/页脚/页码/图/表/卦图）矩形：其中的行/
+  /// 字/段落框不参与内容层训练数据与本书计数（用户规则：页眉页脚只作为
   /// 版面标注训练 region_det）。proposed 候选不排除。与 Python 侧
   /// train_datasets.confirmed_excluded_regions 是同一协议的两半，两侧
   /// 判定（框中心点落在已确认排除类区内）必须保持一致。
@@ -1565,7 +1623,7 @@ class PageAnnotation {
   ];
 
   /// 框 (x,y,w,h) 的中心是否落在已确认排除类区内（页眉/页脚/页码/
-  /// 图/表）——内容层（段落/行/字）统计与导出排除的共用判定。
+  /// 图/表/卦图）——内容层（段落/行/字）统计与导出排除的共用判定。
   bool centerInConfirmedExcluded(int x, int y, int w, int h) {
     final cx = x + w / 2;
     final cy = y + h / 2;
@@ -1833,7 +1891,10 @@ class PageAnnotation {
       return;
     }
 
-    // 1. 手动段落优先认领中心点落在其矩形内的行
+    // 1. 手动段落优先认领中心点落在其矩形内的行；中心掉出段框但仍在段
+    //    列带内的行按 [Paragraph.nearestByColumnBand] 兜底认领——段框偏
+    //    短、行框外扩的正文列不再掉成"未归属孤行"（序号校验对孤行按列
+    //    表原序放行，行被级联插错位后整页乱序也不标红）
     final claimed = <String>{};
     final manualParas = paragraphs.where((p) => p.manual).toList();
     for (final p in manualParas) {
@@ -1848,8 +1909,24 @@ class PageAnnotation {
       }
       p.lineIds = members;
     }
+    for (final l in lines) {
+      if (claimed.contains(l.id)) continue;
+      final owner = Paragraph.nearestByColumnBand(
+        manualParas,
+        l,
+        vertical: orientation != 'horizontal',
+      );
+      if (owner != null) {
+        owner.lineIds.add(l.id);
+        l.paragraphId = owner.id;
+        claimed.add(l.id);
+      }
+    }
 
-    // 2. 未被手动段落认领的行 → 移除所有自动段落并重新聚类
+    // 2. 未被手动段落认领的行 → 移除所有自动段落并重新聚类；新自动段
+    //    按列位置插进段列表的阅读序对应处（rtl=插在首个中心 x 更靠左的
+    //    段之前），不再一律追加到末尾——追加会让段列表末尾的手动段（如
+    //    最左列）读序被压到新自动段之后，整页读序错乱且校验自洽看不出
     paragraphs.removeWhere((p) => !p.manual);
     for (final l in lines) {
       if (l.paragraphId.isNotEmpty && !claimed.contains(l.id)) {
@@ -1857,12 +1934,25 @@ class PageAnnotation {
       }
     }
     final unclaimed = lines.where((l) => !claimed.contains(l.id)).toList();
+    final autoStart = paragraphs.length;
     _clusterLinesIntoParagraphs(
       unclaimed,
       orientation: orientation,
       horizontalDir: horizontalDir,
       verticalDir: verticalDir,
     );
+    final freshAutos = paragraphs.sublist(autoStart);
+    if (freshAutos.isNotEmpty) {
+      paragraphs.removeRange(autoStart, paragraphs.length);
+      final ltr = horizontalDir == 'ltr';
+      for (final p in freshAutos) {
+        final pc = p.x + p.w / 2;
+        final idx = paragraphs.indexWhere(
+          (q) => ltr ? q.x + q.w / 2 > pc : q.x + q.w / 2 < pc,
+        );
+        paragraphs.insert(idx == -1 ? paragraphs.length : idx, p);
+      }
+    }
   }
 
   /// 删除段并连带删除其成员行与行内单字，返回删除的行数。

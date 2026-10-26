@@ -30,6 +30,14 @@ from kraken_bridge import (
 )
 import paddle_proc
 
+# 表格识别 VL spotting 的单请求超时（秒）：交互场景用户在界面等结果，
+# 预算远小于 read_page 的后台直读档（READ_TIMEOUT_VL=900s）。显存被
+# kraken 池挤爆时 VL 推理会挂到分钟级（2026-10-23 实测 spotting 900s
+# 烧满超时、历史日志零成功），超时后回落逐字/序列读法 ~10s 出结果，
+# 不能让用户干等 15 分钟。显存宽裕的健康机器 spotting 常见几十秒，
+# 180s 已留足余量；PADDLE_VL_SPOT_TIMEOUT 可调。
+SPOT_TIMEOUT = float(os.environ.get("PADDLE_VL_SPOT_TIMEOUT", "180"))
+
 
 def _synthesize_seq_chars(
     rect: dict, text: str, conf: float, orientation: str
@@ -311,6 +319,36 @@ def attach_page_text_ref(adapter, image_path: str) -> None:
     log(f"[page-ref] 整页参照就绪: 侧车 {len(lines)} 行")
 
 
+def is_vl_model(name: str | None) -> bool:
+    """模型是否为 PaddleOCR-VL 视觉语言模型（表格识别等按此分流：
+    VL 走 spotting 区域读，PP-OCR 系走行/字读法）。"""
+    return paddle_proc.normalize_model(name).startswith("PaddleOCR-VL")
+
+
+def vl_spotting_read(
+    image_path: str,
+    rect: dict,
+    model: str | None = None,
+    vl_config: dict | None = None,
+    vl_predict: dict | None = None,
+) -> dict:
+    """VL spotting 区域读（表格识别用，PaddleOCR 官网 Demo 同款能力）：
+    裁剪 rect → VL 文本检测与识别 → {"boxes","texts","confs"}（原图
+    绝对坐标）。[vl_config] 必须与文本视图同源传入——VL 池按（模型+
+    解析配置）绑定，缺省签名不同会与文本视图交替重建池。VL 池懒启动
+    （首请求含模型加载/下载）。非 VL 模型会抛 ValueError（调用方回落
+    行/字读法）。超时用交互档 SPOT_TIMEOUT（默认 180s，显存被挤时
+    快速回落逐字/序列读法，不烧 read_page 的 900s 后台预算）。"""
+    payload: dict = {"image_path": image_path, "rect": rect}
+    if vl_predict:
+        payload["vl_predict"] = vl_predict
+    return paddle_proc.ensure_pool(
+        paddle_proc.normalize_model(model), vl_config=vl_config,
+    ).request(
+        "read_spotting", payload, timeout=SPOT_TIMEOUT
+    )
+
+
 def read_page_text(
     image_path: str,
     orientation: str,
@@ -319,6 +357,8 @@ def read_page_text(
     model: str | None = None,
     vl_config: dict | None = None,
     vl_predict: dict | None = None,
+    gate_regions: list[dict] | None = None,
+    progress_token: str | None = None,
 ) -> dict:
     """整页直读（PaddleOCR det+rec 全管线），不走标注切分管线。
 
@@ -326,9 +366,19 @@ def read_page_text(
     排序行列表，阅读序由 page_text 按方向参数重排后拼接。vl_config 是
     VL 模型的解析配置（池绑定开关，书级设置）；vl_predict 是 predict
     级参数（Prompt 类型/生成参数/辅助内容忽略清单，随每次请求），非
-    VL 模型两者都忽略。"""
+    VL 模型两者都忽略。gate_regions：排除类版面区（文本视图「排除页
+    眉页脚」开关的输入，由 /read_page_text 预先算好传入），拼接前整行
+    剔除；None/空 = 不过滤（历史行为）。progress_token：进度登记
+    （read_progress），准备引擎/读字/拼接各阶段打点供客户端轮询；
+    None = 不登记。"""
     from page_text import lines_to_page_text
 
+    def _stage(stage: str, detail: str) -> None:
+        from read_progress import set_stage
+
+        set_stage(progress_token, stage, detail)
+
+    _stage("preparing", "加载 PaddleOCR 模型（首次/冷启动加载可达数分钟）…")
     adapter_model = paddle_proc.normalize_model(model)
     pool = paddle_proc.ensure_pool(adapter_model, vl_config=vl_config)
     payload: dict = {
@@ -341,12 +391,23 @@ def read_page_text(
     }
     if vl_predict:
         payload["vl_predict"] = vl_predict
+    _stage(
+        "reading",
+        "引擎读字中…（VL 为一整页一次推理；首读或显存被挤时可能数分钟）",
+    )
     result = pool.request(
         "read_page",
         payload,
         timeout=paddle_proc.read_timeout(),
     )
     lines = result.get("lines", [])
+    excluded_lines = 0
+    if gate_regions:
+        _stage("gating", "按版面区剔除页眉页脚行…")
+        from seg_layout import filter_page_text_lines
+
+        lines, excluded_lines = filter_page_text_lines(lines, gate_regions)
+    _stage("assembling", "按阅读序拼接整页文本…")
     text, ordered = lines_to_page_text(
         lines, orientation, horizontal_dir, vertical_dir
     )
@@ -355,6 +416,7 @@ def read_page_text(
         "lines": ordered,
         "engine": "paddle",
         "ocr": f"paddle+{adapter_model}",
+        "excluded_lines": excluded_lines,
     }
 
 

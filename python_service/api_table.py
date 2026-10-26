@@ -4,6 +4,8 @@
 两个端点全部只读——服务端不写 annotations，识别结果由 Flutter 端以
 proposed 状态落盘，人工校对后进训练集（与版面区预标注同一哲学）。
 """
+from typing import Optional
+
 from fastapi import HTTPException
 from pydantic import BaseModel
 
@@ -25,6 +27,15 @@ class RecognizeTableRequest(BaseModel):
     orientation: str = "vertical"
     horizontal_dir: str = "ltr"
     vertical_dir: str = "ttb"
+    # 识别引擎（与整页识别同一口径：'kraken' 默认 | 'paddle' =
+    # PaddleEngineAdapter，序列读法语境增强）。+161 表格识别接入引擎。
+    engine: str = "kraken"
+    paddle_model: Optional[str] = None
+    # VL 书的解析配置/predict 参数（与 /read_page_text 同源——vl_config
+    # 保证表格与文本视图共享同一个 VL 池；vl_predict 的 Prompt 类型被
+    # spotting 强制覆盖，其余生成参数沿用）。
+    vl_config: Optional[dict] = None
+    vl_predict: Optional[dict] = None
 
 
 @app.post("/detect_tables")
@@ -43,13 +54,18 @@ def detect_tables(req: DetectTablesRequest):
 @_gated_recognition("recognize_table")
 def recognize_table_endpoint(req: RecognizeTableRequest):
     """手动标记区域的表格识别：格线网格 + 每格文字（格内方向自动判定，
-    横竖版书页同一路径）。"""
+    横竖版书页同一路径；引擎随请求——书里选了 PaddleOCR 时表格同样用
+    Paddle 读法，不再固定 Kraken）。"""
     try:
         result = recognize_table(
             req.image_path, req.x, req.y, req.w, req.h,
             orientation=req.orientation,
             horizontal_dir=req.horizontal_dir,
             vertical_dir=req.vertical_dir,
+            engine=req.engine,
+            paddle_model=req.paddle_model,
+            vl_config=req.vl_config,
+            vl_predict=req.vl_predict,
         )
         if not result.get("ok"):
             raise HTTPException(status_code=422, detail=result.get("reason", "no grid"))

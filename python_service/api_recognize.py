@@ -18,6 +18,7 @@ import kraken_bridge
 import segmenter
 import char_cluster
 import char_verify
+import smart_merge
 import daemon_sizing
 import page_dewarp
 from imaging import imwrite_unicode
@@ -282,6 +283,140 @@ def char_clusters_batch(req: CharClustersBatchRequest):
         raise
     except Exception as e:
         print(f"[char_clusters_batch] error: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+class SmartMergeBox(BaseModel):
+    x: int
+    y: int
+    w: int
+    h: int
+
+
+class SmartMergeBlock(BaseModel):
+    id: str
+    x: int
+    y: int
+    w: int
+    h: int
+    confirmed: bool = False
+    box_confirmed: bool = False
+
+
+class SmartMergeLine(BaseModel):
+    # 行内阅读方向：ttb（竖排上→下，默认）/ btt / ltr / rtl；行按此
+    # 方向的阅读序给 blocks，模板与候选的配对方向须一致才可比。
+    dir: str = "ttb"
+    blocks: List[SmartMergeBlock]
+
+
+class SmartMergePage(BaseModel):
+    page_id: str
+    image_path: str
+    lines: List[SmartMergeLine]
+
+
+class SmartMergeScanRequest(BaseModel):
+    template_image_path: str
+    # 合并前的两个模板框（顺序不限，内部按 template_dir 归位阅读序）。
+    template_boxes: List[SmartMergeBox]
+    template_dir: str = "ttb"
+    threshold: float = smart_merge.DEFAULT_THRESHOLD
+    pages: List[SmartMergePage]
+
+
+@app.post("/smart_merge_scan")
+def smart_merge_scan(req: SmartMergeScanRequest):
+    """智能合并扫描：以一次手工合并的两框为模板，在多页的同行相邻
+    字框对中找同类墨迹（几何构型 + HOG 特征双门槛，见 smart_merge.py）。
+
+    已确认（confirmed / box_confirmed）的框恒不参与；返回按 score 升
+    序、同页互斥的匹配对，由前端按与手工合并相同口径批量合并。纯
+    CPU，不与识别抢 GPU 门。
+    """
+    if len(req.template_boxes) != 2:
+        raise HTTPException(status_code=400, detail="template_boxes must have 2 boxes")
+    if not req.pages:
+        raise HTTPException(status_code=400, detail="no pages")
+    if not os.path.exists(req.template_image_path):
+        raise HTTPException(status_code=400, detail="template image not found")
+    for page in req.pages:
+        if not os.path.exists(page.image_path):
+            raise HTTPException(status_code=400, detail="image not found")
+    try:
+        result = smart_merge.scan_smart_merge(
+            req.template_image_path,
+            [(b.x, b.y, b.w, b.h) for b in req.template_boxes],
+            req.template_dir,
+            req.pages,
+            threshold=req.threshold,
+        )
+        print(
+            f"[smart_merge_scan] pages={len(req.pages)} "
+            f"matches={len(result['matches'])} threshold={req.threshold} "
+            f"failed={len(result['failed_pages'])} "
+            f"elapsed={result['elapsed_ms']:.0f}ms",
+            flush=True,
+        )
+        return result
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[smart_merge_scan] error: {e}", flush=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+class SmartSplitScanRequest(BaseModel):
+    template_image_path: str
+    # 手工 Alt 拆分前的原框（一个框里挤了两个字的那只框）。
+    template_box: SmartMergeBox
+    threshold: float = smart_merge.DEFAULT_THRESHOLD
+    pages: List[SmartMergePage]
+
+
+@app.post("/smart_split_scan")
+def smart_split_scan(req: SmartSplitScanRequest):
+    """智能分割扫描：以一次手工 Alt 拆分前的原框为模板，在多页字框中
+    找同类墨迹的单框（HOG 含宽高比惩罚，见 smart_merge.scan_smart_split）。
+
+    与 /smart_merge_scan 同一套 pages 结构；已确认的框恒不参与。命中
+    由前端按"同比例沿阅读轴一分为二"批量拆分（与手工拆分同口径）。
+    纯 CPU，不与识别抢 GPU 门。
+    """
+    if not req.pages:
+        raise HTTPException(status_code=400, detail="no pages")
+    if not os.path.exists(req.template_image_path):
+        raise HTTPException(status_code=400, detail="template image not found")
+    for page in req.pages:
+        if not os.path.exists(page.image_path):
+            raise HTTPException(status_code=400, detail="image not found")
+    try:
+        result = smart_merge.scan_smart_split(
+            req.template_image_path,
+            (req.template_box.x, req.template_box.y, req.template_box.w, req.template_box.h),
+            req.pages,
+            threshold=req.threshold,
+        )
+        print(
+            f"[smart_split_scan] pages={len(req.pages)} "
+            f"matches={len(result['matches'])} threshold={req.threshold} "
+            f"failed={len(result['failed_pages'])} "
+            f"elapsed={result['elapsed_ms']:.0f}ms",
+            flush=True,
+        )
+        return result
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"[smart_split_scan] error: {e}", flush=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

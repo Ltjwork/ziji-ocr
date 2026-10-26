@@ -1,6 +1,7 @@
 import 'dart:ui';
 
 import 'package:gujichazi/models/models.dart';
+import 'package:gujichazi/services/reading_order.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 /// 竖排分段：短列断段 + 列间距断段。
@@ -298,6 +299,147 @@ void main() {
       Paragraph.fromJson({'id': 'p2', 'x': 1, 'y': 2, 'w': 3, 'h': 4}).manual,
       isFalse,
     );
+  });
+
+  group('列带兜底认领（段框偏短、行框外扩，用户实测页回归）', () {
+    // 实测页：手动段框只罩住列顶（h 246），该列行框后来外扩到 h 624，
+    // 行中心掉出段框 → 正文列掉成"未归属孤行"。序号校验对孤行按列表
+    // 原序接尾放行，行被级联插错位后整页阅读序乱了也不标红。
+    test('中心掉出段框但仍在段列带内的行被认领', () {
+      final line = LineBlock(
+        id: 'l_tall',
+        x: 1483,
+        y: 247,
+        w: 105,
+        h: 624, // 段框只到 y 486，行中心 y 559 掉出框外
+        lineNo: 0,
+        orientation: 'vertical',
+      );
+      final ann = PageAnnotation(
+        pageId: 'p',
+        imagePath: 'x.png',
+        lines: [line],
+      );
+      ann.paragraphs.add(
+        Paragraph(id: 'p_top', x: 1483, y: 240, w: 97, h: 246, manual: true),
+      );
+      ann.rebuildParagraphs(orientation: 'vertical', horizontalDir: 'rtl');
+      expect(ann.paragraphs.firstWhere((p) => p.id == 'p_top').lineIds,
+          ['l_tall']);
+      expect(line.paragraphId, 'p_top');
+    });
+
+    test('同列上下两截的段按行中心纵向就近各认领各的', () {
+      final top = LineBlock(
+        id: 'l_top', x: 300, y: 100, w: 80, h: 200, lineNo: 0, orientation: 'vertical',
+      );
+      final bottom = LineBlock(
+        id: 'l_bottom', x: 300, y: 500, w: 80, h: 200, lineNo: 1, orientation: 'vertical',
+      );
+      final ann = PageAnnotation(
+        pageId: 'p',
+        imagePath: 'x.png',
+        lines: [top, bottom],
+      );
+      ann.paragraphs.addAll([
+        Paragraph(id: 'p_a', x: 300, y: 90, w: 90, h: 220, manual: true),
+        Paragraph(id: 'p_b', x: 300, y: 480, w: 90, h: 230, manual: true),
+      ]);
+      ann.rebuildParagraphs(orientation: 'vertical', horizontalDir: 'rtl');
+      expect(top.paragraphId, 'p_a');
+      expect(bottom.paragraphId, 'p_b');
+    });
+
+    test('独立列（页眉类）不在任何段列带内 → 不被正文手动段认领', () {
+      final header = LineBlock(
+        id: 'l_header', x: 60, y: 100, w: 40, h: 300, lineNo: 0, orientation: 'vertical',
+      );
+      final body = LineBlock(
+        id: 'l_body', x: 300, y: 100, w: 80, h: 400, lineNo: 1, orientation: 'vertical',
+      );
+      final ann = PageAnnotation(
+        pageId: 'p',
+        imagePath: 'x.png',
+        lines: [header, body],
+      );
+      ann.paragraphs.add(
+        Paragraph(id: 'p_body', x: 290, y: 90, w: 100, h: 430, manual: true),
+      );
+      ann.rebuildParagraphs(orientation: 'vertical', horizontalDir: 'rtl');
+      // 页眉列不被正文手动段认领，走自动分段单独成段
+      expect(header.paragraphId, isNot('p_body'));
+      expect(header.paragraphId, isNotEmpty);
+      expect(body.paragraphId, 'p_body');
+    });
+
+    test('回归：兜底认领后，被插错位的正文列在序号校验中标红（修复前静默放行）', () {
+      // 结构复刻实测页：右起第 1 列（长行）因段框偏短掉成孤行，级联把
+      // 它插在列表倒数第 2 位 → 修复前孤行按列表序接尾、序号完美连续、
+      // 不标红；修复后它被列带兜底认领进段，空间读序与序号的断口显形。
+      LineBlock col(int i, int x, int h) => LineBlock(
+        id: 'l_$i',
+        x: x,
+        y: 250,
+        w: 100,
+        h: h,
+        lineNo: i,
+        orientation: 'vertical',
+      );
+      final lines = [
+        col(0, 1500, 624), // 右起第 1 列（段框只罩列顶的"例如：寅"）
+        col(1, 1100, 1800),
+        col(2, 990, 220),
+        col(3, 550, 680),
+        col(4, 430, 2500),
+        col(5, 300, 190),
+        col(6, 190, 240), // 最左列
+      ];
+      final ann = PageAnnotation(pageId: 'p', imagePath: 'x.png', lines: lines);
+      ann.paragraphs.addAll([
+        Paragraph(id: 'p_a', x: 1495, y: 240, w: 100, h: 250, manual: true),
+        Paragraph(id: 'p_b', x: 1095, y: 250, w: 105, h: 1800, manual: true),
+        Paragraph(id: 'p_c', x: 985, y: 250, w: 100, h: 230, manual: true),
+        // 第 4~6 列走自动分段（manual=false，重建时重聚类）
+        Paragraph(id: 'p_f', x: 185, y: 250, w: 105, h: 235, manual: true),
+      ]);
+      ann.rebuildParagraphs(orientation: 'vertical', horizontalDir: 'rtl');
+      // 修复点：7 行全部归属段落（右起第 1 列不再掉成孤行）
+      expect(
+        ann.lines.every((l) => l.paragraphId.isNotEmpty),
+        isTrue,
+        reason: '列带兜底认领后不应再有未归属行',
+      );
+      // 新自动段按列位插进段列表（不追加到末尾）：级联后的 sortLinesInPlace
+      // 重排出的就是正确阅读序（最左列仍在最后）
+      ReadingOrderCalculator.sortLinesInPlace(
+        ann,
+        orientation: 'vertical',
+        horizontalDir: 'rtl',
+      );
+      expect(ann.lines.map((l) => l.id).toList(), [
+        'l_0', 'l_1', 'l_2', 'l_3', 'l_4', 'l_5', 'l_6',
+      ]);
+
+      // 级联插错位后的列表（长行在倒数第 2 位）：修复前校验静默通过，
+      // 修复后长行有段可依，空间读序与序号的断口显形 → 标红报警。
+      final scrambled = [lines[1], lines[2], lines[3], lines[4], lines[5],
+        lines[0], lines[6]];
+      expect(
+        ReadingOrderCalculator.orderBreakIds(
+          scrambled,
+          paragraphs: ann.paragraphs,
+        ),
+        isNotEmpty,
+      );
+      // 排序后的正确列表：校验通过
+      expect(
+        ReadingOrderCalculator.orderBreakIds(
+          ann.lines,
+          paragraphs: ann.paragraphs,
+        ),
+        isEmpty,
+      );
+    });
   });
 
   test('用户实际数据：9 行部分页（含已删列）force 重建为 3 个正确段落', () {

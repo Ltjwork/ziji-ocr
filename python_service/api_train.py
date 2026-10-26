@@ -410,6 +410,25 @@ def train_stop(req: TrainStopRequest):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+class TrainResumeRequest(BaseModel):
+    layer: str
+    run_dir: str  # 中断的训练 run 目录（train/weights/last.pt 所在）
+    device: str = "auto"  # 续训设备；轮数/数据以检查点内原始参数为准
+
+
+@app.post("/train/resume")
+def train_resume(req: TrainResumeRequest):
+    """断点续训：从中断 run 的 last.pt 继续（总轮数等沿用原设置）。"""
+    import training_service
+
+    try:
+        return training_service.resume_training(
+            req.layer, req.run_dir, device=req.device)
+    except Exception as exc:
+        print(f"[train/resume] error: {exc}", flush=True)
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
 
 
 @app.get("/models")

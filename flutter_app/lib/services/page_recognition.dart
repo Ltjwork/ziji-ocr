@@ -4,6 +4,7 @@ import '../models/models.dart';
 import 'ai_concurrency.dart';
 import 'ai_line_repair.dart';
 import 'ai_trace.dart';
+import 'book_region_apply.dart';
 import 'python_service.dart';
 import 'storage.dart';
 import 'ollama_service.dart';
@@ -66,6 +67,28 @@ Future<PageAnnotation> ensurePageAnnotation(
     horizontalDir: pageSettings.horizontalDir,
     verticalDir: pageSettings.verticalDir,
   );
+  // 表格区域兜底清场：门控只带走已确认（boxConfirmed）的排除类区，未
+  // 确认的表格区像素仍会被通用分割切成"单行/单字"混进结果——表格区
+  // 域的内容以表格识别（TableAnnotation）为准，识别后统一把区内通用
+  // 行删掉（首次识别无标注可清，此步为空操作）。
+  var tablePurgedLines = 0;
+  for (final region in ann.mainRegions) {
+    if (region.status != AnnotationStatus.rejected &&
+        RegionLabel.normalize(region.label) == RegionLabel.table) {
+      tablePurgedLines += BookRegionApply.removeLinesInRect(ann, region.rect);
+    }
+  }
+  if (tablePurgedLines > 0) {
+    ann.rebuildParagraphs(
+      orientation: pageSettings.orientation,
+      horizontalDir: pageSettings.horizontalDir,
+      verticalDir: pageSettings.verticalDir,
+    );
+    PythonService.addAppLog(
+      '[表格清场] 重识别后清理表格区域内通用行 $tablePurgedLines 条'
+      '（表格内容以表格识别为准）',
+    );
+  }
   // The project flag freezes whether this run may call AI, while the model
   // address/name remains a user setting.  Load the settings for both paths so
   // logs and the progress UI can tell an enabled run with no selected model

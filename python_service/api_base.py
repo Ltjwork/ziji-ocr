@@ -41,7 +41,7 @@ from segmenter import (
 
 
 
-BACKEND_BUILD = "model-manage-epochs-2026-10-15-v156"
+BACKEND_BUILD = "text-progress-2026-10-25-v170"
 
 
 
@@ -223,6 +223,57 @@ _recognition_exclusive = threading.Lock()
 
 _EXCLUSIVE_DRAIN_TIMEOUT = 300.0  # 独占等在途请求排空的上限（秒）
 
+# 在途识别的端点计数（acquire/release 同线程配对，线程本地记录回退量）。
+# 供后台预热/扩容让路判断（recognition_in_flight）：识别在途时再往同一
+# 块 GPU 压新的模型加载，会与在途推理抢显存/算力——实测启动预热扩容
+# 窗口（k1 就绪后并发拉起其余 daemon）撞上 VL 整页直读，直读被挤到
+# 分钟级。
+_recognition_inflight_lock = threading.Lock()
+_recognition_inflight: dict[str, int] = {}
+_recognition_held_local = threading.local()
+
+
+
+
+def recognition_in_flight(endpoint: str | None = None) -> bool:
+    """是否有识别请求在途；endpoint 给定时只查该端点。
+
+    后台预热/扩容（kraken_proc）据此让路：等在途识别完成再拉起新的
+    CUDA daemon，避免模型加载与在途推理抢同一块 GPU。"""
+    with _recognition_inflight_lock:
+        if endpoint is not None:
+            return _recognition_inflight.get(endpoint, 0) > 0
+        return any(v > 0 for v in _recognition_inflight.values())
+
+
+
+
+def _record_inflight(endpoint: str, n: int) -> None:
+    """槽位获取成功后记账：端点计数 +N，线程本地存回退量（release 用）。"""
+    with _recognition_inflight_lock:
+        _recognition_inflight[endpoint] = _recognition_inflight.get(endpoint, 0) + n
+    held = getattr(_recognition_held_local, "held", None) or []
+    held.append((endpoint, n))
+    _recognition_held_local.held = held
+
+
+
+
+def _forget_inflight(exclusive: bool) -> None:
+    """释放前回退本线程最近一次获取的端点计数（无配对记录时静默跳过
+    ——跨线程误用只退化记账精度，不影响槽位信号量本身）。"""
+    held = getattr(_recognition_held_local, "held", None) or []
+    if not held:
+        return
+    endpoint, n = held.pop()
+    _recognition_held_local.held = held
+    with _recognition_inflight_lock:
+        remaining = _recognition_inflight.get(endpoint, 0) - n
+        if remaining > 0:
+            _recognition_inflight[endpoint] = remaining
+        else:
+            _recognition_inflight.pop(endpoint, None)
+
 
 
 
@@ -254,6 +305,7 @@ def _acquire_recognition_slot(endpoint: str, exclusive: bool = False) -> None:
                 _recognition_slots.release()
             _recognition_exclusive.release()
             raise
+        _record_inflight(endpoint, _RECOGNITION_SLOTS)
         return
     if _recognition_exclusive.locked():
         # 有人正在（或正在等）独占——常规请求让路，避免独占者被饿死。
@@ -270,11 +322,13 @@ def _acquire_recognition_slot(endpoint: str, exclusive: bool = False) -> None:
             status_code=409,
             detail="已有识别任务正在进行中，请等它完成后再试",
         )
+    _record_inflight(endpoint, 1)
 
 
 
 
 def _release_recognition_slot(exclusive: bool = False) -> None:
+    _forget_inflight(exclusive)
     if exclusive:
         for _ in range(_RECOGNITION_SLOTS):
             _recognition_slots.release()

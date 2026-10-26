@@ -86,6 +86,11 @@ class ZijiPluginHostServices implements PluginHostServices {
             'pageCount': pr.imageFiles.length,
             'lastPageIndex': pr.lastPageIndex,
             'importPending': pr.importPending,
+            // 页号 = 图片文件名 stem（删页后下标与文件名错位，插件翻页
+            // 必须用这份映射算 pageId，不能拿下标拼 page_NNN）。
+            'pageIds': [
+              for (var i = 0; i < pr.imageFiles.length; i++) pr.pageIdAt(i),
+            ],
           },
         )
         .toList()
@@ -108,6 +113,21 @@ class ZijiPluginHostServices implements PluginHostServices {
       'draftSaved': ann.draftSaved,
       'boxesReviewed': ann.boxesReviewed,
       'mainRegionCount': ann.mainRegions.length,
+      // 画好的主区（卦图插件按 label=hexagram 取用户画的卦图区）。宿主↔
+      // 插件 JSON 字段只追加不改名。
+      'regions': [
+        for (final r in ann.mainRegions)
+          {
+            'id': r.id,
+            'x': r.x,
+            'y': r.y,
+            'w': r.w,
+            'h': r.h,
+            'label': r.label,
+            'status': r.status,
+            'boxConfirmed': r.boxConfirmed,
+          },
+      ],
       'lines': [
         for (final line in ann.lines)
           {

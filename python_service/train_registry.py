@@ -99,6 +99,73 @@ def scan_layer_runs(layer: str) -> list[str]:
     return out
 
 
+def read_run_meta(run_dir: str) -> dict:
+    """读 ultralytics 落盘的 train/args.yaml 摘要（断点续训取原始
+    轮数/数据集/基础模型用）。只取需要的标量键，yaml 结构变化也不炸。"""
+    meta: dict[str, str] = {}
+    path = os.path.join(run_dir, "train", "args.yaml")
+    if not os.path.exists(path):
+        return meta
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r"^(epochs|data|model|save_period|batch|imgsz):\s*(\S+)",
+                             line.strip())
+                if m:
+                    meta[m.group(1)] = m.group(2).strip("'\"")
+    except OSError:
+        pass
+    return meta
+
+
+def run_done_epochs(run_dir: str) -> int:
+    """run 已完成的轮数（train/results.csv 行数-1；siamese 布局同理）。"""
+    for rel in ("train", ""):
+        csv_path = os.path.join(run_dir, rel, "results.csv")
+        if not os.path.exists(csv_path):
+            continue
+        try:
+            with open(csv_path, encoding="utf-8") as f:
+                return max(0, sum(1 for _ in f) - 1)
+        except OSError:
+            return 0
+    return 0
+
+
+def resumable_run(layer: str) -> dict | None:
+    """该层最近一个可断点续训的 run：有 last.pt（≥1 轮）、没有 done.json
+    （未正常收尾——手动停止/崩溃/关机中断），按 last.pt 新旧取最新。
+    正在训练中的 run 也符合磁盘特征，由调用方按"已有任务在进行中"
+    语义排除。siamese 布局（best.pt 在 run 根目录、无优化器状态）不续训。"""
+    best: tuple[float, str] | None = None
+    for run_dir in scan_layer_runs(layer):
+        if os.path.exists(os.path.join(run_dir, "done.json")):
+            continue
+        last_pt = os.path.join(run_dir, "train", "weights", "last.pt")
+        if not os.path.exists(last_pt):
+            continue
+        try:
+            mtime = os.path.getmtime(last_pt)
+        except OSError:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, run_dir)
+    if best is None:
+        return None
+    run_dir = best[1]
+    meta = read_run_meta(run_dir)
+    try:
+        epochs = int(meta.get("epochs") or 0)
+    except ValueError:
+        epochs = 0
+    return {
+        "run_dir": run_dir,
+        "epochs": epochs or None,  # 总轮数（args.yaml 缺失时未知）
+        "done": run_done_epochs(run_dir),
+        "updated": best[0],
+    }
+
+
 def _better_run(a: dict, b: dict) -> dict:
     """同一 run_dir 的两条记录取一：有训练结果（metrics/epochs）的优先，
     都没有则 started 更新的优先。"""
@@ -287,6 +354,8 @@ def list_models() -> dict:
             "default": default_path,
             "active_started": entry.get("active_started")
             or (active_run or {}).get("started"),
+            # 断点续训入口：最近一个中断未收尾的 run（无则 None）
+            "resumable": resumable_run(layer),
         }
     # Kraken 整行识别引擎（"单字识别"）：当前 chat_rec.mlmodel 是否为
     # 微调版（与官方底座备份不一致即微调过）。

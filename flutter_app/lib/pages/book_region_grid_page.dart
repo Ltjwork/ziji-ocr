@@ -2506,7 +2506,7 @@ class _RegionQuickEditorPageState extends State<_RegionQuickEditorPage> {
   /// 框（页面像素坐标，画布与原图 1:1）。
   final Map<String, List<Rect>> _drafts = {};
 
-  // ── 页眉/页脚等非正文类别（快捷键 1~7 与编辑器主区视图同一词表）──
+  // ── 页眉/页脚等非正文类别（快捷键 1~8 与编辑器主区视图同一词表）──
   // 当前编辑类别 _activeLabel 里的第 _activeIndex 个框为"当前框"（橙色 +
   // 角点），其余框（含其它类别）细线显示、点框内即切换为当前框；
   // **-1 = 未选中**（点击空白取消选择，只有类别色细线、没有橙色框）。
@@ -3244,7 +3244,7 @@ class _RegionQuickEditorPageState extends State<_RegionQuickEditorPage> {
 
   // ── build ──
 
-  /// 快捷键 1~7 与小键盘 1~7：切换「当前类别」（与编辑器主区视图同
+  /// 快捷键 1~8 与小键盘 1~8：切换「当前类别」（与编辑器主区视图同
   /// 一词表，键数与 RegionLabel 词表长度对齐）。
   static const List<LogicalKeyboardKey> _digitKeys = [
     LogicalKeyboardKey.digit1,
@@ -3753,7 +3753,7 @@ class _RegionQuickEditorPageState extends State<_RegionQuickEditorPage> {
             '当前类别：${RegionLabel.displayName(_activeLabel)} · '
             '空白处拖拽新增框（同类可多个）/ 抓角点或边线调整（只吸附当前框）'
             '/ 框内拖动移动 · 单击框选中、点空白取消选择 · Del 删当前框 · '
-            '右键平移 · 滚轮缩放 · 1~7 切类别 · Enter 确认并下一页 · '
+            '右键平移 · 滚轮缩放 · 1~8 切类别 · Enter 确认并下一页 · '
             '←/→ 翻页 · 中键画手势（设置可配）· Esc 返回',
             style: const TextStyle(fontSize: 12, color: Colors.grey),
             overflow: TextOverflow.ellipsis,

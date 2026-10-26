@@ -25,9 +25,11 @@ import '../services/ai_page_prelabel.dart';
 import '../services/ai_trace.dart';
 import '../services/book_cache.dart';
 import '../services/book_region_apply.dart';
+import '../services/smart_merge.dart';
 import '../services/train_auto_export.dart';
 import '../services/mouse_gesture.dart';
 import '../services/editor_shortcut_settings.dart';
+import '../services/editor_toolbar_settings.dart';
 import '../services/ime_virtual_key_bridge.dart';
 import '../services/page_state_markers.dart';
 import '../services/reading_order.dart';
@@ -37,9 +39,12 @@ import '../widgets/backend_console_panel.dart';
 import '../widgets/char_rainbow.dart';
 import '../widgets/char_verify_common.dart';
 import '../widgets/ctrl_scroll_zoom.dart';
+import '../widgets/editor_command_bar.dart';
+import '../widgets/editor_toolbar_customize_dialog.dart';
 import '../widgets/direct_text_panel.dart';
 import '../widgets/engine_settings_section.dart';
 import '../widgets/excalidraw_export_dialog.dart';
+import '../widgets/text_export_dialog.dart';
 import 'ai_trace_panel.dart';
 import 'book_grid_page.dart';
 import 'book_overlay_page.dart';
@@ -51,6 +56,19 @@ import 'similar_chars_book_page.dart';
 import 'similar_chars_page.dart';
 import 'table_review_page.dart';
 
+part 'editor_page_command_bar.dart';
+
+/// 智能全书扫描的公共产物（合并/分割传播共用）：命中列表 + 页标注
+/// 缓存（应用阶段复用）+ pageId→页号映射 + 整页保护跳过数 + 扫描失败
+/// 块内页数。
+typedef _SmartScanBatch<T> = ({
+  List<T> matches,
+  Map<int, PageAnnotation> anns,
+  Map<String, int> indexByPageId,
+  int proofreadSkipped,
+  int scanFailed,
+});
+
 class EditorPage extends StatefulWidget {
   final Project project;
   const EditorPage({super.key, required this.project});
@@ -61,6 +79,16 @@ class EditorPage extends StatefulWidget {
 
 class _EditorPageState extends State<EditorPage> {
   int _pageIndex = 0;
+
+  // ── 顶部命令栏（菜单 + Word 式工具栏）──
+  // 布局（分组顺序/显隐/组名开关）持久化；动作定义在 part 文件
+  // editor_page_command_bar.dart（直接访问本类私有状态）。
+  EditorToolbarSettings _toolbarSettings = const EditorToolbarSettings();
+  late final _cmdBar = _EditorCommandBarController(this);
+
+  /// 命令栏控制器刷新页面用的转发：setState 是 protected 成员，
+  /// State 子类之外直接调用会被静态分析拦（invalid_use_of_protected_member）。
+  void cmdSetState(VoidCallback fn) => setState(fn);
 
   /// 页面图像的就地改写版本（旋转/镜像后 +1）：路径不变，画布/行卡片
   /// 靠它感知需要重新解码图像。
@@ -158,6 +186,25 @@ class _EditorPageState extends State<EditorPage> {
   int _loadGeneration = 0;
   final _focusNode = FocusNode();
 
+  /// 修饰键状态对账节流时间戳（见 [_syncKeyboardStateThrottled]）。
+  DateTime? _lastKeyboardSync;
+
+  /// 点击回页面时与引擎对账按键状态：Alt+Tab、Win 键唤出开始菜单等
+  /// 场景下 KeyUp 落在别的窗口，框架侧修饰键会卡在"按下"——卡死键
+  /// 的重复 KeyDown 会触发框架 assert 抛异常刷日志（实测 Meta Right
+  /// 单次会话 530 条），修饰键读数（isAltPressed 等）也随之失真。
+  /// 引擎在窗口重新聚焦时已自行校正，拉回引擎快照即可清掉残留；
+  /// 引擎不支持的平台上该调用静默返回 null。节流 2 秒防连点刷通道。
+  void _syncKeyboardStateThrottled() {
+    final now = DateTime.now();
+    final last = _lastKeyboardSync;
+    if (last != null && now.difference(last) < const Duration(seconds: 2)) {
+      return;
+    }
+    _lastKeyboardSync = now;
+    unawaited(HardwareKeyboard.instance.syncKeyboardState());
+  }
+
   /// 左侧缩略图列表的滚动控制器：翻页/进入书籍时把当前页滚到可见位置。
   final ScrollController _thumbScroll = ScrollController();
 
@@ -200,6 +247,12 @@ class _EditorPageState extends State<EditorPage> {
   // 合并模式下：第一次点击选中第一个字框，第二次点击同行的框自动合并。
   bool _mergeMode = false;
   CharBlock? _mergeFirstBox;
+
+  /// 智能模式：合并模式之上，手工合并（_runSmartMergePropagation）或
+  /// Alt 拆分（_runSmartSplitPropagation）完成后，以本次操作为模板把
+  /// 全书同类墨迹批量应用（跳过已确认/已保存内容）。
+  bool _smartMergeMode = false;
+  bool _smartMergeRunning = false;
 
   /// 键盘快捷键配置（设置 → 快捷键）：合并/删除识别框的按键。
   EditorShortcutSettings _shortcuts = const EditorShortcutSettings();
@@ -301,6 +354,10 @@ class _EditorPageState extends State<EditorPage> {
         widget.project.imageFiles.length - 1,
       );
     }
+    // 命令栏自定义布局异步恢复（默认布局先渲染，读到后切换）。
+    EditorToolbarSettings.load().then((v) {
+      if (mounted) setState(() => _toolbarSettings = v);
+    });
     _loadPage();
     _loadPageStateMarkers();
     unawaited(_refreshBookProgress());
@@ -437,6 +494,7 @@ class _EditorPageState extends State<EditorPage> {
     _trainExportSub?.cancel();
     _flashTimer?.cancel();
     _toastTimer?.cancel();
+    _cmdBar.dispose();
     ImeVirtualKeyBridge.removeListener(_onImeVirtualKey);
     _focusNode.dispose();
     _thumbScroll.dispose();
@@ -1620,7 +1678,11 @@ class _EditorPageState extends State<EditorPage> {
       _selected = null;
     });
     _snack(
-      _mergeMode ? '进入合并模式（点击第一个框，再点击第二个框自动合并；按 M 键退出）' : '已退出合并模式',
+      _mergeMode
+          ? _smartMergeMode
+                ? '进入智能模式（合并或分割一处后，全书同类墨迹一起批量应用；按 M 键退出）'
+                : '进入合并模式（点击第一个框，再点击第二个框自动合并；按 M 键退出）'
+          : '已退出合并模式',
     );
   }
 
@@ -1663,13 +1725,12 @@ class _EditorPageState extends State<EditorPage> {
       first,
       second,
       horizontal: host.orientation == 'horizontal',
-      rtl: host.orientation == 'horizontal' &&
+      rtl:
+          host.orientation == 'horizontal' &&
           _pageSettings.horizontalDir == 'rtl',
     );
     setState(() {
-      host.chars.removeWhere(
-        (c) => c.id == first.id || c.id == second.id,
-      );
+      host.chars.removeWhere((c) => c.id == first.id || c.id == second.id);
       _insertCharInReadingOrder(host, merged);
       ann.blocks.removeWhere((b) => b.id == first.id || b.id == second.id);
       ann.blocks.add(merged);
@@ -1684,6 +1745,536 @@ class _EditorPageState extends State<EditorPage> {
     _save();
     _queueCharCascade(merged, preserveUserText: false);
     _snack('已合并为 1 个识别框，正在重新识别');
+    if (_smartMergeMode && !_smartMergeRunning) {
+      // 智能合并：以本次合并前的两框为模板发起全书传播。first/second
+      // 是合并前的原始实例（mergeCharBoxes 不改写它们），几何即模板。
+      final templateFirst = first;
+      final templateSecond = second;
+      final templateDir = smartMergeLineDir(host, _pageSettings);
+      Future.microtask(
+        () => _runSmartMergePropagation(
+          templateFirst: templateFirst,
+          templateSecond: templateSecond,
+          templateDir: templateDir,
+        ),
+      );
+    }
+  }
+
+  /// 智能合并全书传播：以一次手工合并为模板分块扫描全书（后端几何
+  /// 构型 + HOG 双门槛），用户确认后按与手工合并相同口径批量合并，
+  /// 并对合并框用分类器候选重读文字（结果为待确认，不自动确认）。
+  ///
+  /// 保护口径：校对完成的页（reviewed / boxesReviewed / 完全确认 /
+  /// 确认无正文）整页跳过；任何已确认字框（confirmed / boxConfirmed）
+  /// 恒不参与——已确认保存过的内容不会被改动。当前页直接改内存标注，
+  /// 其余页读盘 → 应用 → 写盘（machineWrite，不触发训练导出调度）。
+  /// 误合的框可用 Alt+单击切回（沿阅读轴切割），且都是未确认候选。
+  Future<void> _runSmartMergePropagation({
+    required CharBlock templateFirst,
+    required CharBlock templateSecond,
+    required String templateDir,
+  }) async {
+    if (_smartMergeRunning) return;
+    _smartMergeRunning = true;
+    try {
+      final project = widget.project;
+      final currentIndex = _pageIndex;
+      final currentAnn = _annotation;
+      final batch = await _smartScanBook<SmartMergeScanMatch>(
+        verb: '合并',
+        lead: '按本次合并寻找全书同类墨迹',
+        currentIndex: currentIndex,
+        currentAnn: currentAnn,
+        scanChunk: (chunk) async => (await PythonService.smartMergeScan(
+          templateImagePath: project.imageFiles[currentIndex],
+          firstBox: Rect.fromLTWH(
+            templateFirst.x.toDouble(),
+            templateFirst.y.toDouble(),
+            templateFirst.w.toDouble(),
+            templateFirst.h.toDouble(),
+          ),
+          secondBox: Rect.fromLTWH(
+            templateSecond.x.toDouble(),
+            templateSecond.y.toDouble(),
+            templateSecond.w.toDouble(),
+            templateSecond.h.toDouble(),
+          ),
+          templateDir: templateDir,
+          pages: chunk,
+        )).matches,
+      );
+      if (batch == null || batch.matches.isEmpty) return;
+      await _smartConfirmAndApply<SmartMergeScanMatch>(
+        verb: '合并',
+        currentIndex: currentIndex,
+        currentAnn: currentAnn,
+        batch: batch,
+        pageIdOf: (m) => m.pageId,
+        bodyFor: (pages, hits) =>
+            '在 $pages 页找到 $hits 处与本次合并同类的墨迹，'
+            '将按完全相同的方式合并。',
+        note:
+            '合并后自动重读框内文字（结果为待确认，不自动确认）；'
+            '已确认/已保存的内容不会被改动；误合可用 Alt+单击切回。',
+        applyPage: (ann, pageMatches, i) {
+          final results = applySmartMergeMatches(
+            ann,
+            pageMatches,
+            settings: project.settingsAt(i),
+          );
+          return (results.length, [for (final r in results) (r.$1, r.$2)]);
+        },
+      );
+    } finally {
+      _smartMergeRunning = false;
+    }
+  }
+
+  /// 行图 Alt 拆分完成回调（智能模式接 InteractiveLineCrop 的
+  /// onCharSplit）：以拆分前的原框与有效切线比例（前半占阅读轴长度）
+  /// 为模板，发起全书批量拆分。
+  void _onCharSplitByGesture(
+    CharBlock original,
+    CharBlock first,
+    CharBlock second,
+  ) {
+    if (!_smartMergeMode || _smartMergeRunning) return;
+    final ann = _annotation;
+    if (ann == null) return;
+    LineBlock? host;
+    for (final line in ann.lines) {
+      if (line.id == original.lineId) {
+        host = line;
+        break;
+      }
+    }
+    if (host == null) return;
+    final horizontal = host.orientation == 'horizontal';
+    final total = (horizontal ? original.w : original.h).toDouble();
+    final firstLen = (horizontal ? first.w : first.h).toDouble();
+    if (total <= 0) return;
+    Future.microtask(
+      () => _runSmartSplitPropagation(
+        templateBox: original,
+        ratio: firstLen / total,
+      ),
+    );
+  }
+
+  /// 智能分割全书传播：以一次手工 Alt 拆分前的原框为模板扫描全书
+  /// （整框 HOG 含宽高比惩罚，单框对单框），确认后按同比例沿阅读轴
+  /// 一分为二，两个半框都用分类器候选重读文字（待确认，不自动确认）。
+  /// 保护口径与合并传播相同（校对完成的页整页跳过、已确认字框恒不
+  /// 参与）；切线沿用 splitRectAt 的两侧各留 5px 钳制，太薄的框跳过。
+  Future<void> _runSmartSplitPropagation({
+    required CharBlock templateBox,
+    required double ratio,
+  }) async {
+    if (_smartMergeRunning) return;
+    _smartMergeRunning = true;
+    try {
+      final project = widget.project;
+      final currentIndex = _pageIndex;
+      final currentAnn = _annotation;
+      final batch = await _smartScanBook<SmartSplitScanMatch>(
+        verb: '分割',
+        lead: '按本次分割寻找全书同类墨迹',
+        currentIndex: currentIndex,
+        currentAnn: currentAnn,
+        scanChunk: (chunk) async => (await PythonService.smartSplitScan(
+          templateImagePath: project.imageFiles[currentIndex],
+          templateBox: Rect.fromLTWH(
+            templateBox.x.toDouble(),
+            templateBox.y.toDouble(),
+            templateBox.w.toDouble(),
+            templateBox.h.toDouble(),
+          ),
+          pages: chunk,
+        )).matches,
+      );
+      if (batch == null || batch.matches.isEmpty) return;
+      await _smartConfirmAndApply<SmartSplitScanMatch>(
+        verb: '分割',
+        currentIndex: currentIndex,
+        currentAnn: currentAnn,
+        batch: batch,
+        pageIdOf: (m) => m.pageId,
+        bodyFor: (pages, hits) =>
+            '在 $pages 页找到 $hits 处与本次分割同类的墨迹，'
+            '将按相同比例沿阅读轴一分为二。',
+        note:
+            '拆分后两个框自动重读文字（结果为待确认，不自动确认）；'
+            '已确认/已保存的内容不会被改动。',
+        applyPage: (ann, pageMatches, i) {
+          final results = applySmartSplits(
+            ann,
+            pageMatches,
+            ratio: ratio,
+            settings: project.settingsAt(i),
+          );
+          return (
+            results.length,
+            [
+              for (final r in results) ...[(r.$1, r.$3), (r.$2, r.$3)],
+            ],
+          );
+        },
+      );
+    } finally {
+      _smartMergeRunning = false;
+    }
+  }
+
+  /// 智能全书扫描的公共骨架（合并/分割传播共用）：模态进度 + 分块页
+  /// 收集（当前页优先用触发时刻的内存实例，其余读盘缓存供应用阶段
+  /// 复用）+ 整页保护跳过（校对完成/确认无正文）+ 分块调后端扫描。
+  ///
+  /// 返回 null = 用户停止（提示已给出）或页面已卸载；matches 为空时
+  /// 给出"未找到"提示后照常返回批次（调用方判空直接返回）。
+  Future<_SmartScanBatch<T>?> _smartScanBook<T>({
+    required String verb,
+    required String lead,
+    required int currentIndex,
+    required PageAnnotation? currentAnn,
+    required Future<Iterable<T>> Function(List<SmartMergeScanPage> chunk)
+    scanChunk,
+  }) async {
+    final project = widget.project;
+    final pageCount = project.imageFiles.length;
+    var cancelled = false;
+    var done = 0;
+    StateSetter? setProgress;
+    final progressFuture = showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => PopScope(
+        canPop: false,
+        child: StatefulBuilder(
+          builder: (dialogContext, setStateInDialog) {
+            setProgress = setStateInDialog;
+            return AlertDialog(
+              title: Text('智能$verb · 全书扫描'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  LinearProgressIndicator(
+                    value: pageCount == 0 ? 1 : done / pageCount,
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    '$lead · $done / $pageCount 页',
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                  const SizedBox(height: 4),
+                  const Text(
+                    '已确认/已保存的内容不会被动；扫描完成会先征求确认',
+                    style: TextStyle(fontSize: 12, color: Colors.grey),
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () {
+                    cancelled = true;
+                    Navigator.of(dialogContext).pop();
+                  },
+                  child: const Text('停止'),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
+    );
+    final matches = <T>[];
+    final anns = <int, PageAnnotation>{};
+    final indexByPageId = <String, int>{};
+    var proofreadSkipped = 0;
+    var scanFailed = 0;
+    const chunkSize = 40;
+    for (var start = 0; start < pageCount; start += chunkSize) {
+      if (cancelled) break;
+      final chunk = <SmartMergeScanPage>[];
+      for (var i = start; i < pageCount && i < start + chunkSize; i++) {
+        final PageAnnotation? ann;
+        if (i == currentIndex &&
+            _pageIndex == currentIndex &&
+            identical(_annotation, currentAnn)) {
+          ann = currentAnn;
+        } else {
+          ann = await ProjectStorage.loadAnnotation(
+            project.projectDir,
+            project.pageIdAt(i),
+            expectedImagePath: project.imageFiles[i],
+          );
+        }
+        if (ann == null) continue;
+        if (ann.isFullyConfirmed ||
+            ann.boxesReviewed ||
+            ann.reviewed ||
+            ann.noMainTextConfirmed == true) {
+          proofreadSkipped++;
+          continue;
+        }
+        final payload = buildSmartMergeScanPage(
+          pageId: project.pageIdAt(i),
+          imagePath: project.imageFiles[i],
+          ann: ann,
+          settings: project.settingsAt(i),
+        );
+        if (payload == null) continue;
+        anns[i] = ann;
+        indexByPageId[payload.pageId] = i;
+        chunk.add(payload);
+      }
+      if (chunk.isNotEmpty && !cancelled) {
+        try {
+          matches.addAll(await scanChunk(chunk));
+        } catch (e) {
+          scanFailed += chunk.length;
+          PythonService.addAppLog(
+            '[智能$verb] 扫描块失败（第 ${start + 1}~'
+            '${min(start + chunkSize, pageCount)} 页）：$e',
+            isError: true,
+          );
+        }
+      }
+      done = min(start + chunkSize, pageCount);
+      setProgress?.call(() {});
+    }
+    if (!mounted) return null;
+    if (!cancelled) Navigator.of(context).pop();
+    await progressFuture;
+    if (!mounted) return null;
+    if (cancelled) {
+      _snack('智能$verb已停止（未做任何修改）');
+      return null;
+    }
+    if (matches.isEmpty) {
+      _snack(
+        scanFailed > 0
+            ? '全书未找到同类墨迹（$scanFailed 页扫描失败，可重试）'
+            : '全书未找到与本次$verb同类的墨迹'
+                  '${proofreadSkipped > 0 ? '（跳过校对完成 $proofreadSkipped 页）' : ''}',
+      );
+    }
+    return (
+      matches: matches,
+      anns: anns,
+      indexByPageId: indexByPageId,
+      proofreadSkipped: proofreadSkipped,
+      scanFailed: scanFailed,
+    );
+  }
+
+  /// 智能全书应用的公共骨架（合并/分割传播共用）：确认对话框（命中页
+  /// 与处数）→ 模态应用进度 → 逐页 [applyPage]（返回 (处数, 需文字刷新
+  /// 的 (字框, 宿主行) 对)）→ 分类器候选 top1 重读 → 落盘。当前页仍持
+  /// 有触发时的内存实例时直接改内存并 [_save]，否则读盘→改→写盘
+  /// （machineWrite，不触发训练导出调度）；文字刷新失败保留原文字
+  /// （框几何已保存，不回滚）。
+  Future<void> _smartConfirmAndApply<T>({
+    required String verb,
+    required int currentIndex,
+    required PageAnnotation? currentAnn,
+    required _SmartScanBatch<T> batch,
+    required String Function(T match) pageIdOf,
+    required String Function(int pages, int hits) bodyFor,
+    required String note,
+    required (int, List<(CharBlock, LineBlock)>) Function(
+      PageAnnotation ann,
+      List<T> pageMatches,
+      int pageIndex,
+    )
+    applyPage,
+  }) async {
+    final project = widget.project;
+    final matches = batch.matches;
+    final byPage = <String, List<T>>{};
+    for (final m in matches) {
+      (byPage[pageIdOf(m)] ??= []).add(m);
+    }
+    final pageList = byPage.entries.toList()
+      ..sort(
+        (a, b) =>
+            batch.indexByPageId[a.key]!.compareTo(batch.indexByPageId[b.key]!),
+      );
+    if (!mounted) return;
+    final proceed = await showDialog<bool>(
+      context: context,
+      builder: (_) => AlertDialog(
+        title: Text('智能$verb · 确认应用'),
+        content: SizedBox(
+          width: 460,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                bodyFor(byPage.length, matches.length),
+                style: const TextStyle(fontSize: 14),
+              ),
+              const SizedBox(height: 8),
+              ConstrainedBox(
+                constraints: const BoxConstraints(maxHeight: 180),
+                child: SingleChildScrollView(
+                  child: Text(
+                    pageList
+                        .map(
+                          (e) =>
+                              '第 ${batch.indexByPageId[e.key]! + 1} 页 · ${e.value.length} 处',
+                        )
+                        .join('　'),
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade700),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                note,
+                style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: Text('$verb ${matches.length} 处'),
+          ),
+        ],
+      ),
+    );
+    if (proceed != true) {
+      _snack('已取消，未做任何修改');
+      return;
+    }
+    var appliedHits = 0;
+    var appliedPages = 0;
+    var refreshFailed = 0;
+    var applied = 0;
+    if (!mounted) return;
+    StateSetter? setApplyProgress;
+    final applyFuture = showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (dialogContext) => PopScope(
+        canPop: false,
+        child: StatefulBuilder(
+          builder: (dialogContext, setStateInDialog) {
+            setApplyProgress = setStateInDialog;
+            return AlertDialog(
+              title: Text('智能$verb · 应用中'),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  LinearProgressIndicator(
+                    value: pageList.isEmpty ? 1 : applied / pageList.length,
+                  ),
+                  const SizedBox(height: 12),
+                  Text(
+                    '已$verb $appliedHits 处 · $applied / ${pageList.length} 页',
+                    style: const TextStyle(fontSize: 13),
+                  ),
+                ],
+              ),
+            );
+          },
+        ),
+      ),
+    );
+    for (var k = 0; k < pageList.length; k++) {
+      final pageId = pageList[k].key;
+      final i = batch.indexByPageId[pageId];
+      if (i == null) continue;
+      // 当前页仍持有触发时的内存实例 → 直接改内存；否则（极端情况下
+      // 标注已被翻页重载）重新读盘，不动换页后的 _annotation。
+      final bool live =
+          i == currentIndex &&
+          _pageIndex == currentIndex &&
+          identical(_annotation, currentAnn);
+      final PageAnnotation? ann = live
+          ? currentAnn
+          : (i == currentIndex
+                ? await ProjectStorage.loadAnnotation(
+                    project.projectDir,
+                    pageId,
+                    expectedImagePath: project.imageFiles[i],
+                  )
+                : batch.anns[i]);
+      if (ann == null) continue;
+      final (hitCount, refreshPairs) = applyPage(ann, pageList[k].value, i);
+      if (hitCount > 0) {
+        if (live) {
+          setState(() {});
+          _save();
+        } else {
+          ann.draftSaved = true;
+          await ProjectStorage.saveAnnotation(
+            project.projectDir,
+            ann,
+            machineWrite: true,
+          );
+        }
+        try {
+          final cand = await PythonService.getCharCandidatesBatch(
+            imagePath: project.imageFiles[i],
+            blocks: [for (final p in refreshPairs) p.$1],
+            topK: 8,
+          );
+          for (final p in refreshPairs) {
+            final list = cand[p.$1.id];
+            if (list == null || list.isEmpty) continue;
+            final top = list.first;
+            final t = top['text']?.toString() ?? '';
+            if (t.isNotEmpty) {
+              p.$1
+                ..text = t
+                ..conf = (top['score'] as num?)?.toDouble() ?? p.$1.conf
+                ..candidates = [
+                  for (final c in list)
+                    CharCandidate.fromJson(Map<String, dynamic>.from(c)),
+                ];
+            }
+            rebuildSmartMergeLineText(p.$2);
+          }
+          if (live) {
+            setState(() {});
+            _save();
+          } else {
+            await ProjectStorage.saveAnnotation(
+              project.projectDir,
+              ann,
+              machineWrite: true,
+            );
+          }
+        } catch (_) {
+          refreshFailed++;
+        }
+        appliedHits += hitCount;
+        appliedPages++;
+      }
+      applied = k + 1;
+      setApplyProgress?.call(() {});
+    }
+    if (mounted) Navigator.of(context).pop();
+    await applyFuture;
+    if (!mounted) return;
+    _snack(
+      '全书智能$verb：$appliedHits 处（$appliedPages 页）'
+      '${batch.proofreadSkipped > 0 ? '，跳过校对完成 ${batch.proofreadSkipped} 页' : ''}'
+      '${refreshFailed > 0 ? '，$refreshFailed 页文字刷新失败（保留原文字）' : ''}',
+    );
+    PythonService.addAppLog(
+      '[智能$verb] 全书完成：$verb $appliedHits 处（$appliedPages 页），'
+      '跳过校对完成页 ${batch.proofreadSkipped}，'
+      '扫描失败块内页数 ${batch.scanFailed}',
+    );
   }
 
   void _selectLine(LineBlock? l) => setState(() {
@@ -1715,7 +2306,9 @@ class _EditorPageState extends State<EditorPage> {
 
   // ── region/paragraph operations (region/paragraph view) ──
 
-  /// region 视图「新框类别」：拖拽画的新主区框带这个 label。
+  /// 「新框类别」：主区视图拖拽画的新主区框带这个 label；段/行视图选
+  /// 非正文类别时拖拽改画该版面框（正文类别保持画段/行框）。快捷键
+  /// 1~8 与常显芯片三个页面视图通用。
   String _newRegionLabel = RegionLabel.mainText;
   bool _regionPrelabeling = false;
   bool _aiPrelabeling = false;
@@ -1896,6 +2489,7 @@ class _EditorPageState extends State<EditorPage> {
     if (ann == null || region == null) return;
     final idx = ann.mainRegions.indexOf(region);
     if (idx < 0) return;
+    var purgedLines = 0;
     setState(() {
       ann.mainRegions[idx] = MainRegion(
         id: region.id,
@@ -1909,7 +2503,36 @@ class _EditorPageState extends State<EditorPage> {
         uid: region.uid,
       );
       _selectedRegion = ann.mainRegions[idx];
+      // 标成表格即清场：表格区域的内容以表格识别（TableAnnotation）为
+      // 准，整页识别留下的通用行/字框不再代表该区域，避免同一块内容
+      // 同时以"表格格"和"单行/单字"两套形态存在。
+      if (RegionLabel.normalize(label) == RegionLabel.table &&
+          RegionLabel.normalize(region.label) != RegionLabel.table) {
+        purgedLines = BookRegionApply.removeLinesInRect(ann, region.rect);
+        ann.rebuildParagraphs(
+          orientation: _pageOrientation,
+          horizontalDir: _pageSettings.horizontalDir,
+          verticalDir: _pageSettings.verticalDir,
+        );
+        ReadingOrderCalculator.sortLinesInPlace(
+          ann,
+          orientation: _pageOrientation,
+          horizontalDir: _pageSettings.horizontalDir,
+          verticalDir: _pageSettings.verticalDir,
+        );
+        ann.rebuildBlocks();
+        if (_selectedLine != null &&
+            !ann.lines.any((l) => identical(l, _selectedLine))) {
+          _selectedLine = null;
+        }
+      }
     });
+    if (purgedLines > 0) {
+      _snack(
+        '已按表格区清理区内 $purgedLines 行通用识别框'
+        '（表格内容以表格识别为准）',
+      );
+    }
     _save();
   }
 
@@ -1958,6 +2581,33 @@ class _EditorPageState extends State<EditorPage> {
       );
       if (!mounted) return;
       ann.tables.add(table);
+      // 识别成功即清场：删掉区域内的通用行/字框（旧标注在标记 table 时
+      // 未清理、或区域几何后来调整过），表格区域自此只有表格一种形态。
+      // 按区域框（用户意图边界）清——识别出的格线框可能比区域小，按
+      // 格线框清会在边缘留下残行。
+      final purged = BookRegionApply.removeLinesInRect(ann, region.rect);
+      if (purged > 0) {
+        setState(() {
+          ann.rebuildParagraphs(
+            orientation: _pageOrientation,
+            horizontalDir: _pageSettings.horizontalDir,
+            verticalDir: _pageSettings.verticalDir,
+          );
+          ReadingOrderCalculator.sortLinesInPlace(
+            ann,
+            orientation: _pageOrientation,
+            horizontalDir: _pageSettings.horizontalDir,
+            verticalDir: _pageSettings.verticalDir,
+          );
+          ann.rebuildBlocks();
+          // 清场可能删掉当前选中的行（如选中表内残行后点识别表格）
+          if (_selectedLine != null &&
+              !ann.lines.any((l) => identical(l, _selectedLine))) {
+            _selectedLine = null;
+          }
+        });
+        _snack('已清理表格区内 $purged 行通用识别框（内容以表格格为准）');
+      }
       await _pushTableReview(table);
     } on TableGridNotFoundException catch (e) {
       if (mounted) _snack(e.message, error: true);
@@ -1976,9 +2626,9 @@ class _EditorPageState extends State<EditorPage> {
         builder: (_) => TableReviewPage(
           imagePath: ann.imagePath,
           table: table,
-          orientation: _pageSettings.orientation,
-          horizontalDir: _pageSettings.horizontalDir,
-          verticalDir: _pageSettings.verticalDir,
+          // 完整页面设置（含书内引擎）：校对页「重新识别」随书引擎，
+          // 不再回落默认 Kraken。
+          settings: _pageSettings,
         ),
       ),
     );
@@ -2005,6 +2655,11 @@ class _EditorPageState extends State<EditorPage> {
       }
       ann.mainRegions.add(r);
       _selectedRegion = r;
+      // 选中互斥（与 _selectRegion 同口径）：新画的框成为唯一选中，
+      // 段/行视图画版面框后按 Delete 删的是它，不会误删之前选中的段/行。
+      _selected = null;
+      _selectedLine = null;
+      _selectedParagraph = null;
     });
     _save();
   }
@@ -2230,11 +2885,29 @@ class _EditorPageState extends State<EditorPage> {
       // 期间，若有正在执行的主区/段级联先回包合并，manual 行会被
       // spliceRegionLines 钉住保留，不会被"删旧插新"洗掉。
       stub.manual = true;
-      stub.lineNo = _annotation!.lines.length;
-      _annotation!.lines.add(stub);
+      _insertLineInReadingOrder(stub);
       _selectedLine = stub;
     });
     _queueNewLineCascade(stub);
+  }
+
+  /// 新建的手工行按阅读序插入行列表并全页重排行号（lineNo=列表下标），
+  /// 口径与序号校验（orderBreakIds）/级联重排（sortLinesInPlace）一致。
+  /// 此前一律追加到列表末尾——页面中间补画缺列会被编成最后两号，序号
+  /// 校验随即把补列前后整片标红（列表确实乱了，校验没冤枉它，但用户
+  /// 补对了反而挨报警，还得手动拖回位置）。
+  void _insertLineInReadingOrder(LineBlock line) {
+    final ann = _annotation!;
+    final insertAt = ReadingOrderCalculator.insertIndexForNewLine(
+      ann.lines,
+      line,
+      paragraphs: ann.paragraphs,
+      orientation: _pageSettings.orientation,
+      horizontalDir: _pageSettings.horizontalDir,
+      verticalDir: _pageSettings.verticalDir,
+    ).clamp(0, ann.lines.length);
+    ann.lines.insert(insertAt, line);
+    BookRegionApply.renumberLines(ann);
   }
 
   /// 行被重识别整体替换（行 id 变化）后同步段落成员表：把旧行 id 换成
@@ -2667,7 +3340,7 @@ class _EditorPageState extends State<EditorPage> {
     // 结构恒定：child 永远是第一个子项（fit: expand 撑满），状态胶囊只是
     // 追加/移除后面的 Positioned 叶子。此前胶囊为空时直接返回 child、
     // 非空时才包 Stack——级联任务开始/结束会把整个画布子树（含
-    // _AnnotationCanvas 的 State：图像、变换矩阵、拖拽手势）dispose 掉
+    // AnnotationCanvas 的 State：图像、变换矩阵、拖拽手势）dispose 掉
     // 全量重建，识别期间反复入队时画布状态反复被清零。
     return Stack(
       fit: StackFit.expand,
@@ -2955,6 +3628,8 @@ class _EditorPageState extends State<EditorPage> {
   /// [ownerDeleted]：识别期间目标主区/段被用户删除时返回 true——此时
   /// 结果整包作废（主区级联还会清理"区外残留"，按旧矩形合并会把全页
   /// 行洗掉）。
+  /// [gateRegions]：随请求带入的已确认门控区（排除类区在后端字检测前
+  /// 抹底色，识别不再读出表内/图内内容）；缺省不门控（历史行为）。
   /// 返回 (移除的旧行 ID, 新行列表, 区域外删除数)。调用方需在 await 后校验 ann 仍为当前页。
   Future<
     ({List<String> removedIds, List<LineBlock> newLines, int removedOutside})?
@@ -2966,6 +3641,7 @@ class _EditorPageState extends State<EditorPage> {
     bool pruneOutsideRegions = false,
     bool Function() isStale = _neverStale,
     bool Function()? ownerDeleted,
+    List<Map<String, dynamic>>? gateRegions,
   }) async {
     final newLines = await PythonService.segmentLinesInRegion(
       imagePath: _imagePath,
@@ -2974,6 +3650,7 @@ class _EditorPageState extends State<EditorPage> {
       w: rect.width.toInt(),
       h: rect.height.toInt(),
       settings: _pageSettings,
+      gateRegions: gateRegions,
     );
     if (!mounted || ann != _annotation) {
       return null;
@@ -3028,12 +3705,50 @@ class _EditorPageState extends State<EditorPage> {
   }) async {
     final ann = _annotation;
     if (ann == null) return;
+    // 表格区域不做通用行/字重识别：内容以表格识别（TableAnnotation）为
+    // 准，后端重分割会把格线/格内文字重新切成"单行/单字"混回标注。
+    // 调框后只做清场（新区内的通用行删掉），表格本身在表格校对页
+    // 「重新识别」里更新。
+    if (RegionLabel.normalize(region.label) == RegionLabel.table) {
+      if (!mounted || ann != _annotation) return;
+      setState(() {
+        final purged = BookRegionApply.removeLinesInRect(ann, region.rect);
+        if (purged > 0) {
+          ann.rebuildParagraphs(
+            orientation: _pageOrientation,
+            horizontalDir: _pageSettings.horizontalDir,
+            verticalDir: _pageSettings.verticalDir,
+          );
+          ReadingOrderCalculator.sortLinesInPlace(
+            ann,
+            orientation: _pageOrientation,
+            horizontalDir: _pageSettings.horizontalDir,
+            verticalDir: _pageSettings.verticalDir,
+          );
+          ann.rebuildBlocks();
+          // 调框吞进来的选中行被清掉时同步清选择
+          if (_selectedLine != null &&
+              !ann.lines.any((l) => identical(l, _selectedLine))) {
+            _selectedLine = null;
+          }
+        }
+      });
+      await _save();
+      return;
+    }
     final result = await _replaceLinesInRect(
       ann,
       region.rect,
       '主区重识别（段/行/字）',
       pruneOutsideRegions: true,
       isStale: isStale,
+      // 已确认门控区随行带入（不含本区自身——本区像素就是识别目标）：
+      // 已确认的表格/插图等排除类区在后端字检测前被抹底色，邻近区域
+      // 级联不会把表内内容重新切成行/字带回来。
+      gateRegions: [
+        for (final g in ann.confirmedGateRegions)
+          if (g['id'] != region.id) g,
+      ],
       // 识别期间主区被删除：结果作废，不按旧矩形合并/清理
       ownerDeleted: () => !ann.mainRegions.any((r) => r.id == region.id),
     );
@@ -3046,6 +3761,14 @@ class _EditorPageState extends State<EditorPage> {
         horizontalDir: _pageSettings.horizontalDir,
         verticalDir: _pageSettings.verticalDir,
       );
+      // 行列表按阅读序重排（与段级联/序号校验同口径，见 sortLinesInPlace）
+      ReadingOrderCalculator.sortLinesInPlace(
+        ann,
+        orientation: _pageOrientation,
+        horizontalDir: _pageSettings.horizontalDir,
+        verticalDir: _pageSettings.verticalDir,
+      );
+      BookRegionApply.renumberLines(ann);
       ann.rebuildBlocks();
       // 识别期间用户可能已改选其它目标（不抢占当前选择）；恢复选中时按
       // id 取当前列表里的对象——识别期间该区可能已被再次编辑替换。
@@ -3100,10 +3823,20 @@ class _EditorPageState extends State<EditorPage> {
         (p) => p.id != paragraph.id && !p.manual && p.lineIds.isEmpty,
       );
     }
-    // 按新段框重新归属：中心点落在段内的行都归入该段
+    // 按新段框重新归属：中心点落在段内的行都归入该段；中心掉出段框但
+    // 仍在段列带内的行保留/归入（段框偏短、行框外扩的正文列不再掉成
+    // 未归属孤行——序号校验对孤行按列表原序放行，乱序不会标红）
     final memberIds = <String>{};
     for (final l in ann.lines) {
       if (_centerInRect(l.x, l.y, l.w, l.h, paraRect)) {
+        memberIds.add(l.id);
+      } else if ((l.paragraphId.isEmpty || l.paragraphId == paragraph.id) &&
+          Paragraph.nearestByColumnBand(
+                [paragraph],
+                l,
+                vertical: _pageOrientation != 'horizontal',
+              ) !=
+              null) {
         memberIds.add(l.id);
       } else if (l.paragraphId == paragraph.id) {
         l.paragraphId = '';
@@ -3116,6 +3849,16 @@ class _EditorPageState extends State<EditorPage> {
       paragraph.lineIds
         ..clear()
         ..addAll(memberIds);
+      // 行列表按阅读序重排（手动段存在时段序优先）：级联插入的行落在
+      // 删除位置，不重排的话行视图序号（列表下标）与段落序不一致，
+      // 序号校验会整页误报"顺序错误"。
+      ReadingOrderCalculator.sortLinesInPlace(
+        ann,
+        orientation: _pageOrientation,
+        horizontalDir: _pageSettings.horizontalDir,
+        verticalDir: _pageSettings.verticalDir,
+      );
+      BookRegionApply.renumberLines(ann);
       ann.rebuildBlocks();
       // 识别期间用户可能已改选其它目标（不抢占当前选择）；恢复选中时按
       // id 取当前列表里的对象——识别期间该段可能已被再次编辑替换。
@@ -3548,7 +4291,9 @@ class _EditorPageState extends State<EditorPage> {
           chars: [b],
         );
         b.lineId = newLine.id;
-        _annotation!.lines.add(newLine);
+        // 与行视图补画缺列同口径：按阅读序落位插入（renumberLines 会把
+        // lineNo 重排为最终下标），不追加到列表末尾打乱行号。
+        _insertLineInReadingOrder(newLine);
       }
       _annotation!.blocks.add(b);
     });
@@ -4040,9 +4785,7 @@ class _EditorPageState extends State<EditorPage> {
     await _loadPageStateMarkers();
     await _loadPage();
     if (!mounted) return;
-    _snack(
-      hadAnnotation ? '该页已摆正，原识别结果已清空，请重新识别' : '该页已摆正',
-    );
+    _snack(hadAnnotation ? '该页已摆正，原识别结果已清空，请重新识别' : '该页已摆正');
   }
 
   /// 打开「墨迹归类」页：本页字块按墨迹形态聚类，统一/单独改字。
@@ -4093,66 +4836,8 @@ class _EditorPageState extends State<EditorPage> {
     return result;
   }
 
-  /// 全书操作菜单的固定基础项（插件功能入口由 itemBuilder 动态插入）。
-  List<PopupMenuItem<String>> _bookMenuEntries() => const [
-    PopupMenuItem(
-      value: 'book_grid',
-      child: ListTile(
-        leading: Icon(Icons.grid_view),
-        title: Text('全书总览'),
-        subtitle: Text('网格浏览所有页（可切主区/段/行/字层），点击跳页'),
-        contentPadding: EdgeInsets.zero,
-      ),
-    ),
-    PopupMenuItem(
-      value: 'book_overlay',
-      child: ListTile(
-        leading: Icon(Icons.layers),
-        title: Text('全书叠加'),
-        subtitle: Text('所有页半透明叠加，批量调整并应用正文区'),
-        contentPadding: EdgeInsets.zero,
-      ),
-    ),
-    PopupMenuItem(
-      value: 'region_grid',
-      child: ListTile(
-        leading: Icon(Icons.filter_center_focus),
-        title: Text('主区快设'),
-        subtitle: Text('网格逐页快速框正文区，改完统一按主区拆行/字/段'),
-        contentPadding: EdgeInsets.zero,
-      ),
-    ),
-    PopupMenuItem(
-      value: 'book_split',
-      child: ListTile(
-        leading: Icon(Icons.splitscreen),
-        title: Text('跨页拆分（左右页拆开）'),
-        subtitle: Text('左右两页合扫的书按中缝拆成两页'),
-        contentPadding: EdgeInsets.zero,
-      ),
-    ),
-    PopupMenuItem(
-      value: 'similar_book',
-      child: ListTile(
-        leading: Icon(Icons.auto_stories),
-        title: Text('墨迹归类（全书版）'),
-        subtitle: Text('指定页范围或整本书跨页聚类批量校正'),
-        contentPadding: EdgeInsets.zero,
-      ),
-    ),
-    PopupMenuItem(
-      value: 'recognize_book',
-      child: ListTile(
-        leading: Icon(Icons.play_circle_outline),
-        title: Text('开始整本识别'),
-        subtitle: Text('后台逐页识别无标注的页，完成后回到书库看进度'),
-        contentPadding: EdgeInsets.zero,
-      ),
-    ),
-  ];
-
-  /// 打开插件功能入口（全书操作菜单里 PluginHost.enabledEntries 渲染
-  /// 的项）：先冲刷当前页未落盘的修改（插件的写回直接改各页标注
+  /// 打开插件功能入口（命令栏「全书」组里 PluginHost.enabledEntries
+  /// 渲染的项）：先冲刷当前页未落盘的修改（插件的写回直接改各页标注
   /// 文件），再交给宿主开插件页面；关闭后按回执的改写页集合刷新，
   /// 处理与全书版墨迹归类一致。编辑器不感知具体插件——入口列表与
   /// 开关状态全部来自插件宿主。
@@ -4168,12 +4853,11 @@ class _EditorPageState extends State<EditorPage> {
       projectDir: widget.project.projectDir,
       projectName: widget.project.name,
       pageIndex: _pageIndex,
+      pageId: _pageId,
     );
     if (!mounted) return;
     await _handleBookClassifyResult(
-      modified == null
-          ? null
-          : BookClassifyResult(modifiedPages: modified),
+      modified == null ? null : BookClassifyResult(modifiedPages: modified),
     );
   }
 
@@ -5543,6 +6227,10 @@ class _EditorPageState extends State<EditorPage> {
                           pageId: _pageId,
                           imagePath: _imagePath,
                           settings: _pageSettings,
+                          // 本页人工已确认版面区：直读开「排除页眉页脚」时
+                          // 作为门控输入（确认的页眉/页脚/页码区内的行不进
+                          // 直读文本；region_det 未训出也能按人工成果排除）。
+                          gateRegions: _annotation?.confirmedGateRegions,
                           onSnackBar: _snack,
                           // 直读落盘后刷新标注里的整页对照标记（见
                           // _refreshFullTextMarks）。
@@ -5579,12 +6267,13 @@ class _EditorPageState extends State<EditorPage> {
                           onZoom: _zoomDetailCardBy,
                           mergeMode: _mergeMode,
                           onMergeMode: _handleMergeMode,
+                          onCharSplit: _onCharSplitByGesture,
                         )
                       : Column(
                           children: [
                             if (_excalidrawPicking) _excalidrawPickBanner(),
                             Expanded(
-                              child: _AnnotationCanvas(
+                              child: AnnotationCanvas(
                                 imagePath: _imagePath,
                                 imageRevision: _imageRevision,
                                 lines: _annotation!.lines,
@@ -5689,7 +6378,7 @@ class _EditorPageState extends State<EditorPage> {
               ),
               const Divider(height: 1),
               if (_viewMode == 'char') ...[
-                // 模式切换下拉菜单（普通/合并）
+                // 模式切换下拉菜单（普通/合并/智能模式）
                 Padding(
                   padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
                   child: Container(
@@ -5698,43 +6387,79 @@ class _EditorPageState extends State<EditorPage> {
                       borderRadius: BorderRadius.circular(6),
                       color: Colors.grey.shade50,
                     ),
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 4,
+                    ),
                     child: Row(
                       children: [
                         const Text(
                           '模式：',
                           style: TextStyle(fontSize: 13, color: Colors.black87),
                         ),
-                        PopupMenuButton<bool>(
+                        PopupMenuButton<String>(
                           onSelected: (mode) {
                             setState(() {
-                              _mergeMode = mode;
+                              _mergeMode = mode != 'normal';
+                              _smartMergeMode = mode == 'smart';
                               _mergeFirstBox = null;
                               _multiSelectedChars.clear();
                               _selected = null;
                             });
-                            final label = mode ? '合并模式' : '普通模式';
+                            final label = switch (mode) {
+                              'smart' => '智能模式（合并/分割后全书同类墨迹批量应用）',
+                              'merge' => '合并模式',
+                              _ => '普通模式',
+                            };
                             _snack('已切换到 $label');
                           },
                           itemBuilder: (context) => [
                             const PopupMenuItem(
-                              value: false,
+                              value: 'normal',
                               child: Text('普通模式'),
                             ),
                             const PopupMenuItem(
-                              value: true,
+                              value: 'merge',
                               child: Text('合并模式'),
+                            ),
+                            const PopupMenuItem(
+                              value: 'smart',
+                              child: Text('智能模式：合并/分割后全书同类墨迹批量应用'),
                             ),
                           ],
                           child: Text(
-                            _mergeMode ? '合并模式' : '普通模式',
+                            _mergeMode
+                                ? (_smartMergeMode ? '智能模式' : '合并模式')
+                                : '普通模式',
                             style: TextStyle(
                               fontSize: 13,
                               fontWeight: FontWeight.w500,
-                              color: _mergeMode ? Colors.orange : Colors.black87,
+                              color: _smartMergeMode
+                                  ? Colors.deepOrange
+                                  : (_mergeMode
+                                        ? Colors.orange
+                                        : Colors.black87),
                             ),
                           ),
                         ),
+                        if (_smartMergeMode)
+                          const Padding(
+                            padding: EdgeInsets.only(left: 8),
+                            child: Tooltip(
+                              message:
+                                  '本次合并或分割将作为模板，全书同类墨迹批量应用'
+                                  '（合并=构型+形态双门槛，分割=整框形态匹配）；'
+                                  '已确认/已保存的内容不会被动',
+                              child: Text(
+                                '智能',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: Colors.deepOrange,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ),
                         if (_mergeMode)
                           Padding(
                             padding: const EdgeInsets.only(left: 8),
@@ -5822,7 +6547,7 @@ class _EditorPageState extends State<EditorPage> {
                 ),
               ],
               // region 视图：预标注入口（「新框类别」已上移到标题栏下方
-              // 工具栏，与快捷键 1~7 同一状态）
+              // 工具栏，与快捷键 1~8 同一状态）
               if (_viewMode == 'region')
                 Padding(
                   padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
@@ -5949,13 +6674,13 @@ class _EditorPageState extends State<EditorPage> {
                                   () {
                                     switch (_viewMode) {
                                       case 'region':
-                                        return '主区视图\n拖拽空白处画新主区框（类别用顶部工具栏或快捷键 1~7 切换）\n点击主区框选中';
+                                        return '主区视图\n拖拽空白处画新主区框（类别用顶部工具栏或快捷键 1~8 切换）\n点击主区框选中';
                                       case 'paragraph':
-                                        return '段视图\n拖拽空白处画新段框\n点击段框选中\n可使用「自动推断层级」';
+                                        return '段视图\n拖拽空白处画新段框（「新框类别」选页眉/页脚等类型时改画版面框，快捷键 1~8 切换）\n点击段框选中 · 点击版面类型框选中\n可使用「自动推断层级」';
                                       case 'char':
                                         return '点击字框查看属性';
                                       default:
-                                        return '行视图\n拖拽空白处画新行框\n点击行框选中\n拖拽行框移动，拖右下角调整尺寸';
+                                        return '行视图\n拖拽空白处画新行框（「新框类别」选页眉/页脚等类型时改画版面框，快捷键 1~8 切换）\n点击行框选中 · 点击版面类型框选中\n拖拽行框移动，拖右下角调整尺寸';
                                     }
                                   }(),
                                   textAlign: TextAlign.center,
@@ -6094,6 +6819,7 @@ class _EditorPageState extends State<EditorPage> {
             onPointerDown: (e) {
               if (e.buttons == kMiddleMouseButton) _onGestureDown(e);
               _focusNode.requestFocus();
+              _syncKeyboardStateThrottled();
             },
             onPointerMove: (e) {
               if (_gestureActive && e.buttons == kMiddleMouseButton) {
@@ -6122,7 +6848,14 @@ class _EditorPageState extends State<EditorPage> {
                       '字选中=${_selected?.id ?? '无'} '
                       '行选中=${_selectedLine?.id ?? '无'}',
                     );
-                    if (_viewMode == 'region' && _selectedRegion != null) {
+                    if (_selectedRegion != null &&
+                        (_viewMode == 'region' ||
+                            RegionLabel.normalize(_selectedRegion!.label) !=
+                                RegionLabel.mainText)) {
+                      // 选中版面框即删：类型框（页眉/页脚等）在段/行视图
+                      // 也常显可选，跨视图可删；正文类主区框只在主区视图
+                      // 删——它在段/行视图不可见，防误删看不见的选中框。
+                      // 段/行仍按各自视图门控（不可见选中不删）。
                       _deleteSelectedRegion();
                     } else if (_viewMode == 'paragraph' &&
                         _selectedParagraph != null) {
@@ -6152,8 +6885,7 @@ class _EditorPageState extends State<EditorPage> {
                       !_reorderMode &&
                       _annotation != null &&
                       (e.logicalKey.keyId == _shortcuts.mergeChars.keyId ||
-                          e.logicalKey.keyId ==
-                              _shortcuts.deleteChars.keyId)) {
+                          e.logicalKey.keyId == _shortcuts.deleteChars.keyId)) {
                     // 合并/删除识别框快捷键（按键可在 设置 → 快捷键 修改）：
                     // 合并模式：M 键切换进/出合并模式，第一次点击选框，第二次
                     // 点击同行的框自动合并。删除对多选组或当前选中生效。
@@ -6165,13 +6897,16 @@ class _EditorPageState extends State<EditorPage> {
                     } else {
                       _deleteByShortcut();
                     }
-                  } else if (_viewMode == 'region' &&
-                      _viewIndex == 0 &&
+                  } else if (_viewIndex == 0 &&
+                      !_loading &&
+                      _annotation != null &&
                       !_reorderMode) {
-                    // 快捷键 1~7：切换「新框类别」（主数字与小键盘都认，键数
-                    // 与 RegionLabel 词表长度对齐）。只在主区视图生效——其他
-                    // 视图数字另有语义空间，不抢；排序模式锁定。文本输入框聚
-                    // 焦时事件到不了这里，不会误吞数字输入。
+                    // 快捷键 1~8：切换「新框类别」（主数字与小键盘都认，键数
+                    // 与 RegionLabel 词表长度对齐）。主区/段/行三个页面视图
+                    // 都生效——段/行视图选了非正文类别后拖拽直接画该版面框
+                    // （与常显芯片同一状态，不用切回主区视图）；后台控制台
+                    // 不抢，排序模式锁定。文本输入框聚焦时事件到不了这里，
+                    // 不会误吞数字输入。
                     const digitKeys = [
                       LogicalKeyboardKey.digit1,
                       LogicalKeyboardKey.digit2,
@@ -6207,133 +6942,13 @@ class _EditorPageState extends State<EditorPage> {
               },
               child: Scaffold(
                 appBar: AppBar(
-                  // 标题中间区域：书名 + 高频的「校对摆正」直达 + 低频页面操作
-                  // 收进「页面」菜单；两侧 Spacer 让操作组在标题栏内居中。
-                  title: Row(
-                    children: [
-                      Flexible(
-                        child: Text(
-                          widget.project.name,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                      ),
-                      const Spacer(),
-                      IconButton(
-                        icon: const Icon(Icons.crop_free),
-                        tooltip: '校对摆正：智能检测裁切点，透视拉平书页（可去色/锐化）',
-                        onPressed: _loading
-                            ? null
-                            : () => unawaited(_openStraighten()),
-                      ),
-                      PopupMenuButton<String>(
-                        icon: const Icon(Icons.rotate_90_degrees_ccw),
-                        tooltip: '页面操作：旋转 / 镜像 / 识别方向 / 框选导出 / 删除页',
-                        onSelected: (value) {
-                          if (_loading || _annotation == null) return;
-                          switch (value) {
-                            case 'rotate_cw':
-                              unawaited(_transformCurrentPage('rotate_cw'));
-                            case 'rotate_ccw':
-                              unawaited(_transformCurrentPage('rotate_ccw'));
-                            case 'flip_h':
-                              unawaited(_transformCurrentPage('flip_h'));
-                            case 'flip_v':
-                              unawaited(_transformCurrentPage('flip_v'));
-                            case 'page_orientation':
-                              unawaited(_showPageOrientationDialog());
-                            case 'engine_settings':
-                              unawaited(_showEngineSettingsDialog());
-                            case 'excalidraw_pick':
-                              _toggleExcalidrawPick();
-                            case 'delete_page':
-                              unawaited(_confirmDeletePage());
-                          }
-                        },
-                        itemBuilder: (_) => const [
-                          PopupMenuItem(
-                            value: 'rotate_cw',
-                            child: ListTile(
-                              leading: Icon(Icons.rotate_right),
-                              title: Text('顺时针旋转 90°'),
-                              subtitle: Text('标注几何同步变换'),
-                              contentPadding: EdgeInsets.zero,
-                            ),
-                          ),
-                          PopupMenuItem(
-                            value: 'rotate_ccw',
-                            child: ListTile(
-                              leading: Icon(Icons.rotate_left),
-                              title: Text('逆时针旋转 90°'),
-                              subtitle: Text('标注几何同步变换'),
-                              contentPadding: EdgeInsets.zero,
-                            ),
-                          ),
-                          PopupMenuItem(
-                            value: 'flip_h',
-                            child: ListTile(
-                              leading: Icon(Icons.swap_horiz),
-                              title: Text('左右镜像'),
-                              subtitle: Text('标注几何同步变换'),
-                              contentPadding: EdgeInsets.zero,
-                            ),
-                          ),
-                          PopupMenuItem(
-                            value: 'flip_v',
-                            child: ListTile(
-                              leading: Icon(Icons.swap_vert),
-                              title: Text('上下镜像'),
-                              subtitle: Text('标注几何同步变换'),
-                              contentPadding: EdgeInsets.zero,
-                            ),
-                          ),
-                          PopupMenuItem(
-                            value: 'page_orientation',
-                            child: ListTile(
-                              leading: Icon(Icons.swap_horiz),
-                              title: Text('本页识别方向'),
-                              subtitle: Text('排版方向与阅读方向可按页单独设置'),
-                              contentPadding: EdgeInsets.zero,
-                            ),
-                          ),
-                          PopupMenuItem(
-                            value: 'engine_settings',
-                            child: ListTile(
-                              leading: Icon(Icons.auto_awesome_outlined),
-                              title: Text('识别引擎（本书）'),
-                              subtitle: Text(
-                                'Kraken / PaddleOCR 切换与 Paddle 模型档位',
-                              ),
-                              contentPadding: EdgeInsets.zero,
-                            ),
-                          ),
-                          PopupMenuItem(
-                            value: 'excalidraw_pick',
-                            child: ListTile(
-                              leading: Icon(Icons.draw_outlined),
-                              title: Text('框选导出 Excalidraw'),
-                              subtitle: Text('框选区域，在工作台预览调参后导出可编辑图形'),
-                              contentPadding: EdgeInsets.zero,
-                            ),
-                          ),
-                          PopupMenuItem(
-                            value: 'delete_page',
-                            child: ListTile(
-                              leading: Icon(
-                                Icons.delete_outline,
-                                color: Colors.red,
-                              ),
-                              title: Text(
-                                '删除该页',
-                                style: TextStyle(color: Colors.red),
-                              ),
-                              subtitle: Text('删除图片与本页标注，后页编号前移'),
-                              contentPadding: EdgeInsets.zero,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const Spacer(),
-                    ],
+                  // 标题栏只留书名；原标题栏与 actions 里的页面/全书/校对/
+                  // AI/保存/导出入口全部收进顶部命令栏（菜单 + Word 式
+                  // 工具栏，见 _EditorCommandBarController），功能不减、
+                  // 入口按类归组，工具栏右端「自定义」可调整。
+                  title: Text(
+                    widget.project.name,
+                    overflow: TextOverflow.ellipsis,
                   ),
                   actions: [
                     SegmentedButton<int>(
@@ -6353,184 +6968,52 @@ class _EditorPageState extends State<EditorPage> {
                       onSelectionChanged: (value) =>
                           setState(() => _viewIndex = value.first),
                     ),
-                    const SizedBox(width: 8),
-                    // value 混合两种类型：固定项是字符串指令，插件功能
-                    // 入口是 PluginEntryDescriptor 对象（onSelected 里按
-                    // 类型分流）。
-                    PopupMenuButton<Object>(
-                      icon: const Icon(Icons.auto_stories),
-                      tooltip: '全书操作：总览 / 叠加 / 主区快设 / 拆分 / 墨迹归类 / 整本识别',
-                      onSelected: (value) {
-                        if (_loading) return;
-                        // 插件功能入口：统一走插件打开仪式（先冲刷当前页
-                        // 未落盘修改），入口关闭后由回执刷新受影响页。
-                        if (value is PluginEntryDescriptor) {
-                          unawaited(_openPluginEntry(value));
-                          return;
-                        }
-                        switch (value as String) {
-                          case 'book_grid':
-                            _openBookGrid();
-                          case 'book_overlay':
-                            _openBookOverlay();
-                          case 'region_grid':
-                            _openBookRegionGrid();
-                          case 'book_split':
-                            unawaited(_openBookSplit());
-                          case 'similar_book':
-                            unawaited(_openSimilarCharsBook());
-                          case 'recognize_book':
-                            _startWholeBookRecognition();
-                        }
-                      },
-                      // 基础项固定；插件功能入口按当前启停动态插在
-                      // 「开始整本识别」之前（每次开菜单重新构造，停用
-                      // 插件后入口自动消失）。
-                      itemBuilder: (_) => [
-                        ..._bookMenuEntries(),
-                        for (final entry in PluginHost.instance.enabledEntries(
-                          projectDir: widget.project.projectDir,
-                        ))
-                          PopupMenuItem(
-                            value: entry,
-                            child: ListTile(
-                              leading: Icon(entry.iconData),
-                              title: Text(entry.title),
-                              subtitle: entry.subtitle == null
-                                  ? null
-                                  : Text(entry.subtitle!),
-                              contentPadding: EdgeInsets.zero,
-                            ),
-                          ),
-                      ],
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.hub_outlined),
-                      tooltip:
-                          '墨迹归类：本页相似字块分组批量校正，'
-                          '组可确认；页内可进全书版',
-                      onPressed: _loading || _annotation == null
-                          ? null
-                          : _openSimilarChars,
-                    ),
-                    IconButton(
-                      icon: _verifyingPage
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.fact_check_outlined),
-                      tooltip:
-                          '墨迹校验：识别文字与原字墨迹重叠比对，'
-                          '不匹配的标红并转待复核',
-                      onPressed:
-                          _loading || _annotation == null || _verifyingPage
-                          ? null
-                          : () => unawaited(_verifyPageChars()),
-                    ),
-                    IconButton(
-                      icon: _boxReviewing
-                          ? const SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            )
-                          : const Icon(Icons.auto_fix_high),
-                      tooltip:
-                          'AI 检查识别框：扫描可疑行（重叠/高框/低置信度/两路分歧/'
-                          '墨迹存疑），重摆后按识别置信度裁决，提升才采纳；'
-                          '需在 AI 辅助设置中开启',
-                      onPressed:
-                          _loading ||
-                              _annotation == null ||
-                              _boxReviewing ||
-                              _verifyingPage
-                          ? null
-                          : () => unawaited(_runBoxReviewPage()),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.manage_history),
-                      tooltip:
-                          'AI 溯源：回看本页最后一次识别的完整 AI 辅助过程——'
-                          '每行 AI 看到的图、提示词、思考过程、判定依据、写入内容'
-                          '与 YOLO 局部修复前后（仅保留最后一次运行）',
-                      onPressed: _loading || _annotation == null
-                          ? null
-                          : () => unawaited(
-                              showAiTracePanel(
-                                context,
-                                projectDir: widget.project.projectDir,
-                                pageId: _pageId,
-                                pageLabel: '第 ${_pageIndex + 1} 页',
+                    const SizedBox(width: 12),
+                  ],
+                ),
+                body: Column(
+                  children: [
+                    _cmdBar.build(),
+                    // 左右可停靠工具栏（PS 式）：平时无内容不占空间，
+                    // 拖拽中空栏显示落点占位框。
+                    Expanded(
+                      child: ValueListenableBuilder<bool>(
+                        valueListenable: _cmdBar.dragActive,
+                        builder: (context, dragging, _) => Row(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            _cmdBar.dockWidget(EditorToolbarDocks.left),
+                            Expanded(
+                              child: IndexedStack(
+                                index: _viewIndex,
+                                children: [
+                                  _buildEditorBody(pageCount),
+                                  // active：仅当控制台是当前视图时才刷新 UI。识别洪流期间
+                                  // 隐藏面板若逐条 setState+滚动动画，UI 线程被 build 风暴
+                                  // 压死、引擎任务在 Win32 消息队列积压打满，表现为
+                                  // "Failed to post message to main thread" 刷屏。
+                                  BackendConsolePanel(active: _viewIndex == 1),
+                                ],
                               ),
                             ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.refresh),
-                      tooltip: '重新识别当前页',
-                      onPressed: _loading
-                          ? null
-                          : () => _loadPage(forceSegment: true),
-                    ),
-                    IconButton(
-                      icon: Icon(_dirty ? Icons.save : Icons.save_outlined),
-                      tooltip:
-                          '临时保存：保存当前修改（未完成也可存），'
-                          '不确认、不计入训练数据',
-                      onPressed: _loading || _annotation == null
-                          ? null
-                          : _saveDraftPage,
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.done_all_outlined),
-                      tooltip:
-                          '确认识别框：确认本页全部识别框几何（正文区/段落/行/字框，'
-                          '计入检测训练），单字文字候选保持待确认',
-                      onPressed: _loading || _annotation == null
-                          ? null
-                          : _saveBoxesOnlyPage,
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.task_alt),
-                      tooltip: '确认并保存：确认本页全部识别框与文字，计入训练数据',
-                      onPressed: _loading || _annotation == null
-                          ? null
-                          : _saveCurrentPage,
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.file_download),
-                      tooltip: '导出',
-                      onPressed: () => Navigator.push(
-                        context,
-                        MaterialPageRoute(
-                          builder: (_) => ExportPage(project: widget.project),
+                            _cmdBar.dockWidget(EditorToolbarDocks.right),
+                          ],
                         ),
                       ),
                     ),
                   ],
                 ),
-                body: Column(
-                  children: [
-                    _buildEditorToolbar(),
-                    Expanded(
-                      child: IndexedStack(
-                        index: _viewIndex,
-                        children: [
-                          _buildEditorBody(pageCount),
-                          // active：仅当控制台是当前视图时才刷新 UI。识别洪流期间
-                          // 隐藏面板若逐条 setState+滚动动画，UI 线程被 build 风暴
-                          // 压死、引擎任务在 Win32 消息队列积压打满，表现为
-                          // "Failed to post message to main thread" 刷屏。
-                          BackendConsolePanel(active: _viewIndex == 1),
-                        ],
-                      ),
-                    ),
-                  ],
-                ),
-                bottomNavigationBar: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [_buildBoxIndexBar(), _buildPageNavBar(pageCount)],
+                bottomNavigationBar: ValueListenableBuilder<bool>(
+                  valueListenable: _cmdBar.dragActive,
+                  builder: (context, dragging, _) => Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (_viewIndex == 0)
+                        _cmdBar.dockWidget(EditorToolbarDocks.bottom),
+                      _buildBoxIndexBar(),
+                      _buildPageNavBar(pageCount),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -6552,83 +7035,6 @@ class _EditorPageState extends State<EditorPage> {
 
   // ── 底部翻页栏 ──
 
-  /// 标题栏下方工具栏（仅标注视图）：高频页面操作（旋转/镜像）横排直达
-  /// ——原「页面」菜单里翻两级才能点到；主区视图再挂「新框类别」七类
-  /// 快切（快捷键 1~7，与画布新框、右侧面板类别下拉同一状态）。低频/
-  /// 危险操作（识别方向/框选导出/删除页）仍留在标题栏「页面」菜单。
-  Widget _buildEditorToolbar() {
-    if (_viewIndex != 0) return const SizedBox.shrink();
-    final pageBusy = _loading || _annotation == null;
-    Widget pageOp(IconData icon, String tooltip, String action) => IconButton(
-      icon: Icon(icon, size: 20),
-      tooltip: tooltip,
-      visualDensity: VisualDensity.compact,
-      constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
-      padding: const EdgeInsets.symmetric(horizontal: 5),
-      onPressed: pageBusy
-          ? null
-          : () => unawaited(_transformCurrentPage(action)),
-    );
-    final children = <Widget>[
-      pageOp(Icons.rotate_right, '顺时针旋转 90°（标注几何同步变换）', 'rotate_cw'),
-      pageOp(Icons.rotate_left, '逆时针旋转 90°（标注几何同步变换）', 'rotate_ccw'),
-      pageOp(Icons.swap_horiz, '左右镜像（标注几何同步变换）', 'flip_h'),
-      pageOp(Icons.swap_vert, '上下镜像（标注几何同步变换）', 'flip_v'),
-    ];
-    if (_viewMode == 'region') {
-      children.add(
-        Container(
-          margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-          width: 1,
-          color: Colors.black12,
-        ),
-      );
-      for (var i = 0; i < RegionLabel.all.length; i++) {
-        final label = RegionLabel.all[i];
-        children.add(
-          Padding(
-            padding: const EdgeInsets.only(right: 4),
-            child: Tooltip(
-              message: '新画主区框用此类别（快捷键 ${i + 1}，仅主区视图生效）',
-              child: ChoiceChip(
-                avatar: Container(
-                  width: 9,
-                  height: 9,
-                  decoration: BoxDecoration(
-                    color: RegionLabel.color(label),
-                    shape: BoxShape.circle,
-                  ),
-                ),
-                label: Text(
-                  '${RegionLabel.displayName(label)} ${i + 1}',
-                  style: const TextStyle(fontSize: 12),
-                ),
-                selected: _newRegionLabel == label,
-                visualDensity: VisualDensity.compact,
-                showCheckmark: false,
-                onSelected: (_) => setState(() => _newRegionLabel = label),
-              ),
-            ),
-          ),
-        );
-      }
-    }
-    return Container(
-      decoration: const BoxDecoration(
-        border: Border(bottom: BorderSide(color: Colors.black12)),
-      ),
-      height: 42,
-      child: SingleChildScrollView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 6),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.center,
-          children: children,
-        ),
-      ),
-    );
-  }
-
   /// 行视图序号断点行 id（按本页方向做几何阅读序检查，见
   /// ReadingOrderCalculator.orderBreakIds）：画布标红与底部编号条
   /// 同源共用，一次计算两处消费。
@@ -6646,31 +7052,54 @@ class _EditorPageState extends State<EditorPage> {
 
   /// 翻页栏上方的识别框编号条：按当前视图层级列出本页全部框的编号
   /// （与画布 showIndex 标注同序同号），点编号选中该框并把画布平移到
-  /// 框中心。单字视图没有编号标注，不显示本条；后台控制台视图同样
-  /// 不显示。行视图里序号断点（空间相邻行序号不连续=顺序错误）的
-  /// 编号同步标红，画布放大到局部时也能从编号条定位断点。
+  /// 框中心。版面类型框（页眉/页脚等）不参与编号，chip 直接标类型名
+  /// 并按 RegionLabel 配色，与画布角标同口径；正文框编号只数正文框。
+  /// 单字视图没有编号标注，不显示本条；后台控制台视图同样不显示。
+  /// 行视图里序号断点（空间相邻行序号不连续=顺序错误）的编号同步
+  /// 标红，画布放大到局部时也能从编号条定位断点。
   Widget _buildBoxIndexBar() {
     if (_viewIndex != 0 || _viewMode == 'char') return const SizedBox.shrink();
     final ann = _annotation;
     if (ann == null) return const SizedBox.shrink();
     final lineBreakIds = _viewMode == 'line' ? _lineOrderBreakIds() : null;
-    final List<({int no, Rect rect, bool selected, bool orderBreak})> items;
+    // index 供点击选中（层级列表下标）；label 为 chip 显示文本；
+    // chipColor 非空时 chip 按该色打底（版面类型框的类型配色）。
+    final List<
+      ({
+        int index,
+        String label,
+        Color? chipColor,
+        Rect rect,
+        bool selected,
+        bool orderBreak,
+      })
+    >
+    items;
     switch (_viewMode) {
       case 'region':
-        items = [
-          for (var i = 0; i < ann.mainRegions.length; i++)
-            (
-              no: i + 1,
-              rect: ann.mainRegions[i].rect,
-              selected: ann.mainRegions[i] == _selectedRegion,
-              orderBreak: false,
-            ),
-        ];
+        items = [];
+        var bodyNo = 0;
+        for (var i = 0; i < ann.mainRegions.length; i++) {
+          final region = ann.mainRegions[i];
+          final label = RegionLabel.normalize(region.label);
+          final typed = label != RegionLabel.mainText;
+          if (!typed) bodyNo++;
+          items.add((
+            index: i,
+            label: typed ? RegionLabel.displayName(label) : '$bodyNo',
+            chipColor: typed ? RegionLabel.color(label) : null,
+            rect: region.rect,
+            selected: region == _selectedRegion,
+            orderBreak: false,
+          ));
+        }
       case 'paragraph':
         items = [
           for (var i = 0; i < ann.paragraphs.length; i++)
             (
-              no: i + 1,
+              index: i,
+              label: '${i + 1}',
+              chipColor: null,
               rect: ann.paragraphs[i].rect,
               selected: ann.paragraphs[i] == _selectedParagraph,
               orderBreak: false,
@@ -6680,7 +7109,9 @@ class _EditorPageState extends State<EditorPage> {
         items = [
           for (var i = 0; i < ann.lines.length; i++)
             (
-              no: i + 1,
+              index: i,
+              label: '${i + 1}',
+              chipColor: null,
               rect: ann.lines[i].rect,
               selected: ann.lines[i] == _selectedLine,
               orderBreak: lineBreakIds!.contains(ann.lines[i].id),
@@ -6712,7 +7143,7 @@ class _EditorPageState extends State<EditorPage> {
                     Padding(
                       padding: const EdgeInsets.only(right: 4),
                       child: InkWell(
-                        onTap: () => _focusBoxItem(item.no - 1),
+                        onTap: () => _focusBoxItem(item.index),
                         borderRadius: BorderRadius.circular(6),
                         child: Container(
                           padding: const EdgeInsets.symmetric(
@@ -6721,28 +7152,32 @@ class _EditorPageState extends State<EditorPage> {
                           ),
                           decoration: BoxDecoration(
                             // 断点编号标红（选中橙优先）：与画布行框/
-                            // 角标的 kOrderBreakRed 同色同义
+                            // 角标的 kOrderBreakRed 同色同义；版面类型
+                            // 框 chip 按 RegionLabel 类型配色打底
                             color: item.selected
                                 ? Colors.orange.shade700
                                 : item.orderBreak
                                 ? kOrderBreakRed
-                                : Colors.white,
+                                : item.chipColor ?? Colors.white,
                             borderRadius: BorderRadius.circular(6),
                             border: Border.all(
                               color: item.selected
                                   ? Colors.orange.shade900
                                   : item.orderBreak
                                   ? Colors.red.shade900
-                                  : Colors.grey.shade400,
+                                  : item.chipColor ?? Colors.grey.shade400,
                             ),
                           ),
                           child: Text(
-                            '${item.no}',
+                            item.label,
                             style: TextStyle(
                               fontSize: 11.5,
                               fontWeight: FontWeight.w600,
                               fontFeatures: [FontFeature.tabularFigures()],
-                              color: item.selected || item.orderBreak
+                              color:
+                                  item.selected ||
+                                      item.orderBreak ||
+                                      item.chipColor != null
                                   ? Colors.white
                                   : Colors.grey.shade800,
                             ),
@@ -6759,9 +7194,9 @@ class _EditorPageState extends State<EditorPage> {
     );
   }
 
-  /// 点编号条：按编号（1 基，与画布 showIndex 标注同序）选中对应层级
-  /// 的框（其余层级选中清空），并让画布把该框平移到视口中心（保持
-  /// 当前缩放比例）。
+  /// 点编号条：按下标选中对应层级的框（其余层级选中清空），并让画布
+  /// 把该框平移到视口中心（保持当前缩放比例）。下标与编号条 item 的
+  /// index 一致（层级列表下标，与画布标注/编号条展示序同源）。
   void _focusBoxItem(int index) {
     final ann = _annotation;
     if (ann == null) return;
@@ -6824,11 +7259,10 @@ class _EditorPageState extends State<EditorPage> {
     final confirmedPercent = pageCount == 0
         ? 0
         : (confirmed * 100 / pageCount).round();
-    final boxesConfirmed =
-        _markers.savedPages
-            .union(_markers.boxesReviewedPages)
-            .where((i) => i < pageCount)
-            .length;
+    final boxesConfirmed = _markers.savedPages
+        .union(_markers.boxesReviewedPages)
+        .where((i) => i < pageCount)
+        .length;
     final boxesConfirmedPercent = pageCount == 0
         ? 0
         : (boxesConfirmed * 100 / pageCount).round();
@@ -7157,7 +7591,10 @@ class _ToggleRow extends StatelessWidget {
 
 // ─── 标注 Canvas ──────────────────────────────────────────────────────────────
 
-class _AnnotationCanvas extends StatefulWidget {
+/// 仅对测试开放（`visibleForTesting`）：页面内部始终经 EditorPage 组装，
+/// 测试用它直接驱动 Alt 顶点抓取等画布手势。
+@visibleForTesting
+class AnnotationCanvas extends StatefulWidget {
   final String imagePath;
   final List<MainRegion> mainRegions;
   final List<Paragraph> paragraphs;
@@ -7217,7 +7654,7 @@ class _AnnotationCanvas extends StatefulWidget {
   /// 图像就地改写版本（旋转/镜像后变化触发重新解码，路径不变）。
   final int imageRevision;
 
-  const _AnnotationCanvas({
+  const AnnotationCanvas({super.key,
     required this.imagePath,
     this.imageRevision = 0,
     required this.lines,
@@ -7268,10 +7705,10 @@ class _AnnotationCanvas extends StatefulWidget {
   static void _noopUpdateLine(LineBlock a, LineBlock b) {}
 
   @override
-  State<_AnnotationCanvas> createState() => _AnnotationCanvasState();
+  State<AnnotationCanvas> createState() => AnnotationCanvasState();
 }
 
-class _AnnotationCanvasState extends State<_AnnotationCanvas> {
+class AnnotationCanvasState extends State<AnnotationCanvas> {
   final TransformationController _transform = TransformationController();
 
   /// 编号条「定位」待处理框：focusSeq 变化时记录，build 里按当前缩放
@@ -7326,6 +7763,9 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
   /// 移出画布置空。
   Offset? _hoverLocal;
 
+  /// 修饰键诊断日志去重：上次记录的（键, 相位）与时间戳。
+  (LogicalKeyboardKey, String, DateTime)? _lastModifierLog;
+
   Size _imageSize = Size.zero;
   ui.Image? _image;
 
@@ -7339,6 +7779,26 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
 
   bool _handleAltKey(KeyEvent event) {
     final k = event.logicalKey;
+    // Alt 顶点抓取失效排查诊断：Alt/Meta 修饰键的按下/松开各记一条日志
+    //（用户按住的键实际发出哪个 logicalKey 一目了然）。KeyRepeat 与
+    // 1 秒内的同键同相位重复事件去重，避免按住时按系统重复率刷屏。
+    if ((k == LogicalKeyboardKey.altLeft ||
+            k == LogicalKeyboardKey.altRight ||
+            k == LogicalKeyboardKey.alt ||
+            k == LogicalKeyboardKey.metaLeft ||
+            k == LogicalKeyboardKey.metaRight) &&
+        event is! KeyRepeatEvent) {
+      final phase = event is KeyDownEvent ? '按下' : '松开';
+      final now = DateTime.now();
+      final last = _lastModifierLog;
+      if (last == null ||
+          last.$1 != k ||
+          last.$2 != phase ||
+          now.difference(last.$3) > const Duration(seconds: 1)) {
+        _lastModifierLog = (k, phase, now);
+        PythonService.addAppLog('[手势] 修饰键$phase ${k.debugName ?? k.keyId}');
+      }
+    }
     if (_hoverLocal != null &&
         mounted &&
         (k == LogicalKeyboardKey.altLeft ||
@@ -7405,13 +7865,14 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
   }
 
   @override
-  void didUpdateWidget(_AnnotationCanvas old) {
-    super.didUpdateWidget(old);
-    if (widget.focusSeq != old.focusSeq && widget.focusRect != null) {
+  void didUpdateWidget(AnnotationCanvas oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.focusSeq != oldWidget.focusSeq &&
+        widget.focusRect != null) {
       _pendingFocusRect = widget.focusRect;
     }
-    if (old.imagePath != widget.imagePath ||
-        old.imageRevision != widget.imageRevision) {
+    if (oldWidget.imagePath != widget.imagePath ||
+        oldWidget.imageRevision != widget.imageRevision) {
       // 重置前先抓当前缩放比例。恒等矩阵（上一次换图后还没首帧渲染）
       // 不覆盖已抓的值：连续翻页快于图像解码时，沿用的仍是上一页比例。
       if (!_transform.value.isIdentity()) {
@@ -7527,6 +7988,52 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
       if (rect.contains(imgPos)) return r;
     }
     return null;
+  }
+
+  /// 段/行视图可抓取的版面类型框（label ≠ main_text）：选中框的缩放柄
+  /// 优先（柄在框外沿，先于框命中，与主区视图同一抓取口径），否则常规
+  /// 框命中。正文类主区框不参与——那是主区视图的编辑对象，不在这里吞
+  /// 段/行的点击。
+  MainRegion? _typedRegionGrabTarget(Offset imgPos) {
+    final sel = widget.selectedRegion;
+    if (sel != null &&
+        RegionLabel.normalize(sel.label) != RegionLabel.mainText &&
+        _regionResizeHandleAt(sel, imgPos) != null) {
+      return sel;
+    }
+    for (final r in widget.mainRegions.reversed) {
+      if (RegionLabel.normalize(r.label) == RegionLabel.mainText) continue;
+      final rect = Rect.fromLTWH(
+        r.x.toDouble(),
+        r.y.toDouble(),
+        r.w.toDouble(),
+        r.h.toDouble(),
+      );
+      if (rect.contains(imgPos)) return r;
+    }
+    return null;
+  }
+
+  /// 点中主区框后的抓取：命中缩放柄→缩放，否则整体拖动（主区视图与
+  /// 段/行视图的版面类型框共用同一套状态与回调，选中互斥由父层处理）。
+  void _beginRegionGrab(MainRegion hit, Offset imgPos) {
+    widget.onSelectRegion(hit);
+    final handle = _regionResizeHandleAt(hit, imgPos);
+    if (handle != null) {
+      setState(() {
+        _resizingRegion = hit;
+        _regionResizeHandle = handle;
+        final rect = _objectRect(x: hit.x, y: hit.y, w: hit.w, h: hit.h);
+        _resizeOriginalRect = rect;
+        _resizePointerOffset = imgPos - _resizeHandleCenter(rect, handle);
+      });
+    } else {
+      setState(() {
+        _draggingRegion = hit;
+        _dragRegionOffset =
+            imgPos - Offset(hit.x.toDouble(), hit.y.toDouble());
+      });
+    }
   }
 
   Paragraph? _hitTestParagraph(Offset imgPos) {
@@ -7677,11 +8184,16 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
     switch (widget.viewMode) {
       case 'line':
         final sel = widget.selectedLine;
-        if (sel == null) return false;
+        if (sel == null) {
+          _logAltGrabSkip('行视图没有选中行');
+          return false;
+        }
         final rect = _objectRect(x: sel.x, y: sel.y, w: sel.w, h: sel.h);
+        final handle = AnnotationHitGeometry.nearestHandle(rect, imgPos);
+        _logAltGrab('行 id=${sel.id} 顶点=$handle');
         setState(() {
           _resizingLine = sel;
-          _lineResizeHandle = AnnotationHitGeometry.nearestHandle(rect, imgPos);
+          _lineResizeHandle = handle;
           _resizeOriginalRect = rect;
           _resizePointerOffset = Offset.zero; // 顶点直接贴指针，不保留抓取偏移
         });
@@ -7689,14 +8201,16 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
         return true;
       case 'region':
         final sel = widget.selectedRegion;
-        if (sel == null) return false;
+        if (sel == null) {
+          _logAltGrabSkip('主区视图没有选中主区');
+          return false;
+        }
         final rect = _objectRect(x: sel.x, y: sel.y, w: sel.w, h: sel.h);
+        final handle = AnnotationHitGeometry.nearestHandle(rect, imgPos);
+        _logAltGrab('主区 id=${sel.id} 顶点=$handle');
         setState(() {
           _resizingRegion = sel;
-          _regionResizeHandle = AnnotationHitGeometry.nearestHandle(
-            rect,
-            imgPos,
-          );
+          _regionResizeHandle = handle;
           _resizeOriginalRect = rect;
           _resizePointerOffset = Offset.zero;
         });
@@ -7704,14 +8218,16 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
         return true;
       case 'paragraph':
         final sel = widget.selectedParagraph;
-        if (sel == null) return false;
+        if (sel == null) {
+          _logAltGrabSkip('段视图没有选中段');
+          return false;
+        }
         final rect = _objectRect(x: sel.x, y: sel.y, w: sel.w, h: sel.h);
+        final handle = AnnotationHitGeometry.nearestHandle(rect, imgPos);
+        _logAltGrab('段 id=${sel.id} 顶点=$handle');
         setState(() {
           _resizingParagraph = sel;
-          _paragraphResizeHandle = AnnotationHitGeometry.nearestHandle(
-            rect,
-            imgPos,
-          );
+          _paragraphResizeHandle = handle;
           _resizeOriginalRect = rect;
           _resizePointerOffset = Offset.zero;
         });
@@ -7721,6 +8237,17 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
         return false;
     }
   }
+
+  /// Alt 顶点抓取成功接管时记一条手势日志（顶点抓取失效排查的对照面：
+  /// 日志里「Alt 顶点抓取接管」与「修饰键按下 Alt Left」同时出现说明
+  /// 按键与功能链路都通）。
+  void _logAltGrab(String detail) =>
+      PythonService.addAppLog('[手势] Alt 顶点抓取接管 $detail');
+
+  /// 按住 Alt 单击却没接管（无选中框等）时记原因，与成功路径同一前缀
+  /// 便于过滤。
+  void _logAltGrabSkip(String reason) =>
+      PythonService.addAppLog('[手势] Alt 顶点抓取未接管：$reason');
 
   void _zoomAt(Offset focalPoint, double scaleDelta) {
     final current = _transform.value.clone();
@@ -7784,6 +8311,15 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
   bool get _canEditParagraph =>
       !widget.reorderMode && widget.viewMode == 'paragraph';
 
+  /// 段/行视图「新框类别」选了非正文类别时，空白拖拽改画该版面框
+  /// （页眉/页脚等不用切回主区视图补画；null = 保持本视图原语义：
+  /// 画行/段框。正文类别恒走原语义，正文主区框仍在主区视图画）。
+  String? get _typedDrawLabel =>
+      (widget.viewMode == 'line' || widget.viewMode == 'paragraph') &&
+          widget.newRegionLabel != RegionLabel.mainText
+      ? widget.newRegionLabel
+      : null;
+
   @override
   Widget build(BuildContext context) {
     if (_imageSize == Size.zero) {
@@ -7822,513 +8358,539 @@ class _AnnotationCanvasState extends State<_AnnotationCanvas> {
             if (_hoverLocal != null) setState(() => _hoverLocal = null);
           },
           child: Listener(
-          behavior: HitTestBehavior.opaque,
-          // 悬停跟踪：Alt 引导线的指针端（非 Alt 时不触发重绘）。
-          onPointerHover: (e) {
-            _hoverLocal = e.localPosition;
-            if (HardwareKeyboard.instance.isAltPressed) setState(() {});
-          },
-          onPointerSignal: (signal) {
-            if (signal is PointerScrollEvent) {
-              _zoomAt(
-                signal.localPosition,
-                signal.scrollDelta.dy > 0 ? 0.9 : 1.1,
-              );
-            }
-          },
-          onPointerDown: (e) {
-            // right-button: always pan
-            if (e.buttons == kSecondaryMouseButton) {
-              setState(() {
-                _clearPointerState();
-                _panning = true;
+            behavior: HitTestBehavior.opaque,
+            // 悬停跟踪：Alt 引导线的指针端（非 Alt 时不触发重绘）。
+            onPointerHover: (e) {
+              _hoverLocal = e.localPosition;
+              if (HardwareKeyboard.instance.isAltPressed) setState(() {});
+            },
+            onPointerSignal: (signal) {
+              if (signal is PointerScrollEvent) {
+                _zoomAt(
+                  signal.localPosition,
+                  signal.scrollDelta.dy > 0 ? 0.9 : 1.1,
+                );
+              }
+            },
+            onPointerDown: (e) {
+              // right-button: always pan
+              if (e.buttons == kSecondaryMouseButton) {
+                setState(() {
+                  _clearPointerState();
+                  _panning = true;
+                  _panLast = e.localPosition;
+                });
+                return;
+              }
+              if (e.buttons != kPrimaryMouseButton) return;
+
+              final imgPos = _toImage(e.localPosition);
+
+              // line view + reorder mode: click lines to assign temporary order
+              if (widget.viewMode == 'line' && widget.reorderMode) {
+                final hit = _hitTestLine(imgPos);
+                if (hit != null) widget.onReorderLine(hit);
+                return;
+              }
+              if (widget.viewMode == 'paragraph' && widget.reorderMode) {
+                final hit = _hitTestParagraph(imgPos);
+                if (hit != null) widget.onReorderParagraph(hit);
+                return;
+              }
+
+              // Alt+按下：非单字视图把选中框最近顶点移到点击处（接管本次手势）
+              if (_tryAltVertexGrab(imgPos)) return;
+
+              // line view: click to select / drag / resize line, or draw a new line.
+              // 重识别期间不禁止编辑：改动按最新几何重新入队并作废旧任务
+              // （见 _enqueueCascade），正在识别的行被再次调整时结果会被丢弃。
+              if (widget.viewMode == 'line') {
+                // 页眉/页脚等版面类型框先于行命中（常显参考层可直接点选/
+                // 拖动/缩放）；正文类主区框不拦，避免吞掉行编辑的点击。
+                final typedHit = _typedRegionGrabTarget(imgPos);
+                if (typedHit != null) {
+                  _beginRegionGrab(typedHit, imgPos);
+                  return;
+                }
+                // Handle targets extend beyond the box edge.  Check the
+                // selected object's handles before the regular box hit test so
+                // clicking the outside half of a corner still resizes it.
+                final selectedLine = widget.selectedLine;
+                final hit =
+                    (selectedLine != null &&
+                        _lineResizeHandleAt(selectedLine, imgPos) != null)
+                    ? selectedLine
+                    : _hitTestLine(imgPos);
+                if (hit != null) {
+                  widget.onSelectLine(hit);
+                  final handle = _lineResizeHandleAt(hit, imgPos);
+                  if (handle != null) {
+                    setState(() {
+                      _resizingLine = hit;
+                      _lineResizeHandle = handle;
+                      final rect = _objectRect(
+                        x: hit.x,
+                        y: hit.y,
+                        w: hit.w,
+                        h: hit.h,
+                      );
+                      _resizeOriginalRect = rect;
+                      _resizePointerOffset =
+                          imgPos - _resizeHandleCenter(rect, handle);
+                    });
+                  } else {
+                    setState(() {
+                      _draggingLine = hit;
+                      _dragLineOffset =
+                          imgPos - Offset(hit.x.toDouble(), hit.y.toDouble());
+                    });
+                  }
+                } else {
+                  widget.onSelectLine(null);
+                  setState(() {
+                    _dragStart = imgPos;
+                    _dragCurrent = imgPos;
+                  });
+                }
+                return;
+              }
+
+              // region view: click to select / drag / resize region（重识别期间可继续编辑）
+              if (widget.viewMode == 'region') {
+                final selectedRegion = widget.selectedRegion;
+                final hit =
+                    (selectedRegion != null &&
+                        _regionResizeHandleAt(selectedRegion, imgPos) != null)
+                    ? selectedRegion
+                    : _hitTestRegion(imgPos);
+                if (hit != null) {
+                  _beginRegionGrab(hit, imgPos);
+                } else {
+                  widget.onSelectRegion(null);
+                  setState(() {
+                    _dragStart = imgPos;
+                    _dragCurrent = imgPos;
+                  });
+                }
+                return;
+              }
+
+              // paragraph view: click to select / drag / resize paragraph（重识别期间可继续编辑）
+              if (widget.viewMode == 'paragraph') {
+                // 版面类型框（页眉/页脚等）先于段命中（常显参考层可直接
+                // 点选/拖动/缩放）；正文类主区框不拦，避免吞掉段的点击。
+                final typedHit = _typedRegionGrabTarget(imgPos);
+                if (typedHit != null) {
+                  _beginRegionGrab(typedHit, imgPos);
+                  return;
+                }
+                final selectedParagraph = widget.selectedParagraph;
+                final hit =
+                    (selectedParagraph != null &&
+                        _paragraphResizeHandleAt(selectedParagraph, imgPos) !=
+                            null)
+                    ? selectedParagraph
+                    : _hitTestParagraph(imgPos);
+                if (hit != null) {
+                  widget.onSelectParagraph(hit);
+                  final handle = _paragraphResizeHandleAt(hit, imgPos);
+                  if (handle != null) {
+                    setState(() {
+                      _resizingParagraph = hit;
+                      _paragraphResizeHandle = handle;
+                      final rect = _objectRect(
+                        x: hit.x,
+                        y: hit.y,
+                        w: hit.w,
+                        h: hit.h,
+                      );
+                      _resizeOriginalRect = rect;
+                      _resizePointerOffset =
+                          imgPos - _resizeHandleCenter(rect, handle);
+                    });
+                  } else {
+                    setState(() {
+                      _draggingParagraph = hit;
+                      _dragParaOffset =
+                          imgPos - Offset(hit.x.toDouble(), hit.y.toDouble());
+                    });
+                  }
+                } else {
+                  widget.onSelectParagraph(null);
+                  setState(() {
+                    _dragStart = imgPos;
+                    _dragCurrent = imgPos;
+                  });
+                }
+                return;
+              }
+
+              // char view: select / drag / resize
+              final selectedBlock = widget.selected;
+              final hit =
+                  (selectedBlock != null &&
+                      _blockResizeHandle(selectedBlock, imgPos) != null)
+                  ? selectedBlock
+                  : _hitTestBlock(imgPos);
+              if (hit != null) {
+                final handle = _blockResizeHandle(hit, imgPos);
+                if (handle != null) {
+                  PythonService.addAppLog(
+                    '[手势] 页面画布字框缩放开始 char=${hit.id} '
+                    'lineId=${hit.lineId} handle=$handle '
+                    'rect=(${hit.x},${hit.y},${hit.w},${hit.h})',
+                  );
+                  setState(() {
+                    _resizing = hit;
+                    _resizeHandle = handle;
+                    final rect = _objectRect(
+                      x: hit.x,
+                      y: hit.y,
+                      w: hit.w,
+                      h: hit.h,
+                    );
+                    _resizeOriginalRect = rect;
+                    _resizePointerOffset =
+                        imgPos - _resizeHandleCenter(rect, handle);
+                  });
+                } else {
+                  setState(() {
+                    _dragging = hit;
+                    _dragOffset =
+                        imgPos - Offset(hit.x.toDouble(), hit.y.toDouble());
+                  });
+                }
+                widget.onSelect(hit);
+              } else {
+                setState(() {
+                  _dragStart = imgPos;
+                  _dragCurrent = imgPos;
+                });
+                widget.onSelect(null);
+              }
+            },
+            onPointerMove: (e) {
+              if (_panning && _panLast != null) {
+                _panBy(e.localPosition - _panLast!);
                 _panLast = e.localPosition;
-              });
-              return;
-            }
-            if (e.buttons != kPrimaryMouseButton) return;
+                return;
+              }
+              if (e.buttons != kPrimaryMouseButton) return;
 
-            final imgPos = _toImage(e.localPosition);
+              if (!_canEditChars &&
+                  !_canDrawNewLine &&
+                  !_canEditRegion &&
+                  !_canEditParagraph) {
+                return;
+              }
 
-            // line view + reorder mode: click lines to assign temporary order
-            if (widget.viewMode == 'line' && widget.reorderMode) {
-              final hit = _hitTestLine(imgPos);
-              if (hit != null) widget.onReorderLine(hit);
-              return;
-            }
-            if (widget.viewMode == 'paragraph' && widget.reorderMode) {
-              final hit = _hitTestParagraph(imgPos);
-              if (hit != null) widget.onReorderParagraph(hit);
-              return;
-            }
-
-            // Alt+按下：非单字视图把选中框最近顶点移到点击处（接管本次手势）
-            if (_tryAltVertexGrab(imgPos)) return;
-
-            // line view: click to select / drag / resize line, or draw a new line.
-            // 重识别期间不禁止编辑：改动按最新几何重新入队并作废旧任务
-            // （见 _enqueueCascade），正在识别的行被再次调整时结果会被丢弃。
-            if (widget.viewMode == 'line') {
-              // Handle targets extend beyond the box edge.  Check the
-              // selected object's handles before the regular box hit test so
-              // clicking the outside half of a corner still resizes it.
-              final selectedLine = widget.selectedLine;
-              final hit =
-                  (selectedLine != null &&
-                      _lineResizeHandleAt(selectedLine, imgPos) != null)
-                  ? selectedLine
-                  : _hitTestLine(imgPos);
-              if (hit != null) {
-                widget.onSelectLine(hit);
-                final handle = _lineResizeHandleAt(hit, imgPos);
-                if (handle != null) {
-                  setState(() {
-                    _resizingLine = hit;
-                    _lineResizeHandle = handle;
-                    final rect = _objectRect(
-                      x: hit.x,
-                      y: hit.y,
-                      w: hit.w,
-                      h: hit.h,
-                    );
-                    _resizeOriginalRect = rect;
-                    _resizePointerOffset =
-                        imgPos - _resizeHandleCenter(rect, handle);
-                  });
-                } else {
-                  setState(() {
-                    _draggingLine = hit;
-                    _dragLineOffset =
-                        imgPos - Offset(hit.x.toDouble(), hit.y.toDouble());
-                  });
-                }
-              } else {
-                widget.onSelectLine(null);
+              final imgPos = _toImage(e.localPosition);
+              if (_resizing != null && _resizeHandle != null) {
+                final b = _resizing!;
+                final resized = _clampRectToImage(
+                  _resizeRectFromHandle(
+                    _resizeOriginalRect ??
+                        _objectRect(x: b.x, y: b.y, w: b.w, h: b.h),
+                    imgPos,
+                    _resizeHandle!,
+                    minSize: 10,
+                  ),
+                );
+                final updated = b.copyWith(
+                  x: resized.left.toInt(),
+                  y: resized.top.toInt(),
+                  w: resized.width.toInt(),
+                  h: resized.height.toInt(),
+                );
+                widget.onUpdate(b, updated);
+                setState(() => _resizing = updated);
+              } else if (_dragging != null && _dragOffset != null) {
+                final b = _dragging!;
+                final clampedPos = _clampMovePos(
+                  Offset(
+                    imgPos.dx - _dragOffset!.dx,
+                    imgPos.dy - _dragOffset!.dy,
+                  ),
+                  b.w,
+                  b.h,
+                );
+                final newX = clampedPos.dx.toInt();
+                final newY = clampedPos.dy.toInt();
+                final updated = b.copyWith(x: newX, y: newY);
+                widget.onUpdate(b, updated);
+                setState(() => _dragging = updated);
+              } else if (_resizingRegion != null &&
+                  _regionResizeHandle != null) {
+                _applyRegionResize(_resizingRegion!, imgPos);
+              } else if (_draggingRegion != null && _dragRegionOffset != null) {
+                final r = _draggingRegion!;
+                final clampedPos = _clampMovePos(
+                  Offset(
+                    imgPos.dx - _dragRegionOffset!.dx,
+                    imgPos.dy - _dragRegionOffset!.dy,
+                  ),
+                  r.w,
+                  r.h,
+                );
+                final newX = clampedPos.dx.toInt();
+                final newY = clampedPos.dy.toInt();
+                final updated = MainRegion(
+                  id: r.id,
+                  x: newX,
+                  y: newY,
+                  w: r.w,
+                  h: r.h,
+                  label: r.label,
+                  status: r.status,
+                  boxConfirmed: r.boxConfirmed,
+                  uid: r.uid,
+                );
+                widget.onUpdateRegion(r, updated);
+                setState(() => _draggingRegion = updated);
+              } else if (_resizingParagraph != null &&
+                  _paragraphResizeHandle != null) {
+                _applyParagraphResize(_resizingParagraph!, imgPos);
+              } else if (_draggingParagraph != null &&
+                  _dragParaOffset != null) {
+                final p = _draggingParagraph!;
+                final clampedPos = _clampMovePos(
+                  Offset(
+                    imgPos.dx - _dragParaOffset!.dx,
+                    imgPos.dy - _dragParaOffset!.dy,
+                  ),
+                  p.w,
+                  p.h,
+                );
+                final newX = clampedPos.dx.toInt();
+                final newY = clampedPos.dy.toInt();
+                final updated = Paragraph(
+                  id: p.id,
+                  x: newX,
+                  y: newY,
+                  w: p.w,
+                  h: p.h,
+                  mainRegionId: p.mainRegionId,
+                  lineIds: p.lineIds,
+                  type: p.type,
+                  manual: true,
+                  status: p.status,
+                  boxConfirmed: p.boxConfirmed,
+                  uid: p.uid,
+                );
+                widget.onUpdateParagraph(p, updated);
+                setState(() => _draggingParagraph = updated);
+              } else if (_resizingLine != null && _lineResizeHandle != null) {
+                _applyLineResize(_resizingLine!, imgPos);
+              } else if (_draggingLine != null && _dragLineOffset != null) {
+                final l = _draggingLine!;
+                final clampedPos = _clampMovePos(
+                  Offset(
+                    imgPos.dx - _dragLineOffset!.dx,
+                    imgPos.dy - _dragLineOffset!.dy,
+                  ),
+                  l.w,
+                  l.h,
+                );
+                final newX = clampedPos.dx.toInt();
+                final newY = clampedPos.dy.toInt();
+                final updated = l.copyWith(x: newX, y: newY);
+                widget.onUpdateLine(l, updated);
+                setState(() => _draggingLine = updated);
+              } else if (_dragStart != null) {
                 setState(() {
-                  _dragStart = imgPos;
-                  _dragCurrent = imgPos;
+                  _dragCurrent = Offset(
+                    imgPos.dx.clamp(0.0, _imageSize.width),
+                    imgPos.dy.clamp(0.0, _imageSize.height),
+                  );
                 });
               }
-              return;
-            }
-
-            // region view: click to select / drag / resize region（重识别期间可继续编辑）
-            if (widget.viewMode == 'region') {
-              final selectedRegion = widget.selectedRegion;
-              final hit =
-                  (selectedRegion != null &&
-                      _regionResizeHandleAt(selectedRegion, imgPos) != null)
-                  ? selectedRegion
-                  : _hitTestRegion(imgPos);
-              if (hit != null) {
-                widget.onSelectRegion(hit);
-                final handle = _regionResizeHandleAt(hit, imgPos);
-                if (handle != null) {
-                  setState(() {
-                    _resizingRegion = hit;
-                    _regionResizeHandle = handle;
-                    final rect = _objectRect(
-                      x: hit.x,
-                      y: hit.y,
-                      w: hit.w,
-                      h: hit.h,
-                    );
-                    _resizeOriginalRect = rect;
-                    _resizePointerOffset =
-                        imgPos - _resizeHandleCenter(rect, handle);
-                  });
-                } else {
-                  setState(() {
-                    _draggingRegion = hit;
-                    _dragRegionOffset =
-                        imgPos - Offset(hit.x.toDouble(), hit.y.toDouble());
-                  });
-                }
-              } else {
-                widget.onSelectRegion(null);
-                setState(() {
-                  _dragStart = imgPos;
-                  _dragCurrent = imgPos;
-                });
-              }
-              return;
-            }
-
-            // paragraph view: click to select / drag / resize paragraph（重识别期间可继续编辑）
-            if (widget.viewMode == 'paragraph') {
-              final selectedParagraph = widget.selectedParagraph;
-              final hit =
-                  (selectedParagraph != null &&
-                      _paragraphResizeHandleAt(selectedParagraph, imgPos) !=
-                          null)
-                  ? selectedParagraph
-                  : _hitTestParagraph(imgPos);
-              if (hit != null) {
-                widget.onSelectParagraph(hit);
-                final handle = _paragraphResizeHandleAt(hit, imgPos);
-                if (handle != null) {
-                  setState(() {
-                    _resizingParagraph = hit;
-                    _paragraphResizeHandle = handle;
-                    final rect = _objectRect(
-                      x: hit.x,
-                      y: hit.y,
-                      w: hit.w,
-                      h: hit.h,
-                    );
-                    _resizeOriginalRect = rect;
-                    _resizePointerOffset =
-                        imgPos - _resizeHandleCenter(rect, handle);
-                  });
-                } else {
-                  setState(() {
-                    _draggingParagraph = hit;
-                    _dragParaOffset =
-                        imgPos - Offset(hit.x.toDouble(), hit.y.toDouble());
-                  });
-                }
-              } else {
-                widget.onSelectParagraph(null);
-                setState(() {
-                  _dragStart = imgPos;
-                  _dragCurrent = imgPos;
-                });
-              }
-              return;
-            }
-
-            // char view: select / drag / resize
-            final selectedBlock = widget.selected;
-            final hit =
-                (selectedBlock != null &&
-                    _blockResizeHandle(selectedBlock, imgPos) != null)
-                ? selectedBlock
-                : _hitTestBlock(imgPos);
-            if (hit != null) {
-              final handle = _blockResizeHandle(hit, imgPos);
-              if (handle != null) {
+            },
+            onPointerUp: (e) {
+              // 区/段/行/单字的拖动或缩放手势结束 → 通知页面触发级联/重识别
+              final geometryEdited =
+                  _dragging != null ||
+                  _resizing != null ||
+                  _draggingRegion != null ||
+                  _resizingRegion != null ||
+                  _draggingParagraph != null ||
+                  _resizingParagraph != null ||
+                  _draggingLine != null ||
+                  _resizingLine != null;
+              if (_resizing != null) {
+                final o = _resizeOriginalRect;
                 PythonService.addAppLog(
-                  '[手势] 页面画布字框缩放开始 char=${hit.id} '
-                  'lineId=${hit.lineId} handle=$handle '
-                  'rect=(${hit.x},${hit.y},${hit.w},${hit.h})',
+                  '[手势] 页面画布字框缩放结束 ${_resizing!.id} '
+                  '原=(${o?.left.toStringAsFixed(0)},${o?.top.toStringAsFixed(0)},'
+                  '${o?.width.toStringAsFixed(0)},${o?.height.toStringAsFixed(0)}) '
+                  '终=(${_resizing!.x},${_resizing!.y},${_resizing!.w},${_resizing!.h})',
                 );
-                setState(() {
-                  _resizing = hit;
-                  _resizeHandle = handle;
-                  final rect = _objectRect(
-                    x: hit.x,
-                    y: hit.y,
-                    w: hit.w,
-                    h: hit.h,
-                  );
-                  _resizeOriginalRect = rect;
-                  _resizePointerOffset =
-                      imgPos - _resizeHandleCenter(rect, handle);
-                });
-              } else {
-                setState(() {
-                  _dragging = hit;
-                  _dragOffset =
-                      imgPos - Offset(hit.x.toDouble(), hit.y.toDouble());
-                });
               }
-              widget.onSelect(hit);
-            } else {
-              setState(() {
-                _dragStart = imgPos;
-                _dragCurrent = imgPos;
-              });
-              widget.onSelect(null);
-            }
-          },
-          onPointerMove: (e) {
-            if (_panning && _panLast != null) {
-              _panBy(e.localPosition - _panLast!);
-              _panLast = e.localPosition;
-              return;
-            }
-            if (e.buttons != kPrimaryMouseButton) return;
-
-            if (!_canEditChars &&
-                !_canDrawNewLine &&
-                !_canEditRegion &&
-                !_canEditParagraph) {
-              return;
-            }
-
-            final imgPos = _toImage(e.localPosition);
-            if (_resizing != null && _resizeHandle != null) {
-              final b = _resizing!;
-              final resized = _clampRectToImage(
-                _resizeRectFromHandle(
-                  _resizeOriginalRect ??
-                      _objectRect(x: b.x, y: b.y, w: b.w, h: b.h),
-                  imgPos,
-                  _resizeHandle!,
-                  minSize: 10,
-                ),
-              );
-              final updated = b.copyWith(
-                x: resized.left.toInt(),
-                y: resized.top.toInt(),
-                w: resized.width.toInt(),
-                h: resized.height.toInt(),
-              );
-              widget.onUpdate(b, updated);
-              setState(() => _resizing = updated);
-            } else if (_dragging != null && _dragOffset != null) {
-              final b = _dragging!;
-              final clampedPos = _clampMovePos(
-                Offset(
-                  imgPos.dx - _dragOffset!.dx,
-                  imgPos.dy - _dragOffset!.dy,
-                ),
-                b.w,
-                b.h,
-              );
-              final newX = clampedPos.dx.toInt();
-              final newY = clampedPos.dy.toInt();
-              final updated = b.copyWith(x: newX, y: newY);
-              widget.onUpdate(b, updated);
-              setState(() => _dragging = updated);
-            } else if (_resizingRegion != null && _regionResizeHandle != null) {
-              _applyRegionResize(_resizingRegion!, imgPos);
-            } else if (_draggingRegion != null && _dragRegionOffset != null) {
-              final r = _draggingRegion!;
-              final clampedPos = _clampMovePos(
-                Offset(
-                  imgPos.dx - _dragRegionOffset!.dx,
-                  imgPos.dy - _dragRegionOffset!.dy,
-                ),
-                r.w,
-                r.h,
-              );
-              final newX = clampedPos.dx.toInt();
-              final newY = clampedPos.dy.toInt();
-              final updated = MainRegion(
-                id: r.id,
-                x: newX,
-                y: newY,
-                w: r.w,
-                h: r.h,
-                label: r.label,
-                status: r.status,
-                boxConfirmed: r.boxConfirmed,
-                uid: r.uid,
-              );
-              widget.onUpdateRegion(r, updated);
-              setState(() => _draggingRegion = updated);
-            } else if (_resizingParagraph != null &&
-                _paragraphResizeHandle != null) {
-              _applyParagraphResize(_resizingParagraph!, imgPos);
-            } else if (_draggingParagraph != null && _dragParaOffset != null) {
-              final p = _draggingParagraph!;
-              final clampedPos = _clampMovePos(
-                Offset(
-                  imgPos.dx - _dragParaOffset!.dx,
-                  imgPos.dy - _dragParaOffset!.dy,
-                ),
-                p.w,
-                p.h,
-              );
-              final newX = clampedPos.dx.toInt();
-              final newY = clampedPos.dy.toInt();
-              final updated = Paragraph(
-                id: p.id,
-                x: newX,
-                y: newY,
-                w: p.w,
-                h: p.h,
-                mainRegionId: p.mainRegionId,
-                lineIds: p.lineIds,
-                type: p.type,
-                manual: true,
-                status: p.status,
-                boxConfirmed: p.boxConfirmed,
-                uid: p.uid,
-              );
-              widget.onUpdateParagraph(p, updated);
-              setState(() => _draggingParagraph = updated);
-            } else if (_resizingLine != null && _lineResizeHandle != null) {
-              _applyLineResize(_resizingLine!, imgPos);
-            } else if (_draggingLine != null && _dragLineOffset != null) {
-              final l = _draggingLine!;
-              final clampedPos = _clampMovePos(
-                Offset(
-                  imgPos.dx - _dragLineOffset!.dx,
-                  imgPos.dy - _dragLineOffset!.dy,
-                ),
-                l.w,
-                l.h,
-              );
-              final newX = clampedPos.dx.toInt();
-              final newY = clampedPos.dy.toInt();
-              final updated = l.copyWith(x: newX, y: newY);
-              widget.onUpdateLine(l, updated);
-              setState(() => _draggingLine = updated);
-            } else if (_dragStart != null) {
-              setState(() {
-                _dragCurrent = Offset(
-                  imgPos.dx.clamp(0.0, _imageSize.width),
-                  imgPos.dy.clamp(0.0, _imageSize.height),
+              if (_dragStart != null && _dragCurrent != null) {
+                // 识别框不得画出页面图片：钳回图片范围
+                final r = _clampRectToImage(
+                  Rect.fromPoints(_dragStart!, _dragCurrent!),
                 );
-              });
-            }
-          },
-          onPointerUp: (e) {
-            // 区/段/行/单字的拖动或缩放手势结束 → 通知页面触发级联/重识别
-            final geometryEdited =
-                _dragging != null ||
-                _resizing != null ||
-                _draggingRegion != null ||
-                _resizingRegion != null ||
-                _draggingParagraph != null ||
-                _resizingParagraph != null ||
-                _draggingLine != null ||
-                _resizingLine != null;
-            if (_resizing != null) {
-              final o = _resizeOriginalRect;
-              PythonService.addAppLog(
-                '[手势] 页面画布字框缩放结束 ${_resizing!.id} '
-                '原=(${o?.left.toStringAsFixed(0)},${o?.top.toStringAsFixed(0)},'
-                '${o?.width.toStringAsFixed(0)},${o?.height.toStringAsFixed(0)}) '
-                '终=(${_resizing!.x},${_resizing!.y},${_resizing!.w},${_resizing!.h})',
-              );
-            }
-            if (_dragStart != null && _dragCurrent != null) {
-              // 识别框不得画出页面图片：钳回图片范围
-              final r = _clampRectToImage(
-                Rect.fromPoints(_dragStart!, _dragCurrent!),
-              );
-              if (r.width > 8 && r.height > 8) {
-                if (widget.pickRegion && widget.onPickRegion != null) {
-                  // 框选导出模式：选区交给调用方（Excalidraw 导出），
-                  // 不建任何框。
-                  widget.onPickRegion!(r);
-                } else if (_canEditChars) {
-                  final id = 'u_${DateTime.now().millisecondsSinceEpoch}';
-                  widget.onAdd(
-                    CharBlock(
-                      id: id,
-                      x: r.left.toInt(),
-                      y: r.top.toInt(),
-                      w: r.width.toInt(),
-                      h: r.height.toInt(),
-                      col: 0,
-                      order: 0,
-                    ),
-                  );
-                } else if (_canDrawNewLine) {
-                  final id = 'manual_${DateTime.now().millisecondsSinceEpoch}';
-                  widget.onAddLine(
-                    LineBlock(
-                      id: id,
-                      x: r.left.toInt(),
-                      y: r.top.toInt(),
-                      w: r.width.toInt(),
-                      h: r.height.toInt(),
-                      lineNo: 0,
-                    ),
-                  );
-                } else if (_canEditRegion) {
-                  widget.onAddRegion(
-                    MainRegion(
-                      id: '',
-                      x: r.left.toInt(),
-                      y: r.top.toInt(),
-                      w: r.width.toInt(),
-                      h: r.height.toInt(),
-                      label: widget.newRegionLabel,
-                    ),
-                  );
-                } else if (_canEditParagraph) {
-                  widget.onAddParagraph(
-                    Paragraph(
-                      id: '',
-                      x: r.left.toInt(),
-                      y: r.top.toInt(),
-                      w: r.width.toInt(),
-                      h: r.height.toInt(),
-                    ),
-                  );
+                if (r.width > 8 && r.height > 8) {
+                  if (widget.pickRegion && widget.onPickRegion != null) {
+                    // 框选导出模式：选区交给调用方（Excalidraw 导出），
+                    // 不建任何框。
+                    widget.onPickRegion!(r);
+                  } else if (_canEditChars) {
+                    final id = 'u_${DateTime.now().millisecondsSinceEpoch}';
+                    widget.onAdd(
+                      CharBlock(
+                        id: id,
+                        x: r.left.toInt(),
+                        y: r.top.toInt(),
+                        w: r.width.toInt(),
+                        h: r.height.toInt(),
+                        col: 0,
+                        order: 0,
+                      ),
+                    );
+                  } else if (_canDrawNewLine) {
+                    final typed = _typedDrawLabel;
+                    if (typed != null) {
+                      widget.onAddRegion(
+                        MainRegion(
+                          id: '',
+                          x: r.left.toInt(),
+                          y: r.top.toInt(),
+                          w: r.width.toInt(),
+                          h: r.height.toInt(),
+                          label: typed,
+                        ),
+                      );
+                    } else {
+                      final id =
+                          'manual_${DateTime.now().millisecondsSinceEpoch}';
+                      widget.onAddLine(
+                        LineBlock(
+                          id: id,
+                          x: r.left.toInt(),
+                          y: r.top.toInt(),
+                          w: r.width.toInt(),
+                          h: r.height.toInt(),
+                          lineNo: 0,
+                        ),
+                      );
+                    }
+                  } else if (_canEditRegion) {
+                    widget.onAddRegion(
+                      MainRegion(
+                        id: '',
+                        x: r.left.toInt(),
+                        y: r.top.toInt(),
+                        w: r.width.toInt(),
+                        h: r.height.toInt(),
+                        label: widget.newRegionLabel,
+                      ),
+                    );
+                  } else if (_canEditParagraph) {
+                    final typed = _typedDrawLabel;
+                    if (typed != null) {
+                      widget.onAddRegion(
+                        MainRegion(
+                          id: '',
+                          x: r.left.toInt(),
+                          y: r.top.toInt(),
+                          w: r.width.toInt(),
+                          h: r.height.toInt(),
+                          label: typed,
+                        ),
+                      );
+                    } else {
+                      widget.onAddParagraph(
+                        Paragraph(
+                          id: '',
+                          x: r.left.toInt(),
+                          y: r.top.toInt(),
+                          w: r.width.toInt(),
+                          h: r.height.toInt(),
+                        ),
+                      );
+                    }
+                  }
                 }
               }
-            }
-            setState(_clearPointerState);
-            if (geometryEdited) widget.onGeometryEditEnd?.call();
-          },
-          onPointerCancel: (e) {
-            // 手势被系统中断时几何可能已被改动，同样结束级联，避免脏标记残留
-            final geometryEdited =
-                _dragging != null ||
-                _resizing != null ||
-                _draggingRegion != null ||
-                _resizingRegion != null ||
-                _draggingParagraph != null ||
-                _resizingParagraph != null ||
-                _draggingLine != null ||
-                _resizingLine != null;
-            setState(_clearPointerState);
-            if (geometryEdited) widget.onGeometryEditEnd?.call();
-          },
-          child: ClipRect(
-            child: SizedBox.expand(
-              child: OverflowBox(
-                alignment: Alignment.topLeft,
-                minWidth: _imageSize.width,
-                maxWidth: _imageSize.width,
-                minHeight: _imageSize.height,
-                maxHeight: _imageSize.height,
-                child: Transform(
-                  transform: _transform.value,
-                  child: SizedBox(
-                    width: _imageSize.width,
-                    height: _imageSize.height,
-                    child: Stack(
-                      children: [
-                        RawImage(
-                          image: _image,
-                          width: _imageSize.width,
-                          height: _imageSize.height,
-                          fit: BoxFit.fill,
-                        ),
-                        SizedBox(
-                          width: _imageSize.width,
-                          height: _imageSize.height,
-                          child: CustomPaint(
-                            painter: _BlockPainter(
-                              lines: widget.lines,
-                              blocks: widget.blocks,
-                              selected: widget.selected,
-                              selectedLine: widget.selectedLine,
-                              selectedRegion: widget.selectedRegion,
-                              selectedParagraph: widget.selectedParagraph,
-                              mainRegions: widget.mainRegions,
-                              paragraphs: widget.paragraphs,
-                              regionConflictedIds: widget.regionConflictedIds,
-                              orderBreakIds: widget.lineOrderBreakIds,
-                              pendingLineOrder: widget.pendingLineOrder,
-                              pendingParagraphOrder:
-                                  widget.pendingParagraphOrder,
-                              viewMode: widget.viewMode,
-                              showIndex: widget.showIndex,
-                              showCharBox: widget.showCharBox,
-                              screenScale: _screenScale,
-                              dragRect:
-                                  _dragStart != null && _dragCurrent != null
-                                  ? Rect.fromPoints(_dragStart!, _dragCurrent!)
-                                  : null,
-                              altGuide: _altGuide(),
+              setState(_clearPointerState);
+              if (geometryEdited) widget.onGeometryEditEnd?.call();
+            },
+            onPointerCancel: (e) {
+              // 手势被系统中断时几何可能已被改动，同样结束级联，避免脏标记残留
+              final geometryEdited =
+                  _dragging != null ||
+                  _resizing != null ||
+                  _draggingRegion != null ||
+                  _resizingRegion != null ||
+                  _draggingParagraph != null ||
+                  _resizingParagraph != null ||
+                  _draggingLine != null ||
+                  _resizingLine != null;
+              setState(_clearPointerState);
+              if (geometryEdited) widget.onGeometryEditEnd?.call();
+            },
+            child: ClipRect(
+              child: SizedBox.expand(
+                child: OverflowBox(
+                  alignment: Alignment.topLeft,
+                  minWidth: _imageSize.width,
+                  maxWidth: _imageSize.width,
+                  minHeight: _imageSize.height,
+                  maxHeight: _imageSize.height,
+                  child: Transform(
+                    transform: _transform.value,
+                    child: SizedBox(
+                      width: _imageSize.width,
+                      height: _imageSize.height,
+                      child: Stack(
+                        children: [
+                          RawImage(
+                            image: _image,
+                            width: _imageSize.width,
+                            height: _imageSize.height,
+                            fit: BoxFit.fill,
+                          ),
+                          SizedBox(
+                            width: _imageSize.width,
+                            height: _imageSize.height,
+                            child: CustomPaint(
+                              painter: _BlockPainter(
+                                lines: widget.lines,
+                                blocks: widget.blocks,
+                                selected: widget.selected,
+                                selectedLine: widget.selectedLine,
+                                selectedRegion: widget.selectedRegion,
+                                selectedParagraph: widget.selectedParagraph,
+                                mainRegions: widget.mainRegions,
+                                paragraphs: widget.paragraphs,
+                                regionConflictedIds: widget.regionConflictedIds,
+                                orderBreakIds: widget.lineOrderBreakIds,
+                                pendingLineOrder: widget.pendingLineOrder,
+                                pendingParagraphOrder:
+                                    widget.pendingParagraphOrder,
+                                viewMode: widget.viewMode,
+                                showIndex: widget.showIndex,
+                                showCharBox: widget.showCharBox,
+                                screenScale: _screenScale,
+                                dragRect:
+                                    _dragStart != null && _dragCurrent != null
+                                    ? Rect.fromPoints(
+                                        _dragStart!,
+                                        _dragCurrent!,
+                                      )
+                                    : null,
+                                altGuide: _altGuide(),
+                              ),
                             ),
                           ),
-                        ),
-                      ],
+                        ],
+                      ),
                     ),
                   ),
                 ),
               ),
             ),
-          ),
           ),
         );
       },
@@ -8490,6 +9052,8 @@ class _BlockPainter extends CustomPainter {
   // ── region view ──
 
   void _paintRegionView(Canvas canvas) {
+    // 版面类型框（页眉/页脚等）底层常显：正文框叠在其上，编号只数正文框
+    _paintTypedRegions(canvas);
     final regionRects = <Rect>[];
     for (var i = 0; i < mainRegions.length; i++) {
       final r = mainRegions[i];
@@ -8520,12 +9084,19 @@ class _BlockPainter extends CustomPainter {
       );
     }
 
+    // 正文框编号只数正文框：版面类型框已在底层由 _paintTypedRegions
+    // 画出（角标直接标类型名、不占编号，与编号条同序同号）。
+    var bodyNo = 0;
     for (var i = 0; i < mainRegions.length; i++) {
       final rect = regionRects[i];
       final region = mainRegions[i];
+      if (RegionLabel.normalize(region.label) != RegionLabel.mainText) {
+        continue;
+      }
+      bodyNo++;
       final isSel = region == selectedRegion;
-      // 按类别分色（词表/配色见 RegionLabel）；选中态保持橙色高亮
-      final baseColor = RegionLabel.color(RegionLabel.normalize(region.label));
+      // 正文框沿用主区紫（RegionLabel.mainText 配色）；选中态保持橙色高亮
+      final baseColor = RegionLabel.color(RegionLabel.mainText);
       final color = isSel ? Colors.orange : baseColor;
       // 半透明色块叠加：整个框在书页上呈现明显的同色覆盖层
       canvas.drawRect(
@@ -8538,7 +9109,7 @@ class _BlockPainter extends CustomPainter {
       if (showIndex) {
         _drawLabel(
           canvas,
-          '${i + 1}',
+          '$bodyNo',
           rect.topLeft,
           isSel ? Colors.orange : baseColor,
         );
@@ -8560,9 +9131,50 @@ class _BlockPainter extends CustomPainter {
     _drawOverlapTints(canvas, regionRects);
   }
 
+  /// 版面类型框常显参考层：页眉/页脚/页码/眉批/图片/表格这些 label ≠
+  /// main_text 的识别框（region_det 多类框），在正文区/段落/单行三个
+  /// 视图都最先画出——底层参考不遮挡当前层；按 RegionLabel 配色，角标
+  /// 直接标类型名、不参与正文框编号（与编号条同口径）。选中态与多类
+  /// 互证冲突警示跟区域视图同一套画法。
+  void _paintTypedRegions(Canvas canvas) {
+    for (final region in mainRegions) {
+      final label = RegionLabel.normalize(region.label);
+      if (label == RegionLabel.mainText) continue;
+      final rect = region.rect;
+      final isSel = region == selectedRegion;
+      final color = isSel ? Colors.orange : RegionLabel.color(label);
+      // 半透明色块叠加：整个框在书页上呈现明显的同色覆盖层
+      canvas.drawRect(
+        rect,
+        Paint()
+          ..style = PaintingStyle.fill
+          ..color = color.withValues(alpha: isSel ? 0.20 : 0.12),
+      );
+      _drawHaloStroke(canvas, rect, color, isSel ? 3.5 : 3.0);
+      if (showIndex) {
+        _drawLabel(canvas, RegionLabel.displayName(label), rect.topLeft, color);
+      }
+      if (isSel) {
+        _drawResizeHandles(canvas, rect, Colors.orange, 22);
+      }
+      if (regionConflictedIds.contains(region.id)) {
+        // 多类互证冲突：红色警示描边（与正文区/其它排除类区重叠）
+        _drawHaloStroke(canvas, rect, Colors.red, 2.0);
+        _drawLabel(
+          canvas,
+          '!',
+          rect.topRight + const Offset(-20, 2),
+          Colors.red,
+        );
+      }
+    }
+  }
+
   // ── paragraph view ──
 
   void _paintParagraphView(Canvas canvas) {
+    // 版面类型框（页眉/页脚等）底层常显：段落画在其上不遮挡
+    _paintTypedRegions(canvas);
     // faint line boxes first（白衬底淡灰线，配色彩页上也能看到参照）
     for (final line in lines) {
       _drawHaloStroke(
@@ -8635,6 +9247,8 @@ class _BlockPainter extends CustomPainter {
   // ── line view ──
 
   void _paintLineView(Canvas canvas) {
+    // 版面类型框（页眉/页脚等）底层常显：行框画在其上不遮挡
+    _paintTypedRegions(canvas);
     // faint char boxes first（白衬底淡灰线，配色彩页上也能看到参照）
     if (showCharBox) {
       for (final line in lines) {
@@ -8684,9 +9298,7 @@ class _BlockPainter extends CustomPainter {
           !hasPendingOrder && !isSel && orderBreakIds.contains(line.id);
       final color = hasPendingOrder
           ? Colors.teal
-          : (isSel
-                ? Colors.orange
-                : (orderBreak ? kOrderBreakRed : baseColor));
+          : (isSel ? Colors.orange : (orderBreak ? kOrderBreakRed : baseColor));
       // 半透明色块叠加：整个框在书页上呈现明显的同色覆盖层
       canvas.drawRect(
         r,
@@ -9621,6 +10233,10 @@ class _DetailCardList extends StatefulWidget {
   /// 合并模式下点击字框的处理。
   final ValueChanged<CharBlock>? onMergeMode;
 
+  /// Alt 拆分完成回调（透传 InteractiveLineCrop.onCharSplit）。
+  final void Function(CharBlock original, CharBlock first, CharBlock second)?
+  onCharSplit;
+
   const _DetailCardList({
     required this.imagePath,
     this.imageRevision = 0,
@@ -9649,6 +10265,7 @@ class _DetailCardList extends StatefulWidget {
     required this.onZoom,
     this.mergeMode = false,
     this.onMergeMode,
+    this.onCharSplit,
   });
 
   @override
@@ -9828,6 +10445,7 @@ class _DetailCardListState extends State<_DetailCardList> {
       onCharDeleted: widget.onCharDeleted,
       mergeMode: widget.mergeMode,
       onMergeMode: widget.onMergeMode,
+      onCharSplit: widget.onCharSplit,
     );
   }
 }
@@ -10121,6 +10739,10 @@ class _LineCard extends StatelessWidget {
   /// 合并模式下点击字框的处理。
   final ValueChanged<CharBlock>? onMergeMode;
 
+  /// Alt 拆分完成回调（透传 InteractiveLineCrop.onCharSplit）。
+  final void Function(CharBlock original, CharBlock first, CharBlock second)?
+  onCharSplit;
+
   const _LineCard({
     required this.line,
     required this.lineIndex,
@@ -10147,6 +10769,7 @@ class _LineCard extends StatelessWidget {
     required this.onCharDeleted,
     this.mergeMode = false,
     this.onMergeMode,
+    this.onCharSplit,
   });
 
   @override
@@ -10240,6 +10863,7 @@ class _LineCard extends StatelessWidget {
                 multiSelectedIds: multiSelectedIds,
                 mergeMode: mergeMode,
                 onMergeMode: onMergeMode,
+                onCharSplit: onCharSplit,
               ),
               SizedBox(height: 8 * scale),
               // ── 条2：字卡行（与行图同宽，逐字按字框 x 同位） ──
@@ -10325,6 +10949,7 @@ class _LineCard extends StatelessWidget {
                     multiSelectedIds: multiSelectedIds,
                     mergeMode: mergeMode,
                     onMergeMode: onMergeMode,
+                    onCharSplit: onCharSplit,
                   ),
                   SizedBox(width: 8 * scale),
                   // ── 列2：字符 chips 纵向（轻点下方浮出候选条，长按拖拽改变字序） ──
@@ -12482,6 +13107,11 @@ class InteractiveLineCrop extends StatefulWidget {
   /// 合并模式下点击字框的处理（第一次选框，第二次同行自动合并）。
   final ValueChanged<CharBlock>? onMergeMode;
 
+  /// Alt 拆分完成回调（可选；编辑器智能模式用）：(原框, 前半, 后半)，
+  /// 在 onCharUpdated/onCharAdded 之后触发。行内重切页不接。
+  final void Function(CharBlock original, CharBlock first, CharBlock second)?
+  onCharSplit;
+
   const InteractiveLineCrop({
     super.key,
     required this.image,
@@ -12498,6 +13128,7 @@ class InteractiveLineCrop extends StatefulWidget {
     this.multiSelectedIds = const {},
     this.mergeMode = false,
     this.onMergeMode,
+    this.onCharSplit,
   });
 
   @override
@@ -12840,6 +13471,7 @@ class _InteractiveLineCropState extends State<InteractiveLineCrop> {
     );
     widget.onCharUpdated(c, first);
     widget.onCharAdded(second);
+    widget.onCharSplit?.call(c, first, second);
   }
 
   void _clearState() {

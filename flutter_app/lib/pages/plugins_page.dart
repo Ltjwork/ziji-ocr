@@ -71,6 +71,26 @@ class _PluginsPageState extends State<PluginsPage> {
     );
   }
 
+  Future<void> _reloadPlugin(InstalledPlugin plugin) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    final reloaded = await PluginHost.instance.reloadPlugin(plugin.id);
+    if (!mounted) return;
+    setState(() => _busy = false);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          reloaded == null
+              ? '插件「${plugin.manifest.name}」的安装目录已不存在，'
+                    '视同已卸载'
+              : '已重新加载「${reloaded.manifest.name}」'
+                    '（v${reloaded.manifest.version}），'
+                    '插件页面请重新打开',
+        ),
+      ),
+    );
+  }
+
   Future<void> _confirmUninstall(InstalledPlugin plugin) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -109,7 +129,9 @@ class _PluginsPageState extends State<PluginsPage> {
             Text(
               '插件是独立的功能扩展包（.zjplugin 文件），在这里导入安装、'
               '按需启停。启用中插件的入口会出现在编辑器「全书操作」菜单里，'
-              '后台任务随开关运行；插件的详细配置在各自的设置页里。',
+              '后台任务随开关运行；插件的详细配置在各自的设置页里。'
+              '插件文件被直接覆盖更新后，点该插件的「重新加载」即取最新版，'
+              '无需重启应用（已打开的插件页面会自动关闭，重新打开即是新版）。',
               style: Theme.of(context).textTheme.bodySmall?.copyWith(
                 color: scheme.onSurface.withValues(alpha: 0.7),
               ),
@@ -137,6 +159,7 @@ class _PluginsPageState extends State<PluginsPage> {
                   running: PluginHost.instance.runtimes.any(
                     (r) => r.plugin.id == plugin.id,
                   ),
+                  onReload: () => _reloadPlugin(plugin),
                   onUninstall: () => _confirmUninstall(plugin),
                 ),
           ],
@@ -186,12 +209,14 @@ class _PluginCard extends StatelessWidget {
     required this.plugin,
     required this.enabled,
     required this.running,
+    required this.onReload,
     required this.onUninstall,
   });
 
   final InstalledPlugin plugin;
   final bool enabled;
   final bool running;
+  final Future<void> Function() onReload;
   final Future<void> Function() onUninstall;
 
   @override
@@ -234,6 +259,11 @@ class _PluginCard extends StatelessWidget {
                         PluginHost.instance.openSettings(context, plugin),
                       ),
                     ),
+                  IconButton(
+                    tooltip: '重新加载（读取磁盘上的最新插件文件）',
+                    icon: const Icon(Icons.refresh),
+                    onPressed: () => unawaited(onReload()),
+                  ),
                   IconButton(
                     tooltip: '卸载插件',
                     icon: Icon(

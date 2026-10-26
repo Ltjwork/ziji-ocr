@@ -4,7 +4,6 @@ library;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gujichazi/models/models.dart';
 import 'package:gujichazi/models/table_block.dart';
-import 'package:gujichazi/pages/table_review_page.dart';
 
 TableAnnotation _sampleTable() {
   final t = TableAnnotation(
@@ -58,6 +57,32 @@ void main() {
       expect(restored.cells.first.text, '甲');
       expect(restored.cells.first.status, AnnotationStatus.confirmed);
       expect(restored.cells.first.chars.single.conf, 0.97);
+    });
+
+    test('识别日志 log 字段解析、落盘往返与旧标注兼容', () {
+      final t = TableAnnotation.fromRecognition({
+        'id': 'tbl_x',
+        'x': 1, 'y': 2, 'w': 3, 'h': 4,
+        'rows': 2, 'cols': 2,
+        'h_lines': [2, 4, 6],
+        'v_lines': [1, 3, 5, 7],
+        'line_width': 3,
+        'cells': [
+          {'x': 2, 'y': 3, 'w': 4, 'h': 5, 'row': 0, 'col': 0, 'text': '甲'},
+        ],
+        'log': [
+          '引擎=paddle+PP-OCRv6_small_rec（模型 PP-OCRv6_small_rec）',
+          '格(0,0) 序列=「甲」(conf.0.91) 框内=「甲」 吻合1/1 → 取序列（语境）',
+        ],
+      });
+      expect(t.logLines, hasLength(2));
+      expect(t.logLines.first, contains('引擎=paddle'));
+      // 落盘往返保留（.toJson 带 log，fromJson 读回）
+      final restored = TableAnnotation.fromJson(t.toJson());
+      expect(restored.logLines, t.logLines);
+      // 旧标注无 log 字段 → 空列表不抛
+      expect(TableAnnotation.fromJson(_sampleTable().toJson()).logLines,
+          isEmpty);
     });
 
     test('fromRecognition 解析后端响应（snake_case 字段）', () {
@@ -150,6 +175,64 @@ void main() {
       final normalCols = t.split('\n').first.split('\t').skip(1).toList();
       final rtlColsList = rtl.split('\n').first.split('\t').skip(1).toList();
       expect(rtlColsList, normalCols.reversed.toList());
+    });
+
+    test('rowNumbers=false：全书导出矩阵不带行号列（原表结构）', () {
+      final md = TableExport.toMarkdown(
+        _sampleTable(),
+        rtlCols: false,
+        rowNumbers: false,
+      );
+      final first = md.trim().split('\n').first;
+      expect(first, startsWith('| 甲 |'));
+      final tsv = TableExport.toTSV(
+        _sampleTable(),
+        rtlCols: false,
+        rowNumbers: false,
+      );
+      // 每行单元数 = cols（无行号列），合并格被覆盖格留空
+      for (final row in tsv.split('\n')) {
+        expect(row.split('\t').length, 3);
+      }
+    });
+  });
+
+  group('charsBeforeCursor（对照校对：光标前文字↔字框对齐）', () {
+    List<TableCellChar> boxes(List<String> texts) => [
+          for (var i = 0; i < texts.length; i++)
+            TableCellChar(
+              x: i * 10, y: 0, w: 10, h: 10, text: texts[i],
+            ),
+        ];
+
+    test('文本未改动：光标在第 k 字 → 前 k 个字框', () {
+      final chars = boxes(['天', '地', '玄', '黄']);
+      final out = charsBeforeCursor('天地玄黄', 3, chars);
+      expect(out.map((c) => c.text).toList(), ['天', '地', '玄']);
+      // 光标在末尾 → 全部
+      expect(charsBeforeCursor('天地玄黄', 4, chars).length, 4);
+      // 光标在开头 → 无高亮
+      expect(charsBeforeCursor('天地玄黄', 0, chars), isEmpty);
+    });
+
+    test('删过一字：跳过被删的框就近对齐', () {
+      final chars = boxes(['天', '地', '玄', '黄']);
+      // 文本删掉了「地」：光标在「玄」后（第 2 字后）
+      final out = charsBeforeCursor('天玄黄', 2, chars);
+      expect(out.map((c) => c.text).toList(), ['天', '玄']);
+    });
+
+    test('插入过字：插入字符不占框，后续仍对齐', () {
+      final chars = boxes(['天', '地', '玄', '黄']);
+      // 在「天」「地」之间插入了「元」
+      final out = charsBeforeCursor('天元地玄黄', 3, chars);
+      expect(out.map((c) => c.text).toList(), ['天', '地']);
+    });
+
+    test('边界：空字框/越界光标安全', () {
+      expect(charsBeforeCursor('天地', 2, const []), isEmpty);
+      expect(charsBeforeCursor('天地', 99, boxes(['天', '地'])).length, 2);
+      expect(charsBeforeCursor('', 0, boxes(['天'])), isEmpty);
     });
   });
 }

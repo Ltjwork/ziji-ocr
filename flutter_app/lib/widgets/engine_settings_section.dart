@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../models/models.dart';
 import '../services/python_service.dart';
@@ -233,34 +234,11 @@ class _EngineSettingsSectionState extends State<EngineSettingsSection> {
                 child: Text(label, style: const TextStyle(fontSize: 12.5)),
               ),
               Expanded(
-                child: TextField(
-                  controller: TextEditingController(
-                    text: initial?.toString() ?? '',
-                  ),
-                  decoration: InputDecoration(
-                    isDense: true,
-                    hintText: hint,
-                    border: const OutlineInputBorder(),
-                    contentPadding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 6,
-                    ),
-                  ),
-                  style: const TextStyle(fontSize: 12.5),
-                  onChanged: (v) {
-                    final t = v.trim();
-                    if (t.isEmpty) {
-                      fn(null);
-                      return;
-                    }
-                    final d = double.tryParse(t);
-                    if (d == null) return;
-                    if (asInt) {
-                      fn(d.toInt());
-                    } else {
-                      fn(d);
-                    }
-                  },
+                child: NumField(
+                  value: initial,
+                  hint: hint,
+                  asInt: asInt,
+                  onChanged: fn,
                 ),
               ),
             ],
@@ -313,16 +291,20 @@ class _EngineSettingsSectionState extends State<EngineSettingsSection> {
             decoration: const InputDecoration(isDense: true),
           ),
         ),
-        header('生成参数（留空 = 模型默认；本地推理暂由模型忽略这三项采样参数）'),
-        numFieldTyped('重复抑制强度', st.vlRepetitionPenalty, '默认 1.0',
+        header('生成参数（留空 = 模型默认；古籍竖排推荐只把重复抑制强度填 1.15，其余保持留空）'),
+        numFieldTyped('重复抑制强度', st.vlRepetitionPenalty,
+            '留空=1.0；压制重复退化填 1.15（1.1~1.2）',
             (v) => upd(st.copyWith(vlRepetitionPenalty: v?.toDouble())), false),
-        numFieldTyped('识别稳定性', st.vlTemperature, '默认 0.0',
+        numFieldTyped('识别稳定性', st.vlTemperature,
+            '留空=0（贪心最稳）；>0 启用采样（结果带随机性）',
             (v) => upd(st.copyWith(vlTemperature: v?.toDouble())), false),
-        numFieldTyped('结果可信范围', st.vlTopP, '默认 1.0',
+        numFieldTyped('结果可信范围', st.vlTopP,
+            '留空=1.0（不截断）；仅稳定性>0 时生效',
             (v) => upd(st.copyWith(vlTopP: v?.toDouble())), false),
-        numFieldTyped('图像最小总像素数', st.vlMinPixels, '默认 147384',
+        numFieldTyped('图像最小总像素数', st.vlMinPixels, '留空=模型默认，无需填写',
             (v) => upd(st.copyWith(vlMinPixels: v?.toInt())), true),
-        numFieldTyped('图像最大总像素数', st.vlMaxPixels, '留空 = 不限',
+        numFieldTyped('图像最大总像素数', st.vlMaxPixels,
+            '留空=模型默认；调大更清晰但更慢更吃显存',
             (v) => upd(st.copyWith(vlMaxPixels: v?.toInt())), true),
         header('辅助内容解析（默认过滤；开启后恢复解析）'),
         row('页眉', '页眉文字', st.vlParseHeader,
@@ -340,6 +322,99 @@ class _EngineSettingsSectionState extends State<EngineSettingsSection> {
         row('旁注文本', '旁批/边栏文字', st.vlParseAsideText,
             (v) => upd(st.copyWith(vlParseAsideText: v))),
       ],
+    );
+  }
+}
+
+/// 设置面板的数字输入框（生成参数 5 项共用）。
+///
+/// controller 由 State 持有、跨父级重建存活：设置是"每敲一键就保存并
+/// 重建界面"的写法，若在 build 里现建 controller（旧实现），每次按键
+/// 光标被重置到行首、`1` 还会被格式化回写成 `1.0`，继续输入就插在开头
+/// 越打越乱（实测出现 `.15`、`.5151511.0`）。回写外部值只在"值既不等于
+/// 本框最近上报值、也不等于当前文本解析值"时发生——打字过程中父级重建
+/// （解析值 == 已上报值）不打断输入、不移动光标。
+class NumField extends StatefulWidget {
+  const NumField({
+    super.key,
+    required this.value,
+    required this.hint,
+    required this.asInt,
+    required this.onChanged,
+  });
+
+  final Object? value; // 当前设置值（num?；null = 留空）
+  final String hint;
+  final bool asInt; // true = 整数档（像素数），false = 小数档
+  final void Function(num? v) onChanged;
+
+  @override
+  State<NumField> createState() => _NumFieldState();
+}
+
+class _NumFieldState extends State<NumField> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.value?.toString() ?? '');
+  num? _emitted;
+
+  num? _parse(String raw) {
+    final t = raw.trim();
+    if (t.isEmpty) return null;
+    final d = double.tryParse(t);
+    if (d == null) return null;
+    return widget.asInt ? d.toInt() : d;
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _emitted = _parse(_controller.text);
+  }
+
+  @override
+  void didUpdateWidget(covariant NumField oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final incoming = widget.value;
+    if (incoming == _emitted) return;
+    if (incoming == _parse(_controller.text)) {
+      _emitted = incoming is num ? incoming : null;
+      return;
+    }
+    final text = incoming?.toString() ?? '';
+    if (_controller.text != text) {
+      _controller
+        ..text = text
+        ..selection = TextSelection.collapsed(offset: text.length);
+    }
+    _emitted = incoming is num ? incoming : null;
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: _controller,
+      inputFormatters: [
+        FilteringTextInputFormatter.allow(RegExp(r'[0-9.]')),
+      ],
+      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+      decoration: InputDecoration(
+        isDense: true,
+        hintText: widget.hint,
+        border: const OutlineInputBorder(),
+        contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      ),
+      style: const TextStyle(fontSize: 12.5),
+      onChanged: (v) {
+        final parsed = _parse(v);
+        _emitted = parsed;
+        widget.onChanged(parsed);
+      },
     );
   }
 }

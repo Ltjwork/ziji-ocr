@@ -69,6 +69,7 @@ REGION_OVERLAY_COLORS = {
     "margin_note": (180, 140, 0),
     "figure": (65, 76, 109),
     "table": (87, 20, 173),
+    "hexagram": (12, 54, 191),
 }
 
 

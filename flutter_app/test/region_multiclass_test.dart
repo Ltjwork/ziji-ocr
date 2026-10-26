@@ -24,6 +24,7 @@ void main() {
           'margin_note',
           'figure',
           'table',
+          'hexagram',
         ]),
       );
       for (final (i, label) in RegionLabel.all.indexed) {
@@ -44,6 +45,7 @@ void main() {
       expect(RegionLabel.isExcluded('header'), isTrue);
       expect(RegionLabel.isExcluded('footer'), isTrue);
       expect(RegionLabel.isExcluded('page_number'), isTrue);
+      expect(RegionLabel.isExcluded('hexagram'), isTrue);
       for (final l in RegionLabel.all) {
         expect(RegionLabel.isBody(l) || RegionLabel.isExcluded(l), isTrue,
             reason: '$l 必须明确归属宿主或排除');

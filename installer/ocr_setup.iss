@@ -7,7 +7,7 @@
 #define MyAppIconFile "..\flutter_app\windows\runner\resources\app_icon.ico"
 #ifndef MyAppVersion
   ; 单独用 ISCC 编译而未传 /DMyAppVersion 时的兜底版本号
-  #define MyAppVersion "1.0.2"
+  #define MyAppVersion "1.0.3"
 #endif
 
 [Setup]

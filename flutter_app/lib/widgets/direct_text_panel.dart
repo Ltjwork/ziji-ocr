@@ -1,3 +1,4 @@
+import 'dart:async' show Timer;
 import 'dart:convert' show base64Encode;
 import 'dart:io';
 import 'dart:math' as math;
@@ -10,12 +11,14 @@ import '../models/models.dart';
 import '../services/direct_text_store.dart';
 import '../services/ollama_service.dart';
 import '../services/python_service.dart';
+import '../services/storage.dart';
 import 'char_rainbow.dart';
 
 /// 编辑器「文本」视图：**左右分栏**——左侧书页栏（与标注视图同款的
 /// 书页展示：解码位图 + 缩放平移；不画任何识别框，可选叠加"行文对照"
 /// ——把每行识别文本按竖排逐字画在列旁），右侧文本栏（整页直读文本：
-/// 可编辑 / AI 校对 / 保存 / 复制）。
+/// 可编辑 / AI 校对 / 保存 / 复制；每行前置行编号，纯展示不入文本内容
+/// ——保存/复制/AI 校对拿到的都是不带编号的原文）。
 ///
 /// 整页直读（PaddleOCR det+rec 全管线 / Kraken blla 分行 + CHAT 读字）
 /// 不走主区/段落/单行/单字标注管线；直读文本落盘在书目录 direct_text/
@@ -28,6 +31,7 @@ class DirectTextPanel extends StatefulWidget {
     required this.pageId,
     required this.imagePath,
     required this.settings,
+    this.gateRegions,
     this.onSnackBar,
     this.onReadComplete,
   });
@@ -36,6 +40,12 @@ class DirectTextPanel extends StatefulWidget {
   final String pageId;
   final String imagePath;
   final ProjectSettings settings;
+
+  /// 本页人工已确认版面区（标注 mainRegions 的确认框，编辑器传入）：
+  /// 「排除页眉页脚」开关开启时随识别请求带给后端做门控输入（页眉/
+  /// 页脚/页码等确认区内的行不进直读文本），region_det 模型未训出也
+  /// 能按人工成果排除；null/空 = 后端退回 region_det 模型预检。
+  final List<Map<String, dynamic>>? gateRegions;
 
   /// 宿主编辑器的 SnackBar 回调（无则用本面板自己的 ScaffoldMessenger）。
   final void Function(String message, {bool error})? onSnackBar;
@@ -65,6 +75,31 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
   bool _aiRunning = false;
   bool _dirty = false;
 
+  /// 「排除页眉页脚」开关（书级设置）：开 = 识别时后端把落在排除类
+  /// 版面区（页眉/页脚/页码/插图/表格/卦图）内的行整行剔除后再拼整页
+  /// 文本。切换即写回 project.settings 并落盘，对全书生效；已读出的
+  /// 文本不变，下次「识别本页/重新识别」生效。
+  late bool _excludeHeaderFooter;
+
+  /// 文本栏滚动偏移（行编号栏同步滚动用，见 _buildTextPanel）。
+  final ValueNotifier<double> _gutterScroll = ValueNotifier<double>(0);
+
+  /// 文本内容变化信号（行编号栏重算行位用）：编辑每次按键只 bump 这个
+  /// 计数器重画编号栏，不重建整个面板（与行文对照的 _overlayRepaint
+  /// 同一省重建思路——面板含页图，整建代价高）。
+  final ValueNotifier<int> _gutterTextRev = ValueNotifier<int>(0);
+
+  // ── 识别进度（识别中每秒刷新：本地秒表 + 后端阶段轮询）──
+  Timer? _progressTimer;
+  int _recognizeElapsedS = 0;
+
+  /// 最近一次轮询到的进度（{active, stage, detail, elapsed_s}）；null =
+  /// 后端还没回报（旧版后端/首轮询未返回），只显示本地秒表。
+  Map<String, dynamic>? _progress;
+
+  /// 轮询去重：上一轮 GET 未返回时跳过本轮（本地接口 <10ms，纯防御）。
+  bool _progressPolling = false;
+
   /// 最近一次直读的元信息（状态行展示：引擎/行数/耗时）。
   Map<String, dynamic>? _lastRead;
 
@@ -91,6 +126,7 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
   @override
   void initState() {
     super.initState();
+    _excludeHeaderFooter = widget.project.settings.readExcludeHeaderFooter;
     _controller.addListener(_syncOverlayWithText);
     _loadSaved();
     _loadPageImage();
@@ -98,8 +134,11 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
 
   @override
   void dispose() {
+    _progressTimer?.cancel();
     _controller.removeListener(_syncOverlayWithText);
     _controller.dispose();
+    _gutterScroll.dispose();
+    _gutterTextRev.dispose();
     _overlayRepaint.dispose();
     _pageTransform.dispose();
     _pageImage?.dispose();
@@ -212,6 +251,9 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
   /// 增删过行则保持识别时的原文，不做错位同步）。
   void _syncOverlayWithText() {
     if (!_dirty) setState(() => _dirty = true);
+    // 行编号栏跟进必须在无行记录提前返回**之前**：未识别/无行文对照
+    // 数据时用户同样在编辑文本，编号行位要持续重算。
+    _gutterTextRev.value++;
     if (_lineRecords.isEmpty) return;
     final lines = _controller.text.split('\n');
     if (lines.length != _lineRecords.length) return;
@@ -222,13 +264,62 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
     _overlayRepaint.value++;
   }
 
+  /// 识别进度秒表：每秒 +1 并向后端轮询当前阶段（detail 中文说明原样
+  /// 展示）。轮询失败静默（旧后端无该字段/瞬时抖动），界面退化为只走
+  /// 本地秒表——识别本身不受影响。
+  void _startProgressTicker(String token) {
+    _recognizeElapsedS = 0;
+    _progress = null;
+    _progressPolling = false;
+    _progressTimer?.cancel();
+    _progressTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() => _recognizeElapsedS++);
+      if (_progressPolling) return;
+      _progressPolling = true;
+      PythonService.readPageProgress(token).then((p) {
+        _progressPolling = false;
+        if (!mounted || p == null) return;
+        setState(() => _progress = p);
+      });
+    });
+  }
+
+  void _stopProgressTicker() {
+    _progressTimer?.cancel();
+    _progressTimer = null;
+    _progress = null;
+    _recognizeElapsedS = 0;
+    _progressPolling = false;
+  }
+
+  /// 进度行文案：本地秒表 + 后端回报的当前阶段说明。
+  String get _recognizeProgressText {
+    final p = _progress;
+    final detail = (p?['detail'] ?? '').toString();
+    final stage = (p?['stage'] ?? '').toString();
+    final label = detail.isNotEmpty
+        ? detail
+        : stage.isNotEmpty
+        ? stage
+        : '等待后端回报进度…';
+    return '识别中 $_recognizeElapsedS s · $label';
+  }
+
   Future<void> _recognize() async {
     if (_recognizing) return;
     setState(() => _recognizing = true);
+    // 进度 token：后端各阶段打点，客户端每秒轮询（旧后端不识别该字段，
+    // 忽略即可——进度行退化为本地秒表）。
+    final progressToken = 'read-${DateTime.now().microsecondsSinceEpoch}';
+    _startProgressTicker(progressToken);
     try {
       final result = await PythonService.readPageText(
         imagePath: widget.imagePath,
         settings: widget.settings,
+        excludeHeaderFooter: _excludeHeaderFooter,
+        gateRegions: widget.gateRegions,
+        progressToken: progressToken,
       );
       if (!mounted) return;
       final text = (result['text'] as String?) ?? '';
@@ -272,11 +363,13 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
       // 元数据侧车记下"这份文本是哪个引擎/模型读的"，状态栏好如实回答；
       // line_records 是逐行框+文本——默认识别流程的全文对照（无框字符
       // 紫片/不一致字橙标）以此为整页参照（后端零推理读侧车）。
+      final excludedLines = (result['excluded_lines'] as num?)?.toInt() ?? 0;
       final readMeta = <String, dynamic>{
         'engine': result['engine']?.toString() ?? '',
         'ocr': result['ocr']?.toString() ?? '',
         'elapsed_s': result['elapsed_s']?.toString() ?? '',
         'lines': records.length,
+        'excluded_lines': excludedLines,
         'line_records': [
           for (final r in records)
             {
@@ -295,11 +388,13 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
       widget.onReadComplete?.call();
       _snack(
         '整页直读完成：${records.length} 行、${text.length} 字'
-        '（${result['elapsed_s']}s，$_engineLabel）',
+        '（${result['elapsed_s']}s，$_engineLabel）'
+        '${excludedLines > 0 ? '，已排除 $excludedLines 行页眉页脚等' : ''}',
       );
     } catch (e) {
       if (mounted) _snack('整页直读失败：$e', error: true);
     } finally {
+      _stopProgressTicker();
       if (mounted) setState(() => _recognizing = false);
     }
   }
@@ -316,6 +411,18 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
       _snack('直读文本已保存（direct_text/${widget.pageId}.txt）');
     } catch (e) {
       if (mounted) _snack('保存失败：$e', error: true);
+    }
+  }
+
+  /// 「排除页眉页脚」开关切换：写回书级设置并落盘（对全书生效，翻页/
+  /// 重开应用都记住）。已读出的文本不变——开关只影响下一次识别。
+  Future<void> _toggleExcludeHeaderFooter(bool v) async {
+    setState(() => _excludeHeaderFooter = v);
+    widget.project.settings.readExcludeHeaderFooter = v;
+    try {
+      await ProjectStorage.save(widget.project);
+    } catch (e) {
+      if (mounted) _snack('书级设置保存失败：$e', error: true);
     }
   }
 
@@ -488,6 +595,45 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
 
   // ── 右侧文本栏 ──
 
+  /// 文本编辑区样式常量：行编号栏与 TextField 共用同一套排版度量
+  /// （字号/行高/内边距），编号才能与文本行逐行对齐。
+  static const TextStyle _editorTextStyle = TextStyle(
+    fontSize: 15,
+    height: 1.6,
+  );
+  static const EdgeInsets _textContentPadding = EdgeInsets.symmetric(
+    horizontal: 12,
+    vertical: 12,
+  );
+  static const double _gutterWidth = 34;
+  static const double _gutterGap = 6;
+
+  /// 每逻辑行的 y 起点（编辑区内容坐标系，不含内边距）：每行用与
+  /// TextField 完全相同的字号/行高在编辑区宽度下排版，行高 × 视觉行数
+  /// 累加——长行在编辑框内折成多视觉行时，编号仍落在该行首视觉行。
+  List<double> _computeLineTops(String text, double maxWidth) {
+    if (text.isEmpty) return const [];
+    final tp = TextPainter(textDirection: TextDirection.ltr);
+    final tops = <double>[];
+    var y = 0.0;
+    for (final line in text.split('\n')) {
+      tops.add(y);
+      // 空行按一个空格量高（空串排版高度为 0，会把后续编号整体上提）。
+      tp.text = TextSpan(
+        text: line.isEmpty ? ' ' : line,
+        style: _editorTextStyle,
+      );
+      tp.layout(maxWidth: maxWidth);
+      y += tp.height;
+    }
+    tp.dispose();
+    return tops;
+  }
+
+  /// 上次直读被门控剔除的行数（回包/元数据侧车记的 excluded_lines）。
+  int _excludedLinesOf(Map<String, dynamic>? meta) =>
+      (meta?['excluded_lines'] as num?)?.toInt() ?? 0;
+
   Widget _buildTextPanel() {
     final text = _controller.text;
     final lineCount = text.isEmpty ? 0 : '\n'.allMatches(text).length + 1;
@@ -541,8 +687,45 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
                 icon: const Icon(Icons.copy, size: 18),
                 label: const Text('复制'),
               ),
+              // 「排除页眉页脚」开关（书级）：识别后剔除页眉/页脚/页码等
+              // 版面区内的行再拼整页文本。开关只影响下一次识别，已读
+              // 文本不变；VL 模型的辅助内容忽略（vlParse*）独立生效。
+              Tooltip(
+                message: '开：识别后剔除落在页眉/页脚/页码/插图/表格等版面区'
+                    '内的行再拼整页文本（人工确认区优先，其次 region_det '
+                    '模型预检）。书级设置，下次「识别本页」生效。',
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      '排除页眉页脚',
+                      style: TextStyle(fontSize: 12.5),
+                    ),
+                    // Switch 保持自然尺寸（内部固定高约束，强压高度会
+                    // 越界绘制）；Row/Wrap 交叉轴居中即可与按钮对齐。
+                    Switch(
+                      value: _excludeHeaderFooter,
+                      onChanged: _toggleExcludeHeaderFooter,
+                    ),
+                  ],
+                ),
+              ),
             ],
           ),
+          // 识别进度行：细进度条 + 每秒刷新的"已用时 · 当前阶段"
+          // （阶段由后端打点：准备引擎/读字/拼接——回答"卡没卡、卡在哪"）。
+          if (_recognizing) ...[
+            const SizedBox(height: 6),
+            const ClipRRect(
+              borderRadius: BorderRadius.all(Radius.circular(2)),
+              child: LinearProgressIndicator(minHeight: 3),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              _recognizeProgressText,
+              style: const TextStyle(fontSize: 11.5, color: Colors.grey),
+            ),
+          ],
           const SizedBox(height: 6),
           Text.rich(
             TextSpan(
@@ -560,6 +743,7 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
                   text:
                       ' · $lineCount 行 · ${text.characters.length} 字'
                       '${meta != null ? ' · 上次直读 ${meta['elapsed_s']}s/${(meta['lines'] as List?)?.length ?? 0} 行' : ''}'
+                      '${_excludedLinesOf(meta) > 0 ? ' · 已排除 ${_excludedLinesOf(meta)} 行页眉页脚等' : ''}'
                       '${_dirty ? ' · 有未保存修改' : ''}',
                 ),
                 if (_readStale)
@@ -576,19 +760,92 @@ class _DirectTextPanelState extends State<DirectTextPanel> {
           ),
           const SizedBox(height: 8),
           Expanded(
-            child: TextField(
-              controller: _controller,
-              maxLines: null,
-              expands: true,
-              textAlignVertical: TextAlignVertical.top,
-              style: const TextStyle(fontSize: 15, height: 1.6),
-              decoration: const InputDecoration(
-                border: OutlineInputBorder(),
-                hintText: '点「识别本页」用所选引擎整页直读（不拆主区/段落/'
-                    '单行/单字），结果填入此处，可编辑、可 AI 校对、可保存；'
-                    '左侧书页可开「行文对照」逐行比对',
-                hintStyle: TextStyle(fontSize: 12.5),
-              ),
+            child: LayoutBuilder(
+              builder: (context, constraints) {
+                // 编辑区文本净宽 = 栏宽 - 编号栏 - 间隙 - 文本框左右内边
+                // 距：行编号的折行计量与编辑框逐像素同宽，长行折行不错位。
+                final textAreaWidth = math.max(
+                  1.0,
+                  constraints.maxWidth -
+                      _gutterWidth -
+                      _gutterGap -
+                      _textContentPadding.horizontal,
+                );
+                return Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: _gutterWidth,
+                      height: double.infinity,
+                      child: ValueListenableBuilder<double>(
+                        valueListenable: _gutterScroll,
+                        builder: (context, scroll, _) =>
+                            ValueListenableBuilder<int>(
+                              valueListenable: _gutterTextRev,
+                              builder: (context, _, __) {
+                                final lineTops = _computeLineTops(
+                                  _controller.text,
+                                  textAreaWidth,
+                                );
+                                // 内容不满一屏时编辑框不产生滚动：文字
+                                // 删短后复位旧偏移，编号不再整体悬空。
+                                final lineHeight =
+                                    _editorTextStyle.fontSize! *
+                                    _editorTextStyle.height!;
+                                final contentHeight = lineTops.isEmpty
+                                    ? 0.0
+                                    : lineTops.last + lineHeight;
+                                if (scroll != 0 &&
+                                    contentHeight +
+                                            _textContentPadding.vertical <=
+                                        constraints.maxHeight) {
+                                  _gutterScroll.value = 0;
+                                }
+                                return CustomPaint(
+                                  painter: _LineNumberGutterPainter(
+                                    lineTops: lineTops,
+                                    topInset: _textContentPadding.top,
+                                    lineHeight: lineHeight,
+                                    scrollOffset: _gutterScroll.value,
+                                  ),
+                                );
+                              },
+                            ),
+                      ),
+                    ),
+                    SizedBox(width: _gutterGap),
+                    Expanded(
+                      child: NotificationListener<ScrollNotification>(
+                        // 文本框内部滚动 → 编号栏按同偏移平移（只读同步：
+                        // 编号栏自身不响应手势，拖文本框滚动即可）。
+                        onNotification: (n) {
+                          if (n.depth == 0 &&
+                              n.metrics.axis == Axis.vertical &&
+                              n.metrics.pixels != _gutterScroll.value) {
+                            _gutterScroll.value = n.metrics.pixels;
+                          }
+                          return false;
+                        },
+                        child: TextField(
+                          controller: _controller,
+                          maxLines: null,
+                          expands: true,
+                          textAlignVertical: TextAlignVertical.top,
+                          style: _editorTextStyle,
+                          decoration: const InputDecoration(
+                            border: OutlineInputBorder(),
+                            contentPadding: _textContentPadding,
+                            hintText: '点「识别本页」用所选引擎整页直读（不拆主区/段落/'
+                                '单行/单字），结果填入此处，可编辑、可 AI 校对、可保存；'
+                                '左侧书页可开「行文对照」逐行比对',
+                            hintStyle: TextStyle(fontSize: 12.5),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              },
             ),
           ),
         ],
@@ -735,4 +992,56 @@ class _LineTextOverlayPainter extends CustomPainter {
   /// records 的 text 会被文本栏编辑就地更新（同一 list 实例、内容已变），
   /// 引用比较判不出差异——本 painter 只随 _overlayRepaint 重建，恒重画
   /// 开销可忽略（每页几十个字片）。
+}
+
+/// 文本栏行编号栏：右对齐画每个逻辑行的行号（识别出的第几行），随
+/// 文本编辑与滚动同步。行号是**纯展示**、不入文本内容——保存/复制/
+/// AI 校对拿到的都是不带编号的原文；行位由 _computeLineTops 给出
+/// （与编辑框同字号/行高/净宽计量，长行折行时编号对准首视觉行）。
+class _LineNumberGutterPainter extends CustomPainter {
+  _LineNumberGutterPainter({
+    required this.lineTops,
+    required this.topInset,
+    required this.lineHeight,
+    required this.scrollOffset,
+  });
+
+  /// 每逻辑行的 y 起点（编辑区内容坐标系，不含内边距）。
+  final List<double> lineTops;
+
+  /// 文本框顶部内边距（编号 y 与文本行顶对齐的基准）。
+  final double topInset;
+
+  /// 单视觉行高（fontSize × height），编号垂直居中在该行内。
+  final double lineHeight;
+
+  /// 文本框当前滚动偏移（ScrollNotification 同步，见 _buildTextPanel）。
+  final double scrollOffset;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.clipRect(Offset.zero & size);
+    for (var i = 0; i < lineTops.length; i++) {
+      final y = topInset + lineTops[i] - scrollOffset;
+      // 视口外（上下各留一行余量）不画：长页滚动不白画整列编号。
+      if (y < -lineHeight || y > size.height) continue;
+      final tp = TextPainter(
+        text: TextSpan(
+          text: '${i + 1}',
+          style: const TextStyle(fontSize: 11, color: Colors.grey),
+        ),
+        textDirection: TextDirection.ltr,
+      )..layout();
+      tp.paint(
+        canvas,
+        Offset(size.width - 4 - tp.width, y + (lineHeight - tp.height) / 2),
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_LineNumberGutterPainter old) =>
+      scrollOffset != old.scrollOffset ||
+      topInset != old.topInset ||
+      !identical(lineTops, old.lineTops);
 }

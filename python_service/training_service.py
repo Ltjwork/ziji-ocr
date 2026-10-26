@@ -98,6 +98,7 @@ from train_tasks import (  # noqa: E402,F401
     _TASK_COUNTER,
     _monitor,
     start_training,
+    resume_training,
     stop_training,
     training_status,
     training_curve,

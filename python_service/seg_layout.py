@@ -29,8 +29,10 @@ REGION_BODY_LABELS = frozenset({"main_text", "margin_note"})
 # 排除类：不作为包含边界，其中的行/字在 main_text_only 下被过滤，
 # build_body_gated_image 在字检测前抹底色。figure/table 同走门控——
 # 表格格线/插图若不抹除会被 char_det 误切成"字"（+83 表格识别）。
+# hexagram（卦图区）同走门控：卦图里的干支由易经插件按划区单独识别，
+# 不该混进正文。
 REGION_EXCLUDED_LABELS = frozenset(
-    {"header", "footer", "page_number", "figure", "table"}
+    {"header", "footer", "page_number", "figure", "table", "hexagram"}
 )
 # 冲突审计类：与 main_text 的重叠 ≥ REGION_CONFLICT_OVERLAP 记冲突。
 # figure/table 不参与——插图/表格出现在正文区内部是正常版面，不是
@@ -386,6 +388,41 @@ def dispose_body_gated_image(path: str | None) -> None:
         pass
 
 
+def filter_page_text_lines(
+    lines: list[dict[str, Any]],
+    regions: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], int]:
+    """整页直读行列表按排除类版面区过滤（文本视图「排除页眉页脚」开关）。
+
+    行中心落在排除类区（页眉/页脚/页码/插图/表格/卦图）内的行整行剔除，
+    行归属判定与标注管线 main_text_only 同口径（中心点）；regions 为
+    None（region_det 不可用、无人工门控区）时原样返回——无安全边界
+    不强切，与 segment_image_with_metadata 的门控退路一致。rejected
+    区不参与（用户已否决的候选区不是门控依据）。返回 (保留行, 剔除数)。
+    """
+    if not lines:
+        return lines, 0
+    excluded = [
+        r for r in (regions or [])
+        if region_label(r) in REGION_EXCLUDED_LABELS
+        and r.get("status") != "rejected"
+    ]
+    if not excluded:
+        return lines, 0
+
+    def _inside(ln: dict[str, Any]) -> bool:
+        cx = ln.get("x", 0) + ln.get("w", 0) / 2
+        cy = ln.get("y", 0) + ln.get("h", 0) / 2
+        return any(
+            r.get("x", 0) <= cx <= r.get("x", 0) + r.get("w", 0)
+            and r.get("y", 0) <= cy <= r.get("y", 0) + r.get("h", 0)
+            for r in excluded
+        )
+
+    kept = [ln for ln in lines if not _inside(ln)]
+    return kept, len(lines) - len(kept)
+
+
 def _augment_with_model_hierarchy(
     result: dict[str, Any],
     image_path: str,
@@ -478,7 +515,7 @@ def filter_result_to_region(
     vertical_dir: str = "ttb",
     orientation: str = "vertical",
 ) -> dict[str, Any]:
-    """把整页识别结果过滤为"与区域相交的行"（整行保留），并重排序号。
+    """把整页识别结果过滤为"属于区域的行"并按区域沿阅读轴裁行。
 
     在识别之后调用：调用方先对整页结果跑完全部识别（与 /segment 同一
     批次），再过滤——保证区域重识别与整页重识别对同一行产出完全一致。
@@ -487,16 +524,22 @@ def filter_result_to_region(
     改变，同一行的读法/正文判定在两条链路间漂移。
 
     行保留条件：行中心或任一字中心落在区域内（行外扩成整列后行中心
-    可能移出区域，只要区域内有本行的字就保留）。保留整行、不按区域
-    裁字：行是完整的阅读单元，把跨区域边界的列拦腰截断会让区域外的
-    字直接消失（重识别后"文字照不全"）；跨边界列与区域外的旧行可能
-    短暂并存重复内容，由编辑器/人工去重。"""
+    可能移出区域，只要区域内有本行的字就保留）。
+
+    保留后沿阅读轴（竖排=纵向）按区域裁行：整页检测的"行"是整列高度，
+    常跨过上下相邻段落的边界——段落框只应换回本段的部分，整行保留会把
+    邻段文字一并带进本段（用户按四段划分逐段识别时每段都混入邻段行的
+    实测根源）。区域阅读轴之外的字裁掉、行框收到区域内；跨轴（横向）
+    保持整行不裁：边界列整行属于哪个段由两侧段各自级联时去重，拦腰
+    裁会把一条列拆进两个段。字全被裁掉的行（如外扩巨框的页首标题行，
+    字都在区域上方）整行不返回。"""
     # 懒导入：seg_pipeline 依赖本模块（_filter_layout），顶层互相 import 成环
     from seg_pipeline import _apply_sort_and_renumber
 
     rx, ry, rw, rh = region
     rx = max(0, rx)
     ry = max(0, ry)
+    vertical = orientation != "horizontal"
 
     def center_inside(item: dict[str, Any]) -> bool:
         try:
@@ -505,6 +548,16 @@ def filter_result_to_region(
         except (TypeError, ValueError):
             return False
         return rx <= cx <= rx + rw and ry <= cy <= ry + rh
+
+    def read_axis_center(item: dict[str, Any]) -> float | None:
+        try:
+            start = float(item.get("y" if vertical else "x", 0))
+            span = float(item.get("h" if vertical else "w", 0))
+        except (TypeError, ValueError):
+            return None
+        return start + span / 2.0
+
+    read1, read2 = (ry, ry + rh) if vertical else (rx, rx + rw)
 
     lines: list[dict[str, Any]] = []
     for source_line in result.get("lines", []) or []:
@@ -518,10 +571,37 @@ def filter_result_to_region(
             center_inside(c) for c in chars
         ):
             continue
-        lines.append(dict(source_line))
+        line = dict(source_line)
+        # 阅读轴裁字：区域外的字属于相邻段落（那个段级联时会各自识别）
+        kept = [
+            c for c in chars
+            if (rc := read_axis_center(c)) is not None and read1 <= rc <= read2
+        ]
+        if len(kept) < len(chars):
+            if not kept:
+                continue  # 本行没有一个字在区域的阅读轴范围内：不属于本区域
+            line["chars"] = kept
+            line["text"] = "".join(str(c.get("text") or "") for c in kept)
+        # 行框沿阅读轴收到区域内；跨轴不动（边界列整行语义保持）
+        try:
+            lx, ly = int(line.get("x", 0)), int(line.get("y", 0))
+            lw, lh = int(line.get("w", 0)), int(line.get("h", 0))
+        except (TypeError, ValueError):
+            lines.append(line)
+            continue
+        if vertical:
+            n1, n2 = max(ry, ly), min(ry + rh, ly + lh)
+            if n1 != ly or n2 != ly + lh:
+                line["y"], line["h"] = n1, max(1, n2 - n1)
+        else:
+            n1, n2 = max(rx, lx), min(rx + rw, lx + lw)
+            if n1 != lx or n2 != lx + lw:
+                line["x"], line["w"] = n1, max(1, n2 - n1)
+        lines.append(line)
     _log(
         f"[diag:region-filter] region={region} 整行保留 "
         f"{len(lines)}/{len(result.get('lines') or [])} 行"
+        f"（阅读轴裁行到区域内）"
     )
 
     # 过滤后重新编号，保持返回结果与整页识别相同的阅读顺序。
@@ -585,6 +665,15 @@ def extend_lines_to_region_ink(
         # 并排子列拆分行：框已贴各自子带墨迹，外扩会把上段通栏框吃进
         # 下方双列段（见 split_double_column_lines）。
         if line.get("double_col_split"):
+            continue
+        # 与页面阅读方向不同的行（竖排页里的横排标题/页眉行）不沿页面
+        # 阅读轴外扩：其行带下方的正文列墨迹会被当成"本行墨迹"，标题行
+        # 被纵向拉成整页高的巨框（实测 (201,56,432,87) → (26,56,1820,1511)），
+        # 巨框中心随后落进别的段框、整行被区域过滤带进段内。
+        line_orientation = str(line.get("orientation") or "")
+        if line_orientation and line_orientation != (
+            "vertical" if vertical else "horizontal"
+        ):
             continue
         if vertical:
             cross1, cross2 = lx - pad, lx + lw + pad

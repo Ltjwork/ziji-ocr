@@ -25,7 +25,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", choices=["detect", "classify", "siamese"],
                         required=True)
-    parser.add_argument("--data", required=True)
+    # resume 时数据集参数以检查点内保存的为准，--data 允许缺省
+    parser.add_argument("--data", default="")
     parser.add_argument("--base", default="yolov8s.pt")
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--imgsz", type=int, default=1280)
@@ -41,6 +42,13 @@ def main() -> int:
         default=0,
         help="每 N 轮保存一次中间检查点 epoch{N}.pt（0=不保存），"
              "供按曲线挑中间模型/判别过拟合",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="断点续训：--base 指向中断 run 的 last.pt，轮数/数据/增强/"
+             "保存目录等以检查点内保存的原始参数为准（ultralytics resume "
+             "语义），只有 device 等少数项可覆写",
     )
     parser.add_argument("--run-dir", required=True)
     args = parser.parse_args()
@@ -71,37 +79,58 @@ def main() -> int:
 
     if args.task == "siamese":
         return run_siamese(args, torch, device)
+    if not args.resume and not args.data:
+        print("[worker] 错误：缺少 --data（训练数据集）", flush=True)
+        return 1
 
     from ultralytics import YOLO
 
-    print(f"[worker] task={args.task} data={args.data} base={args.base} "
-          f"epochs={args.epochs} imgsz={args.imgsz} batch={args.batch} "
-          f"device={args.device} torch={torch.__version__}", flush=True)
+    if not args.resume:
+        print(f"[worker] task={args.task} data={args.data} base={args.base} "
+              f"epochs={args.epochs} imgsz={args.imgsz} batch={args.batch} "
+              f"device={args.device} torch={torch.__version__}", flush=True)
 
     model = YOLO(args.base)
-    train_kwargs = dict(
-        data=args.data,
-        epochs=args.epochs,
-        imgsz=args.imgsz,
-        batch=args.batch,
-        project=args.run_dir,
-        name="train",
-        exist_ok=True,
-        verbose=True,
-        plots=False,
-    )
-    if device is not None:
-        train_kwargs["device"] = device
-    if args.save_period > 0:
-        # ultralytics 语义：>0 时每 N 轮向 weights/ 写一个独立 epoch{N}.pt
-        train_kwargs["save_period"] = args.save_period
-    if args.task == "detect":
-        # 古籍适配：拼图/翻转会制造不存在的版面，关闭
-        train_kwargs.update(mosaic=0.0, flipud=0.0, fliplr=0.0, degrees=0.5, scale=0.1)
+    if args.resume:
+        # 断点续训：轮数/数据/增强/保存目录全部沿用 last.pt 里保存的原始
+        # 参数（ultralytics check_resume 用 ckpt_args 整体替换 args，传
+        # epochs 等也不生效），只有 device/patience 等白名单项可覆写。
+        # patience 强制覆写为 0（禁用早停）：旧 run 存的 patience=100 +
+        # 第 1 轮的 best_fitness 会让续训立刻再次早停。产物仍写回原 run
+        # 目录（save_dir 随 ckpt 参数恢复）。
+        print(f"[worker] resume task={args.task} base={args.base} "
+              f"device={args.device} torch={torch.__version__}", flush=True)
+        train_kwargs = dict(resume=True, patience=0)
+        if device is not None:
+            train_kwargs["device"] = device
+        model.train(**train_kwargs)
     else:
-        train_kwargs.update(mosaic=0.0, erasing=0.0)
-
-    model.train(**train_kwargs)
+        train_kwargs = dict(
+            data=args.data,
+            epochs=args.epochs,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            project=args.run_dir,
+            name="train",
+            exist_ok=True,
+            verbose=True,
+            plots=False,
+            # 禁用早停（ultralytics 默认 patience=100）：轮数由用户显式
+            # 选择；古籍小数据集的验证指标第 1-2 轮就饱和，默认早停会把
+            # 150/300 轮的训练在第 ~101 轮悄悄掐断（实测案例）。
+            patience=0,
+        )
+        if device is not None:
+            train_kwargs["device"] = device
+        if args.save_period > 0:
+            # ultralytics 语义：>0 时每 N 轮向 weights/ 写一个独立 epoch{N}.pt
+            train_kwargs["save_period"] = args.save_period
+        if args.task == "detect":
+            # 古籍适配：拼图/翻转会制造不存在的版面，关闭
+            train_kwargs.update(mosaic=0.0, flipud=0.0, fliplr=0.0, degrees=0.5, scale=0.1)
+        else:
+            train_kwargs.update(mosaic=0.0, erasing=0.0)
+        model.train(**train_kwargs)
 
     best = os.path.join(args.run_dir, "train", "weights", "best.pt")
     metrics = _read_metrics(os.path.join(args.run_dir, "train", "results.csv"))

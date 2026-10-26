@@ -2,15 +2,18 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/models.dart';
 import '../services/python_service.dart';
 import '../services/storage.dart';
 import 'training_curve_dialog.dart';
+import 'training_probe_dialog.dart';
 
 /// 模型训练页：从项目标注生成数据集并训练 5 类模型，训练后可启用反哺识别。
 ///
@@ -116,6 +119,17 @@ class _TrainingPageState extends State<TrainingPage> {
   /// layer -> 中间检查点保存周期（每 N 轮存一个 epoch{N}.pt，0=不存）。
   /// 默认每 10 轮：训练曲线弹窗里可以按曲线挑中间版本启用、判断过拟合。
   final Map<String, int> _savePeriodChoice = {};
+
+  /// 存档轮测试页识别：训练每到一个存档轮（epoch{N}.pt 落盘，后端
+  /// checkpoint_epoch 上报）自动用该轮检查点识别一次测试页并展示结果，
+  /// 直观看到模型逐轮长进。layer -> 是否启用（默认开）/测试页路径/状态。
+  final Map<String, bool> _probeEnabled = {};
+  final Map<String, String?> _probeImage = {};
+  final Map<String, _TrainProbe> _probes = {};
+
+  /// 目录 → 书籍项目（存档轮测试默认取当前来源书籍的第一页作测试页）。
+  Map<String, Project> _projectByDir = {};
+
   final Set<String> _busy = {};
   final Set<String> _exporting = {};
   bool _autoExporting = false;
@@ -129,11 +143,55 @@ class _TrainingPageState extends State<TrainingPage> {
   @override
   void initState() {
     super.initState();
+    unawaited(_initAsync());
+  }
+
+  /// 先恢复本地持久化的训练配置（每层轮数/存档周期/测试页、训练设备），
+  /// 再拉首屏数据——否则用户上次选的 300 轮会被本页默认 150 抢先盖掉
+  /// （轮数选择只存本页内存时，换入口进页/重启应用都会回到默认值，
+  /// 这正是"选了 300 实际仍按 150 训练"的根源）。
+  Future<void> _initAsync() async {
+    await _loadTrainPrefs();
+    if (!mounted) return;
     if (widget.project != null) {
-      _refresh().then((_) => unawaited(_autoExportPending()));
+      await _refresh().then((_) => unawaited(_autoExportPending()));
     } else {
       _loadProjects();
     }
+  }
+
+  Future<void> _loadTrainPrefs() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (!mounted) return;
+      setState(() {
+        _deviceChoice = prefs.getString('train.device') ?? 'auto';
+        for (final layer in _layerOrder) {
+          _epochsChoice[layer] = prefs.getInt('train.epochs.$layer') ?? 150;
+          _savePeriodChoice[layer] =
+              prefs.getInt('train.savePeriod.$layer') ?? 10;
+          _probeEnabled[layer] =
+              prefs.getBool('train.probeEnabled.$layer') ?? true;
+          _probeImage[layer] = prefs.getString('train.probeImage.$layer');
+        }
+      });
+    } catch (_) {}
+  }
+
+  /// 持久化一项训练配置（写入失败静默——只是记不住偏好，不阻塞操作）。
+  Future<void> _saveTrainPref(String key, Object? value) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (value == null) {
+        await prefs.remove(key);
+      } else if (value is bool) {
+        await prefs.setBool(key, value);
+      } else if (value is int) {
+        await prefs.setInt(key, value);
+      } else if (value is String) {
+        await prefs.setString(key, value);
+      }
+    } catch (_) {}
   }
 
   /// 打开训练页自动增量导出：stats 带 pending（书库中已确认但未导出的
@@ -193,6 +251,9 @@ class _TrainingPageState extends State<TrainingPage> {
       if (!mounted) return;
       setState(() {
         _rootDir = root;
+        _projectByDir = {
+          for (final pr in projects) pr.projectDir: pr,
+        };
         _sourceChoices
           ..clear()
           ..add((dir: root, name: '全部书籍（汇总）'));
@@ -262,6 +323,8 @@ class _TrainingPageState extends State<TrainingPage> {
         _verifyData = results[6] as Map<String, dynamic>?;
         _error = null;
       });
+      // 存档轮测试：轮询到新的 epoch{N}.pt 落盘即触发（内部有节流）
+      _maybeRunProbe();
     } catch (e) {
       if (!mounted) return;
       // 刷新失败不清已有数据（成功才整体替换），只提示并等下轮轮询恢复；
@@ -284,6 +347,47 @@ class _TrainingPageState extends State<TrainingPage> {
     } catch (_) {}
   }
 
+  /// 在独立窗口打开训练器（同一 exe 的第二实例）：主窗口随即可以回去
+  /// 校对，训练与进度显示互不影响——训练状态住在后端里，两个窗口各自
+  /// 轮询。后端生命周期仍归主实例，训练窗口关闭不影响训练。
+  ///
+  /// 单实例：runner 侧命名互斥体保证全局只有一个训练窗口——已开着时
+  /// 再次点击只会把已有窗口带到前台，不会重复开。
+  Future<void> _openTrainingWindow() async {
+    try {
+      // 经 cmd start 中转（实测可靠）：从应用直接 Process 启动 GUI 子
+      // 进程时，第二实例偶发渲染管线不启动（窗口可见但全白、Dart VM
+      // 在跑却不出画面）；start 规范化子进程上下文后正常。必须用
+      // Process.start 而非 run——GUI 子孙进程会继承管道句柄，run 等
+      // 不到 EOF 会永远挂起。
+      await Process.start('cmd', [
+        '/c',
+        'start',
+        '',
+        Platform.resolvedExecutable,
+        'training-window',
+      ], environment: {
+        ...Platform.environment,
+        'ZIJI_TRAINING_WINDOW': '1',
+      });
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('训练器已在新窗口打开：本窗口可以继续校对，训练照常进行'),
+        ),
+      );
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('打开独立训练窗口失败：$e'),
+            backgroundColor: Colors.red.shade700,
+          ),
+        );
+      }
+    }
+  }
+
   void _schedulePoll() {
     _pollTimer?.cancel();
     if (_hasRunningTask && mounted) {
@@ -300,6 +404,215 @@ class _TrainingPageState extends State<TrainingPage> {
       return rb.compareTo(ra);
     });
     return matches.first;
+  }
+
+  // --- 存档轮测试页识别：新检查点落盘 → 自动用该轮识别测试页 ---
+
+  /// 当前训练来源对应的书籍项目（指定书进入时即该书；下拉选择单本书时
+  /// 也能拿到；选"全部书籍汇总"时为 null，测试页需手动指定）。
+  Project? get _probeProject {
+    if (widget.project != null) return widget.project;
+    return _projectByDir[_projectDir];
+  }
+
+  /// 该层的测试页：手动选过用手选值；否则默认取来源书籍第一页。
+  String? _probeImageFor(String layer) {
+    final chosen = _probeImage[layer];
+    if (chosen != null && chosen.isNotEmpty) return chosen;
+    final images = _probeProject?.imageFiles;
+    return (images != null && images.isNotEmpty) ? images.first : null;
+  }
+
+  Future<String?> _pickImageFile() async {
+    final result = await FilePicker.platform.pickFiles(
+      allowMultiple: false,
+      type: FileType.custom,
+      allowedExtensions: const ['jpg', 'jpeg', 'png', 'webp', 'bmp', 'tif', 'tiff'],
+    );
+    final files = result?.files ?? const <PlatformFile>[];
+    if (files.isEmpty) return null;
+    return files.first.path;
+  }
+
+  /// 选择测试页：优先列出来源书籍的页面，也支持浏览任意图片文件。
+  Future<void> _chooseProbeImage(String layer) async {
+    final pages = _probeProject?.imageFiles ?? const <String>[];
+    String? picked;
+    if (pages.isNotEmpty) {
+      picked = await showDialog<String>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('选择测试页'),
+          content: SizedBox(
+            width: 480,
+            height: 440,
+            child: ListView.builder(
+              itemCount: pages.length,
+              itemBuilder: (_, i) => ListTile(
+                dense: true,
+                title: Text('第 ${i + 1} 页', style: const TextStyle(fontSize: 13)),
+                subtitle: Text(
+                  p.basename(pages[i]),
+                  style: const TextStyle(fontSize: 10.5),
+                  overflow: TextOverflow.ellipsis,
+                ),
+                onTap: () => Navigator.pop(ctx, pages[i]),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () async {
+                final path = await _pickImageFile();
+                if (ctx.mounted && path != null) Navigator.pop(ctx, path);
+              },
+              child: const Text('浏览文件…'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('取消'),
+            ),
+          ],
+        ),
+      );
+    } else {
+      picked = await _pickImageFile();
+    }
+    if (picked == null || picked.isEmpty) return;
+    setState(() => _probeImage[layer] = picked);
+    unawaited(_saveTrainPref('train.probeImage.$layer', picked));
+  }
+
+  /// 轮询到新的存档轮就触发一次测试识别（同层同轮只测一次；上一轮还在
+  /// 测时跳过，测完若又有新存档轮会在下轮轮询接上）。
+  void _maybeRunProbe() {
+    if (!mounted) return;
+    for (final task in _tasks) {
+      final status = task['status'] as String?;
+      if (status != 'training' && status != 'starting') continue;
+      final layer = task['layer'] as String?;
+      if (layer == null || !_layerMeta.containsKey(layer)) continue;
+      final epoch = (task['checkpoint_epoch'] as num?)?.toInt();
+      if (epoch == null || epoch <= 0) continue;
+      final probe = _probes[layer];
+      if (probe != null && (probe.running || probe.epoch == epoch)) continue;
+      if (!(_probeEnabled[layer] ?? true)) continue;
+      final image = _probeImageFor(layer);
+      // 持久化的测试页可能已被移动/删除：跳过（面板上仍可重新选择）
+      if (image == null || !File(image).existsSync()) continue;
+      final runDir = task['run_dir'] as String?;
+      if (runDir == null || runDir.isEmpty) continue;
+      unawaited(_runProbe(layer, epoch, runDir, image));
+    }
+  }
+
+  /// 断点续训：从上次中断的 run（后端 /models 的 resumable 信息）继续。
+  Future<void> _resumeTraining(
+    String layer,
+    Map<String, dynamic>? resumable,
+  ) async {
+    final runDir = resumable?['run_dir'] as String?;
+    if (runDir == null || runDir.isEmpty) return;
+    setState(() => _busy.add(layer));
+    try {
+      await PythonService.resumeTraining(
+        layer: layer,
+        runDir: runDir,
+        device: _deviceChoice,
+      );
+      // 预置"已测过"基线：中断前已落盘的存档轮不再重复测试（新一轮
+      // 存档落盘后照常触发）。本会话已有探针状态则不动（其 epoch 天然
+      // 等于最后一个已测存档轮，不会重复）。
+      if (!_probes.containsKey(layer)) {
+        final savePeriod = _savePeriodChoice[layer] ?? 10;
+        final done = (resumable?['done'] as num?)?.toInt() ?? 0;
+        if (savePeriod > 0) {
+          _probes[layer] =
+              _TrainProbe(epoch: (done ~/ savePeriod) * savePeriod);
+        }
+      }
+      await _refresh();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('继续训练失败：$e'),
+            backgroundColor: Colors.red.shade700,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _busy.remove(layer));
+    }
+  }
+
+  Future<void> _runProbe(
+    String layer,
+    int epoch,
+    String runDir,
+    String imagePath,
+  ) async {
+    final ckpt = p.join(runDir, 'train', 'weights', 'epoch$epoch.pt');
+    setState(() {
+      _probes[layer] = _TrainProbe(epoch: epoch, modelPath: ckpt)..running = true;
+    });
+    final sw = Stopwatch()..start();
+    void finish(_TrainProbeUpdate update) {
+      if (!mounted) return;
+      setState(() {
+        final probe = _probes[layer];
+        if (probe == null || probe.epoch != epoch) return;
+        probe.running = false;
+        update(probe);
+      });
+    }
+
+    try {
+      if (!await File(ckpt).exists()) {
+        throw Exception('检查点不存在：$ckpt');
+      }
+      final ann = await PythonService.segmentWithSettings(
+        imagePath: imagePath,
+        pageId: pageIdForImage(imagePath, 0),
+        settings: _probeProject?.settings ?? ProjectSettings(),
+        testLayer: layer,
+        testModelPath: ckpt,
+      );
+      finish(
+        (probe) => probe
+          ..annotation = ann
+          ..elapsedMs = sw.elapsedMilliseconds
+          ..finishedAt = DateTime.now()
+          ..error = null,
+      );
+    } catch (e) {
+      finish(
+        (probe) => probe
+          ..elapsedMs = sw.elapsedMilliseconds
+          ..finishedAt = DateTime.now()
+          ..error = e.toString(),
+      );
+    }
+  }
+
+  /// 查看最近一次存档轮测试的识别结果（图 + 框 + 文字）。
+  Future<void> _showProbeResult(String layer) async {
+    final probe = _probes[layer];
+    final ann = probe?.annotation;
+    final image = _probeImageFor(layer);
+    if (probe == null || ann == null || image == null) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => TrainingProbeDialog(
+        layer: layer,
+        layerTitle: _layerMeta[layer]!.$1,
+        epoch: probe.epoch,
+        imagePath: image,
+        annotation: ann,
+        elapsedMs: probe.elapsedMs,
+        modelPath: probe.modelPath ?? '',
+      ),
+    );
   }
 
   /// 该层当前生效的基础档位：用户手动选过用手选值；否则跟随系统算出的
@@ -633,17 +946,38 @@ class _TrainingPageState extends State<TrainingPage> {
                   model: _models[layer],
                   task: _taskFor(layer),
                   busy: _busy.contains(layer),
-                      datasetDir: _datasetDirs[layer],
-                      onOpenFolder: _openFolder,
-                      baseChoice: _effectiveBase(layer),
-                      epochsChoice: _epochsChoice[layer] ?? 150,
-                      savePeriodChoice: _savePeriodChoice[layer] ?? 10,
+                  datasetDir: _datasetDirs[layer],
+                  onOpenFolder: _openFolder,
+                  baseChoice: _effectiveBase(layer),
+                  epochsChoice: _epochsChoice[layer] ?? 150,
+                  savePeriodChoice: _savePeriodChoice[layer] ?? 10,
+                  probeEnabled: _probeEnabled[layer] ?? true,
+                  onProbeToggle: (v) {
+                    setState(() => _probeEnabled[layer] = v);
+                    unawaited(
+                        _saveTrainPref('train.probeEnabled.$layer', v));
+                  },
+                  probeImagePath: _probeImageFor(layer),
+                  onPickProbeImage: () =>
+                      unawaited(_chooseProbeImage(layer)),
+                  probe: _probes[layer],
+                  onShowProbeResult: () => unawaited(_showProbeResult(layer)),
+                  resumable: _models[layer]?['resumable']
+                      as Map<String, dynamic>?,
+                  onResume: () => unawaited(
+                      _resumeTraining(layer, _models[layer]?['resumable']
+                          as Map<String, dynamic>?)),
                   onBaseChanged: (v) =>
                       setState(() => _baseChoice[layer] = v),
-                  onEpochsChanged: (v) =>
-                      setState(() => _epochsChoice[layer] = v),
-                  onSavePeriodChanged: (v) =>
-                      setState(() => _savePeriodChoice[layer] = v),
+                  onEpochsChanged: (v) {
+                    setState(() => _epochsChoice[layer] = v);
+                    unawaited(_saveTrainPref('train.epochs.$layer', v));
+                  },
+                  onSavePeriodChanged: (v) {
+                    setState(() => _savePeriodChoice[layer] = v);
+                    unawaited(
+                        _saveTrainPref('train.savePeriod.$layer', v));
+                  },
                   onTrain: () => _startTraining(layer),
                   onStop: () =>
                       _stopTask(_taskFor(layer)?['id'] as String? ?? ''),
@@ -728,6 +1062,14 @@ class _TrainingPageState extends State<TrainingPage> {
             onPressed: (_preflightBusy || _projectDir.isEmpty) ? null : _runPreflight,
           ),
           Tooltip(
+            message: '在独立窗口打开训练器：主窗口可回去校对，'
+                '训练与进度显示互不影响（训练窗口关闭不影响训练）',
+            child: IconButton(
+              icon: const Icon(Icons.open_in_new),
+              onPressed: _openTrainingWindow,
+            ),
+          ),
+          Tooltip(
             message: '训练设备：自动 = 有 GPU 用 GPU；'
                 '选 GPU/CPU 则强制指定（需环境支持）',
             child: SegmentedButton<String>(
@@ -737,8 +1079,10 @@ class _TrainingPageState extends State<TrainingPage> {
                 ButtonSegment(value: 'cpu', label: Text('CPU', style: TextStyle(fontSize: 11))),
               ],
               selected: {_deviceChoice},
-              onSelectionChanged: (s) =>
-                  setState(() => _deviceChoice = s.first),
+              onSelectionChanged: (s) {
+                setState(() => _deviceChoice = s.first);
+                unawaited(_saveTrainPref('train.device', s.first));
+              },
               style: const ButtonStyle(
                 visualDensity: VisualDensity.compact,
                 tapTargetSize: MaterialTapTargetSize.shrinkWrap,
@@ -897,7 +1241,12 @@ class _TrainingPageState extends State<TrainingPage> {
               children: [
                 if (running) ...[
                   Text(
-                    task?['status'] == 'training' ? '微调进行中' : '正在启动',
+                    _etaStatusLine(
+                      base: task?['status'] == 'training' ? '微调进行中' : '正在启动',
+                      epoch: (task?['epoch'] as num?)?.toInt(),
+                      epochs: (task?['epochs'] as num?)?.toInt(),
+                      etaSeconds: task?['eta_seconds'] as num?,
+                    ),
                     style: const TextStyle(fontSize: 12, color: Colors.blue),
                   ),
                   const SizedBox(width: 10),
@@ -1227,7 +1576,15 @@ class _TrainingPageState extends State<TrainingPage> {
               children: [
                 if (running) ...[
                   Text(
-                    status == 'training' ? '训练中' : '正在启动',
+                    _etaStatusLine(
+                      base: status == 'training' ? '训练中' : '正在启动',
+                      epochs: (task?['epochs'] as num?)?.toInt(),
+                      etaSeconds: task?['eta_seconds'] as num?,
+                      doneEpochs:
+                          (((task?['progress'] as num?)?.toDouble() ?? 0) *
+                              ((task?['epochs'] as num?)?.toInt() ?? 0))
+                          .round(),
+                    ),
                     style: const TextStyle(fontSize: 12, color: Colors.blue),
                   ),
                   const SizedBox(width: 10),
@@ -1450,6 +1807,19 @@ class _LayerCard extends StatelessWidget {
 
   /// 中间检查点保存周期（每 N 轮存 epoch{N}.pt，0=不存）。
   final int savePeriodChoice;
+
+  /// 存档轮测试页识别：开关 / 测试页路径 / 最近一次测试状态。
+  final bool probeEnabled;
+  final ValueChanged<bool> onProbeToggle;
+  final String? probeImagePath;
+  final VoidCallback onPickProbeImage;
+  final _TrainProbe? probe;
+  final VoidCallback onShowProbeResult;
+
+  /// 最近一个中断未收尾的 run（/models 的 resumable；null=没有可续训的）。
+  final Map<String, dynamic>? resumable;
+  final VoidCallback onResume;
+
   final ValueChanged<String> onBaseChanged;
   final ValueChanged<int> onEpochsChanged;
   final ValueChanged<int> onSavePeriodChanged;
@@ -1480,6 +1850,14 @@ class _LayerCard extends StatelessWidget {
     required this.baseChoice,
     required this.epochsChoice,
     required this.savePeriodChoice,
+    this.probeEnabled = true,
+    this.onProbeToggle = _noopToggle,
+    this.probeImagePath,
+    this.onPickProbeImage = _noop,
+    this.probe,
+    this.onShowProbeResult = _noop,
+    this.resumable,
+    this.onResume = _noop,
     required this.onBaseChanged,
     required this.onEpochsChanged,
     required this.onSavePeriodChanged,
@@ -1495,6 +1873,9 @@ class _LayerCard extends StatelessWidget {
 
   bool get _isCls => layer == 'char_cls';
 
+  static void _noop() {}
+  static void _noopToggle(bool _) {}
+
   String get _lastRunDir {
     final taskDir = task?['run_dir'] as String?;
     if (taskDir != null && taskDir.isNotEmpty) return taskDir;
@@ -1504,6 +1885,152 @@ class _LayerCard extends StatelessWidget {
       if (dir != null && dir.isNotEmpty) return dir;
     }
     return '';
+  }
+
+  /// 存档轮测试面板：开关 + 测试页选择 + 最近一次识别结果/进行中状态。
+  Widget _buildProbePanel(BuildContext context) {
+    final probeState = probe;
+    final taskStatus = task?['status'] as String?;
+    final running =
+        taskStatus == 'training' || taskStatus == 'starting';
+    return Container(
+      padding: const EdgeInsets.fromLTRB(10, 4, 10, 8),
+      decoration: BoxDecoration(
+        color: Colors.blue.shade50,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Tooltip(
+                message: '训练每到一个存档轮（每 N 轮存档）自动用该轮检查点'
+                    '识别一次测试页，直观看到模型逐轮长进。识别与训练共用 '
+                    'GPU，期间两边都会稍慢，可随时关闭。',
+                child: Row(
+                  children: [
+                    Switch(
+                      value: probeEnabled,
+                      onChanged: running ? onProbeToggle : null,
+                    ),
+                    Text(
+                      '存档轮测试页识别',
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        color: running ? null : Colors.grey,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const Spacer(),
+              TextButton.icon(
+                onPressed: onPickProbeImage,
+                icon: const Icon(Icons.image_outlined, size: 15),
+                label: Text(
+                  probeImagePath == null
+                      ? '选择测试页'
+                      : '测试页：${p.basename(probeImagePath!)}',
+                  style: const TextStyle(fontSize: 11),
+                ),
+                style: TextButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                ),
+              ),
+            ],
+          ),
+          if (probeEnabled && running && savePeriodChoice <= 0)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                '当前「不存中间检查点」：训练中不会产生存档轮，也就不会触发测试'
+                '（可在「每 N 轮存档」里开启）',
+                style: TextStyle(fontSize: 10.5, color: Colors.orange.shade800),
+              ),
+            ),
+          if (probeEnabled && running && probeImagePath == null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                '还没有测试页：点击右侧「选择测试页」后，每个存档轮自动识别展示',
+                style: TextStyle(fontSize: 10.5, color: Colors.orange.shade800),
+              ),
+            ),
+          if (probeState != null) ...[
+            if (probeState.running)
+              const Padding(
+                padding: EdgeInsets.only(top: 2),
+                child: Row(
+                  children: [
+                    SizedBox(
+                      width: 13,
+                      height: 13,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    ),
+                    SizedBox(width: 8),
+                    Text(
+                      '正在用该轮检查点识别测试页…（与训练并行，稍慢）',
+                      style: TextStyle(fontSize: 11, color: Colors.blue),
+                    ),
+                  ],
+                ),
+              )
+            else if (probeState.error != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text(
+                  '第 ${probeState.epoch} 轮识别失败：${probeState.error}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(fontSize: 11, color: Colors.red.shade700),
+                ),
+              )
+            else if (probeState.annotation != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        '第 ${probeState.epoch} 轮存档 · '
+                        '${_hhmm(probeState.finishedAt)} 识别 · '
+                        '字框 ${probeState.annotation!.blocks.length} · '
+                        '行 ${probeState.annotation!.lines.length} · '
+                        '段 ${probeState.annotation!.paragraphs.length} · '
+                        '${(probeState.elapsedMs / 1000).toStringAsFixed(1)}s',
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.green.shade800,
+                        ),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: onShowProbeResult,
+                      style: TextButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                      ),
+                      child: const Text(
+                        '查看识别结果',
+                        style: TextStyle(fontSize: 11),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ] else if (probeEnabled && running && probeImagePath != null)
+            const Padding(
+              padding: EdgeInsets.only(top: 2),
+              child: Text(
+                '等待第一个存档轮落盘…（每到一个存档轮自动测试一次）',
+                style: TextStyle(fontSize: 10.5, color: Colors.grey),
+              ),
+            ),
+        ],
+      ),
+    );
   }
 
   @override
@@ -1654,10 +2181,72 @@ class _LayerCard extends StatelessWidget {
               LinearProgressIndicator(value: progress.clamp(0, 1)),
               const SizedBox(height: 4),
               Text(
-                status == 'starting'
-                    ? '正在启动训练（下载数据/初始化）…'
-                    : '训练中 epoch ${(progress * (task?['epochs'] as int? ?? 100)).round()}/${task?['epochs']}',
+                _trainingProgressText(status, task),
                 style: const TextStyle(fontSize: 11),
+              ),
+            ],
+            // 存档轮测试面板：训练中配置/展示；训练结束后保留最近一次结果
+            if (running || probe != null) ...[
+              const SizedBox(height: 6),
+              _buildProbePanel(context),
+            ],
+            // 断点续训：上次训练未正常收尾（手动停止/崩溃/关机中断）时出现
+            if (!running && resumable != null) ...[
+              const SizedBox(height: 6),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 10,
+                  vertical: 4,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.amber.shade50,
+                  borderRadius: BorderRadius.circular(6),
+                  border: Border.all(color: Colors.amber.shade200),
+                ),
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.history,
+                      size: 15,
+                      color: Colors.orange.shade800,
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      child: Builder(builder: (_) {
+                        final info = resumable;
+                        if (info == null) return const SizedBox.shrink();
+                        final done = (info['done'] as num?)?.toInt() ?? 0;
+                        final epochs = (info['epochs'] as num?)?.toInt();
+                        final trained = epochs != null && epochs > 0
+                            ? '已练 $done/$epochs 轮'
+                            : '已练 $done 轮';
+                        final runName = p.basename(
+                          (info['run_dir'] as String?) ?? '',
+                        ).replaceFirst(RegExp(r'^run_'), '');
+                        return Text(
+                          '上次训练未完成（$trained · $runName）：'
+                          '可从第 ${done + 1} 轮继续，总轮数与数据沿用原设置',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: Colors.orange.shade900,
+                          ),
+                        );
+                      }),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton.tonalIcon(
+                      onPressed: busy ? null : onResume,
+                      icon: const Icon(Icons.play_arrow, size: 16),
+                      label: const Text(
+                        '继续训练',
+                        style: TextStyle(fontSize: 12),
+                      ),
+                      style: FilledButton.styleFrom(
+                        visualDensity: VisualDensity.compact,
+                      ),
+                    ),
+                  ],
+                ),
               ),
             ],
             if (status == 'failed') ...[
@@ -1812,7 +2401,9 @@ class _LayerCard extends StatelessWidget {
                             child: CircularProgressIndicator(strokeWidth: 2),
                           )
                         : const Icon(Icons.play_arrow, size: 18),
-                    label: const Text('开始训练'),
+                    // 轮数直接标在按钮上：启动前一眼核对（轮数选择会随
+                    // 训练配置持久化，但跨入口/跨机器仍可能不是你以为的那个数）
+                    label: Text('开始训练（$epochsChoice 轮）'),
                   ),
                   const SizedBox(width: 8),
                   if (runs > 0)
@@ -1885,3 +2476,90 @@ class _LayerCard extends StatelessWidget {
     );
   }
 }
+
+/// 存档轮测试页识别的状态（训练页内每层一份；字段就地更新 + setState）。
+class _TrainProbe {
+  _TrainProbe({required this.epoch, this.modelPath});
+
+  /// 已触发测试的存档轮号（epoch{N}.pt）。
+  int epoch;
+  bool running = false;
+  String? modelPath;
+  PageAnnotation? annotation;
+  int elapsedMs = 0;
+  DateTime? finishedAt;
+  String? error;
+}
+
+typedef _TrainProbeUpdate = void Function(_TrainProbe probe);
+
+/// 训练进行中的一行进度文案：当前轮 + 本轮内进度 + 预计完成时间。
+String _trainingProgressText(String? status, Map<String, dynamic>? task) {
+  if (status == 'starting') return '正在启动训练（下载数据/初始化）…';
+  final epochs = (task?['epochs'] as num?)?.toInt() ?? 0;
+  final epoch = (task?['epoch'] as num?)?.toInt();
+  final batch = task?['batch'] as Map?;
+  final epochProgress = (task?['epoch_progress'] as num?)?.toDouble();
+  final secPerEpoch = (task?['sec_per_epoch'] as num?)?.toDouble();
+  final eta = _etaText(task?['eta_seconds'] as num?);
+  final parts = <String>[
+    if (epoch != null && epochs > 0) '第 $epoch/$epochs 轮',
+    if (epochProgress != null && batch != null)
+      '本轮 ${(epochProgress * 100).round()}%'
+          '（${batch['cur']}/${batch['total']}）',
+    if (secPerEpoch != null && secPerEpoch > 0)
+      '每轮约 ${_fmtDuration(secPerEpoch)}',
+    if (eta.isNotEmpty) eta,
+  ];
+  return parts.isEmpty ? '训练中…' : parts.join(' · ');
+}
+
+/// 秒数 → "38 秒 / 5 分 12 秒 / 2 小时 15 分"。
+String _fmtDuration(num seconds) {
+  final s = seconds.round();
+  if (s < 60) return '$s 秒';
+  final m = s ~/ 60;
+  final sec = s % 60;
+  if (m < 60) return sec > 0 ? '$m 分 $sec 秒' : '$m 分钟';
+  final h = m ~/ 60;
+  final mm = m % 60;
+  return mm > 0 ? '$h 小时 $mm 分' : '$h 小时';
+}
+
+/// 预计完成文案：'预计还需约 2 小时 15 分（约 16:42 完成）'；空 = 估不出。
+String _etaText(num? etaSeconds) {
+  if (etaSeconds == null || etaSeconds <= 0) return '';
+  final eta = etaSeconds.toDouble();
+  // 早期估算含启动开销偏保守，太短的估计没意义，至少 30s 才展示
+  if (eta < 30) return '';
+  final finish = DateTime.now().add(Duration(seconds: eta.round()));
+  final hh = finish.hour.toString().padLeft(2, '0');
+  final mm = finish.minute.toString().padLeft(2, '0');
+  final dayLabel = _sameDay(finish, DateTime.now()) ? '' : '明天 ';
+  return '预计还需约 ${_fmtDuration(eta)}（约 $dayLabel$hh:$mm 完成）';
+}
+
+bool _sameDay(DateTime a, DateTime b) =>
+    a.year == b.year && a.month == b.month && a.day == b.day;
+
+/// Kraken/墨迹比对卡的进行中状态行：基础文案 + 轮数 + 预计完成时间。
+/// [epoch] 直接给当前轮（1 基）；或用 [doneEpochs]（已完成轮数）+1 推。
+String _etaStatusLine({
+  required String base,
+  int? epoch,
+  int? epochs,
+  int? doneEpochs,
+  num? etaSeconds,
+}) {
+  final buf = StringBuffer(base);
+  final total = epochs ?? 0;
+  final cur = epoch ?? (doneEpochs != null && total > 0 ? doneEpochs + 1 : null);
+  if (cur != null && total > 0) buf.write(' 第 $cur/$total 轮');
+  final eta = _etaText(etaSeconds);
+  if (eta.isNotEmpty) buf.write(' · $eta');
+  return buf.toString();
+}
+
+String _hhmm(DateTime? time) => time == null
+    ? ''
+    : '${time.hour.toString().padLeft(2, '0')}:${time.minute.toString().padLeft(2, '0')}';

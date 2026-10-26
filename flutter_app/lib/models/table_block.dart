@@ -12,6 +12,36 @@ library;
 
 import 'models.dart';
 
+/// 光标前文字 ↔ 格内字框序列对齐（表格对照校对用）：返回 [text] 前
+/// [cursorOffset] 个字符对应的字框，供原图高亮。
+/// 按字顺次匹配；文本删过字（框在而文本无）允许跳一个框再匹配，文本
+/// 插过字（文本有而框无）不占框——校对改动后的文本仍能就近对齐。
+List<TableCellChar> charsBeforeCursor(
+  String text,
+  int cursorOffset,
+  List<TableCellChar> chars,
+) {
+  if (chars.isEmpty || cursorOffset <= 0) return const [];
+  final prefix = text.substring(0, cursorOffset.clamp(0, text.length));
+  final out = <TableCellChar>[];
+  var i = 0;
+  for (final rune in prefix.runes) {
+    if (i >= chars.length) break;
+    final ch = String.fromCharCode(rune);
+    if (chars[i].text == ch) {
+      out.add(chars[i]);
+      i++;
+    } else if (i + 1 < chars.length && chars[i + 1].text == ch) {
+      // 框在而文本无（该字被删）：跳过被删的框取下一个
+      i++;
+      out.add(chars[i]);
+      i++;
+    }
+    // 文本有而框无（插入的字）：不占框，继续对齐后面的字
+  }
+  return out;
+}
+
 /// 单元格内的识别证据（一个字框 + 逐字读法与置信度）。
 class TableCellChar {
   int x, y, w, h;
@@ -127,6 +157,11 @@ class TableAnnotation {
   String status;
   String uid;
 
+  /// 识别日志（诊断用）：引擎/模型、每格连通域统计、逐字读/序列读与
+  /// 逐组融合决策、耗时——与官网 Demo 效果不一致时逐行对照定位差异
+  /// 环节。随识别结果产生、随标注落盘，校对页可查看/复制。
+  List<String> logLines;
+
   TableAnnotation({
     required this.id,
     required this.x,
@@ -142,9 +177,11 @@ class TableAnnotation {
     this.regionUid = '',
     this.status = AnnotationStatus.proposed,
     this.uid = '',
+    List<String>? logLines,
   })  : hLines = hLines ?? const [],
         vLines = vLines ?? const [],
-        cells = cells ?? [];
+        cells = cells ?? [],
+        logLines = logLines ?? const [];
 
   factory TableAnnotation.fromJson(Map<String, dynamic> j) => TableAnnotation(
         id: j['id'] as String,
@@ -164,6 +201,10 @@ class TableAnnotation {
         regionUid: j['region_uid'] as String? ?? '',
         status: AnnotationStatus.normalize(j['status'] as String?),
         uid: j['uid'] as String? ?? '',
+        logLines: (j['log'] as List?)
+                ?.map((e) => e.toString())
+                .toList() ??
+            const [],
       );
 
   /// /recognize_table 响应 → TableAnnotation。
@@ -188,6 +229,8 @@ class TableAnnotation {
                 .toList() ??
             const [],
         regionUid: regionUid,
+        logLines: (j['log'] as List?)?.map((e) => e.toString()).toList() ??
+            const [],
       );
 
   Map<String, dynamic> toJson() => {
@@ -205,6 +248,7 @@ class TableAnnotation {
         'region_uid': regionUid,
         'status': status,
         if (uid.isNotEmpty) 'uid': uid,
+        if (logLines.isNotEmpty) 'log': logLines,
       };
 
   /// 页面旋转/镜像的几何同步（与 PageAnnotation.transformGeometry 同一
@@ -296,4 +340,68 @@ class TableAnnotation {
       cols = t;
     }
   }
+}
+
+/// 表格文本导出（Markdown / TSV）。合并格：内容只写起点格，被覆盖格
+/// 留空（Markdown/TSV 均不支持 colspan）。
+///
+/// 2026-10 起从表格校对页移入模型层：全书全文导出（BookTextExporter）
+/// 与校对页单表导出共用同一矩阵；[rowNumbers] 控制首列是否带行号
+/// （校对页带行号，全书导出按原表结构不带）。
+class TableExport {
+  /// 返回 rows×cols 的单元矩阵（[rowNumbers] 时首列多一列行号），按列
+  /// 显示序重排。
+  static List<List<String>> _matrix(
+    TableAnnotation t, {
+    required bool rtlCols,
+    bool rowNumbers = true,
+  }) {
+    final blocks = <(int, int), TableCellBlock>{
+      for (final c in t.cells) (c.row, c.col): c,
+    };
+    var colOrder = List<int>.generate(t.cols, (i) => i);
+    if (rtlCols) {
+      colOrder = colOrder.reversed.toList();
+    }
+    final rows = <List<String>>[];
+    for (var r = 0; r < t.rows; r++) {
+      final row = rowNumbers ? <String>['${r + 1}'] : <String>[];
+      for (final c in colOrder) {
+        row.add(blocks[(r, c)]?.text ?? '');
+      }
+      rows.add(row);
+    }
+    return rows;
+  }
+
+  static String toMarkdown(
+    TableAnnotation t, {
+    required bool rtlCols,
+    bool rowNumbers = true,
+  }) {
+    final m = _matrix(t, rtlCols: rtlCols, rowNumbers: rowNumbers);
+    if (m.isEmpty) return '';
+    final buf = StringBuffer();
+    for (var i = 0; i < m.length; i++) {
+      var cells = m[i];
+      // 行号列首行显示「行」作表头（校对页导出的旧观感）。
+      if (i == 0 && rowNumbers) cells = ['行', ...cells.skip(1)];
+      buf.writeln(
+          '| ${cells.map((c) => c.isEmpty ? ' ' : c).join(' | ')} |');
+      // Markdown 表头分隔行跟在首行后：原表首行作表头。
+      if (i == 0) {
+        buf.writeln('| ${m[i].map((_) => '---').join(' | ')} |');
+      }
+    }
+    return buf.toString();
+  }
+
+  static String toTSV(
+    TableAnnotation t, {
+    required bool rtlCols,
+    bool rowNumbers = true,
+  }) =>
+      _matrix(t, rtlCols: rtlCols, rowNumbers: rowNumbers)
+          .map((r) => r.join('\t'))
+          .join('\n');
 }

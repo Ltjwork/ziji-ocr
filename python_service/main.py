@@ -1,4 +1,4 @@
-# 本文件是门面（facade）：实现已按职责拆分到 api_base, api_segment, api_page, api_export, api_recognize, api_train, api_verify, api_kraken, api_region, api_table，此处 re-export 保持既有 import 面不变。
+# 本文件是门面（facade）：实现已按职责拆分到 api_base, api_segment, api_page, api_export, api_recognize, api_train, api_verify, api_kraken, api_region, api_table, api_hexagram，此处 re-export 保持既有 import 面不变。
 import base64
 import functools
 import os
@@ -162,6 +162,13 @@ from api_table import (  # noqa: E402,F401
     RecognizeTableRequest,
     detect_tables,
     recognize_table_endpoint,
+)
+
+from api_hexagram import (  # noqa: E402,F401
+    DetectHexagramsRequest,
+    RecognizeHexagramRequest,
+    detect_hexagrams,
+    recognize_hexagram_endpoint,
 )
 
 from api_train import (  # noqa: E402,F401

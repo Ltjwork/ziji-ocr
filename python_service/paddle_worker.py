@@ -4,7 +4,8 @@ paddle_bridge/paddle_proc 调起。
 
 协议（stdin/stdout，均为单行 JSON，UTF-8）——与 kraken_worker 同款框架：
   请求：{"id": int, "op": "ping" | "recognize" | "read_boxes" | "read_strip"
-         | "read_line" | "read_page" | "detect_lines" | "shutdown",
+         | "read_line" | "read_page" | "read_spotting" | "detect_lines"
+         | "shutdown",
          "payload": {...}}
   响应：{"id": int, "ok": true, "result": {...}} 或
         {"id": int, "ok": false, "error": "...", "traceback": "..."}
@@ -41,10 +42,13 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import time
 import traceback
 
 from PIL import Image
+
+from paddle_vl_sampling import ensure_vl_sampling_support
 
 DEFAULT_MODEL = "PP-OCRv6_small_rec"
 
@@ -621,6 +625,94 @@ def _plain_chars(s: str) -> str:
     )
 
 
+def _find_spotting_res(data) -> dict | None:
+    """结果树里递归找 spotting_res dict（包装层随 paddlex 版本而异：
+    layoutParsingResults[0].prunedResult.spotting_res / res.spotting_res /
+    顶层 spotting_res / 直接就是 spotting 内容本身；任何一层命中即
+    返回）。"""
+    if isinstance(data, dict):
+        if "rec_polys" in data and "rec_texts" in data:
+            return data
+        sp = data.get("spotting_res")
+        if isinstance(sp, dict):
+            return sp
+        for v in data.values():
+            found = _find_spotting_res(v)
+            if found is not None:
+                return found
+    elif isinstance(data, list):
+        for v in data:
+            found = _find_spotting_res(v)
+            if found is not None:
+                return found
+    return None
+
+
+def _op_read_spotting(model, payload: dict) -> dict:
+    """VL 文本检测与识别（spotting）·区域级——表格识别用（PaddleOCR
+    官网 Demo 同款能力）：裁剪 rect 区域 → VL spotting 管线 → 逐文本框
+    {"boxes": [{"x","y","w","h"}], "texts": [...], "confs": [...]}，坐标
+    偏移回原图绝对坐标。仅 VL 模型；PP-OCR 系模型拒绝（无此管线）。"""
+    if not _is_vl_model():
+        _vl_reject()
+    image_path = payload["image_path"]
+    rect = payload.get("rect") or {}
+    rx, ry = int(rect.get("x", 0)), int(rect.get("y", 0))
+    rw, rh = int(rect.get("w", 0)), int(rect.get("h", 0))
+    img = Image.open(image_path).convert("RGB")
+    if rw > 0 and rh > 0:
+        img = img.crop((rx, ry, rx + rw, ry + rh))
+    fd, tmp_path = tempfile.mkstemp(prefix="ocr_vlspot_", suffix=".png")
+    os.close(fd)
+    try:
+        img.save(tmp_path)
+        # spotting 强制为 Prompt 类型（vl_predict 其余参数仍走白名单）
+        kwargs = _vl_predict_kwargs(payload.get("vl_predict") or None)
+        kwargs["prompt_label"] = "spotting"
+        t0 = time.time()
+        spotting = None
+        for res in model.predict(input=tmp_path, **kwargs):
+            data = _vl_result_dict(res)
+            found = _find_spotting_res(data)
+            if found is not None:
+                spotting = found
+        tlog(
+            f"VL spotting done in {time.time() - t0:.1f}s: "
+            f"{len((spotting or {}).get('rec_texts') or [])} boxes"
+        )
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+    if not spotting:
+        return {"boxes": [], "texts": [], "confs": []}
+    polys = spotting.get("rec_polys") or []
+    texts = spotting.get("rec_texts") or []
+    confs = spotting.get("rec_scores") or []
+    boxes = []
+    out_texts = []
+    out_confs = []
+    for i, poly in enumerate(polys):
+        if i >= len(texts):
+            break
+        try:
+            xs = [float(p[0]) for p in poly]
+            ys = [float(p[1]) for p in poly]
+        except (TypeError, IndexError, ValueError):
+            continue
+        x0, y0 = min(xs) + rx, min(ys) + ry
+        x1, y1 = max(xs) + rx, max(ys) + ry
+        boxes.append({
+            "x": int(round(x0)), "y": int(round(y0)),
+            "w": int(round(x1 - x0)), "h": int(round(y1 - y0)),
+        })
+        out_texts.append(str(texts[i]))
+        conf = confs[i] if i < len(confs) else None
+        out_confs.append(round(float(conf), 4) if conf is not None else 0.0)
+    return {"boxes": boxes, "texts": out_texts, "confs": out_confs}
+
+
 def _order_geo_reading(
     lines: list[dict],
     orientation: str,
@@ -983,6 +1075,9 @@ def _load_model():
         if device == "cpu":
             tlog("WARNING: VL 模型跑在 CPU 上会极慢（分钟级/页），建议 GPU")
         tlog(f"load VL pipeline: {_MODEL_NAME} (device={device}, cfg={vl_cfg})")
+        # 本地 VL 推理默认丢弃 repetition_penalty/temperature/top_p（上游
+        # 只在服务端模式支持），这里补上转发——界面「生成参数」三项生效。
+        tlog(f"VL sampling patch: {ensure_vl_sampling_support()}")
         t0 = time.time()
 
         def build():
@@ -1064,6 +1159,7 @@ _OPS = {
     "read_strip": _op_read_strip,
     "read_line": _op_read_line,
     "read_page": _op_read_page,
+    "read_spotting": _op_read_spotting,
     "detect_lines": _op_detect_lines,
 }
 

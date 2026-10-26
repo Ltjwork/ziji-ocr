@@ -214,6 +214,30 @@ class PluginHost extends ChangeNotifier implements PluginUiHooks {
     notifyListeners();
   }
 
+  /// 重新加载一个插件：重读安装目录（插件文件被直接覆盖时取到新版
+  /// 清单），停掉旧运行时与该插件已打开的页面，再按启停状态用新文件
+  /// 重启运行时。开发迭代改完插件、把新文件覆盖进插件安装目录后点
+  /// 这里的重载即可生效，无需重启应用。返回重读到的插件（目录已不
+  /// 存在则返回 null，视同已卸载）。
+  Future<InstalledPlugin?> reloadPlugin(String id) async {
+    // 该插件已打开的页面跑的是旧代码，先按无回执关闭，避免新旧混跑。
+    for (final session in _pageSessions.values.toList()) {
+      if (session.plugin.id == id) {
+        session.requestClose?.call(null);
+      }
+    }
+    await _stopRuntime(id);
+    _entriesByPlugin.remove(id);
+    _statusLines.remove(id);
+    await _reloadInstalled();
+    final plugin = byId(id);
+    if (plugin != null && _enabled[id] == true) {
+      unawaited(_startRuntime(plugin));
+    }
+    notifyListeners();
+    return plugin;
+  }
+
   // ── 启停 ──
 
   Future<void> setEnabled(String id, bool value) async {
@@ -438,6 +462,7 @@ class PluginHost extends ChangeNotifier implements PluginUiHooks {
     String? projectDir,
     String? projectName,
     int pageIndex = 0,
+    String? pageId,
   }) async {
     final plugin = byId(entry.pluginId);
     if (plugin == null || entry.page.isEmpty) return null;
@@ -448,6 +473,7 @@ class PluginHost extends ChangeNotifier implements PluginUiHooks {
         projectDir: projectDir,
         projectName: projectName,
         pageIndex: pageIndex,
+        pageId: pageId,
         entryId: entry.id,
       ),
       title: entry.title,

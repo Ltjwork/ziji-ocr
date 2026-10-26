@@ -10,6 +10,7 @@ import '../models/models.dart';
 import '../models/table_block.dart';
 import 'isolate_codec.dart';
 import 'ollama_service.dart' show OllamaSettings;
+import 'smart_merge.dart';
 
 /// 服务基准地址：默认 1288；服务端在 1288 被 Windows 端口保留区
 /// （winnat/Hyper-V/WSL 随机保留段，bind 报 Errno 13）占用时会自动
@@ -20,7 +21,7 @@ String _base = 'http://127.0.0.1:$_kBasePort';
 // Keep the client gate in lock-step with the backend build string: accepting
 // an older build silently leaves the app talking to an older segmenter (and
 // makes the new layout/ink rules appear to have no effect).
-const _expectedBackendBuild = 'model-manage-epochs-2026-10-15-v156';
+const _expectedBackendBuild = 'text-progress-2026-10-25-v170';
 
 /// 测试专用：把服务基地址指到别处（如一个已关闭的本地端口，模拟
 /// 「后端未启动/被关闭」时的连接被拒）。不落盘、不写端口文件；调用方
@@ -524,6 +525,44 @@ class PythonService {
     ).whenComplete(() => _starting = false);
   }
 
+  // ── 训练器独立窗口（第二实例）的"只连接"模式 ───────────────────────
+  // 主实例独占后端生命周期（拉起/关闭/旧版握手重启/失联复活）；训练窗口
+  // 只跟随端口文件连接既有后端，绝不 spawn/kill——两个实例都跑完整
+  // start() 会互相把对方拉起的后端当"旧版"掐掉。
+  static bool attachedMode = false;
+
+  /// 连接既有后端（跟随 service_port.txt 轮询健康检查，直到超时）。
+  /// 供训练器独立窗口使用；成功返回 true。
+  static Future<bool> attach(
+    String pythonServiceDir, {
+    Duration timeout = const Duration(seconds: 120),
+    void Function(String line)? onProgress,
+  }) async {
+    attachedMode = true;
+    _logServiceDir = pythonServiceDir;
+    final deadline = DateTime.now().add(timeout);
+    while (true) {
+      final port = _readPortFromFile(pythonServiceDir);
+      if (port != null) {
+        _base = 'http://127.0.0.1:$port';
+        final health = await _readHealth();
+        final build = health?['build']?.toString();
+        if (health != null && build == _expectedBackendBuild) {
+          _addLog('app', '训练器窗口已连接后端（端口 $port）。');
+          return true;
+        }
+        onProgress?.call(build == null
+            ? '端口 $port 上后端未就绪（正在启动/模型加载中），继续等待…'
+            : '后端版本不匹配（build=$build，期望 $_expectedBackendBuild），'
+                '主窗口会自动重启后端，继续等待…');
+      } else {
+        onProgress?.call('还没有识别服务（请打开主应用，后端由它启动）…');
+      }
+      if (DateTime.now().isAfter(deadline)) return false;
+      await Future<void>.delayed(const Duration(seconds: 1));
+    }
+  }
+
   static Future<void> _startBackend(
     String pythonServiceDir,
     String startupLabel,
@@ -886,6 +925,9 @@ class PythonService {
 
   /// 停止后端并等待直接进程及其监听端口释放。
   static Future<bool> stopAndWait() async {
+    // 训练器独立窗口只连接不持有后端：没有它可停的进程，关窗不动主实例
+    // 拉起的后端（训练也不被打断）。
+    if (attachedMode) return true;
     _addLog('app', '正在停止 Python 后端。');
     _stopServiceLogFollower();
     final process = _process;
@@ -930,6 +972,8 @@ class PythonService {
     final dir = _logServiceDir;
     // 测试环境（debugSetServiceBase 指向死端口、从未 start()）不拉进程。
     if (dir == null) return;
+    // 训练器独立窗口不复活后端：后端归主实例管（失联时主实例或用户处理）。
+    if (attachedMode) return;
     if (_starting || _reviveTask != null) return;
     final last = _lastReviveAt;
     if (last != null && DateTime.now().difference(last) < _reviveCooldown) {
@@ -950,11 +994,17 @@ class PythonService {
   }
 
   /// 失联时给用户的中文指引（按自动重启所处阶段选词）。
-  static String _backendDownMessage() => _reviveTask != null
-      ? '后端服务不可达（后端进程已退出，例如控制台窗口被关闭或系统重启过）。'
-            '正在自动重启后端（约需半分钟），完成后请重试本操作'
-      : '后端服务不可达，且自动重启未成功或仍在冷却（详见后台日志）。'
-            '请检查后端控制台窗口，或重启应用';
+  static String _backendDownMessage() {
+    if (attachedMode) {
+      return '识别服务不可达：后端由主应用管理（主窗口关闭/退出会停止后端）。'
+          '请重新打开主应用，本窗口会自动连上';
+    }
+    return _reviveTask != null
+        ? '后端服务不可达（后端进程已退出，例如控制台窗口被关闭或系统重启过）。'
+              '正在自动重启后端（约需半分钟），完成后请重试本操作'
+        : '后端服务不可达，且自动重启未成功或仍在冷却（详见后台日志）。'
+              '请检查后端控制台窗口，或重启应用';
+  }
 
   /// 测试注入的 HTTP 客户端（null = 真实网络）。widget 测试的 FakeAsync
   /// 区里真实 socket 永不完成（测试框架还会把 HttpClient 全局拦截成
@@ -1736,15 +1786,28 @@ class PythonService {
   /// 整页直读（/read_page_text）：引擎自己分行读字（PaddleOCR det+rec
   /// 全管线 / Kraken blla 分行 + rpred），返回按阅读序拼接的整页文本
   /// ——不走主区/段落/单行/单字标注管线，供「文本」视图快速通读与
-  /// AI 校对。返回 {text, lines, engine, ocr, elapsed_s}。
+  /// AI 校对。返回 {text, lines, engine, ocr, elapsed_s, excluded_lines,
+  /// excluded_regions}。
+  ///
+  /// [excludeHeaderFooter]：「排除页眉页脚」开关（书级设置），开 = 后端
+  /// 把落在排除类版面区（页眉/页脚/页码/插图/表格/卦图）内的行整行剔除
+  /// 后再拼整页文本；[gateRegions] 是随开关带入的人工已确认版面区
+  /// （/segment 的 gate_regions 同款输入，非空时后端优先用它、不跑
+  /// region_det 预检）。[progressToken]：进度登记 token（每次识别随机
+  /// 生成），传入后可凭它轮询 [readPageProgress] 展示"已用时 + 阶段"；
+  /// 缺省 null = 后端不登记（历史行为）。
   static Future<Map<String, dynamic>> readPageText({
     required String imagePath,
     required ProjectSettings settings,
+    bool excludeHeaderFooter = false,
+    List<Map<String, dynamic>>? gateRegions,
+    String? progressToken,
   }) async {
     _addLog(
       'http',
       'POST /read_page_text image_path=$imagePath '
-          'orientation=${settings.orientation} engine=${settings.engine}',
+          'orientation=${settings.orientation} engine=${settings.engine}'
+          '${excludeHeaderFooter ? ' exclude_header_footer=true' : ''}',
     );
     final r =
         await _post(
@@ -1766,6 +1829,17 @@ class PythonService {
             if (settings.engine == 'paddle' &&
                 settings.paddleModel.startsWith('PaddleOCR-VL'))
               'vl_predict': settings.vlPredict,
+            // 排除页眉页脚（文本视图开关）：开才带字段，缺省关 = 历史
+            // 行为（整页全读）。VL 模型的辅助内容忽略（vlParse*）独立
+            // 生效，两套开关互不影响。
+            if (excludeHeaderFooter) 'exclude_header_footer': true,
+            if (excludeHeaderFooter &&
+                gateRegions != null &&
+                gateRegions.isNotEmpty)
+              'gate_regions': gateRegions,
+            // 进度登记 token：每次识别随机生成，识别中凭它轮询
+            // /read_page_progress（见 readPageProgress）；缺省不登记。
+            if (progressToken != null) 'progress_token': progressToken,
           }),
         ).timeout(
           // VL 0.9B 首次推理含权重编译、且常与 kraken 池共享显存（被挤时
@@ -1814,6 +1888,30 @@ class PythonService {
           'in ${data['elapsed_s']}s',
     );
     return data;
+  }
+
+  /// 整页直读进度查询（GET /read_page_progress，识别中每秒轮询）：
+  /// 返回 {active, stage, detail, engine, elapsed_s}——detail 是面向
+  /// 用户的中文阶段说明（准备引擎/读字/拼接），客户端原样展示。轮询
+  /// 失败（后端旧版/瞬时网络抖动）返回 null，调用方降级为只显示本地
+  /// 秒表，不打断识别。
+  static Future<Map<String, dynamic>?> readPageProgress(String token) async {
+    try {
+      final r = await http
+          .get(
+            Uri.parse(
+              '$_base/read_page_progress?token='
+              '${Uri.encodeComponent(token)}',
+            ),
+          )
+          .timeout(const Duration(seconds: 3));
+      if (r.statusCode != 200) return null;
+      final decoded = jsonDecode(r.body);
+      if (decoded is! Map) return null;
+      return Map<String, dynamic>.from(decoded.cast<String, dynamic>());
+    } catch (_) {
+      return null;
+    }
   }
 
   /// 下载/校验 PaddleOCR 指定识别模型（/paddle/download，设置页逐档下载
@@ -2513,7 +2611,7 @@ class PythonService {
     _addLog(
       'http',
       'POST /recognize_table rect=($x,$y,$w,$h) '
-          'orientation=${settings.orientation}',
+          'orientation=${settings.orientation} engine=${settings.engine}',
     );
     final r =
         await _post(
@@ -2528,10 +2626,29 @@ class PythonService {
             'orientation': settings.orientation,
             'horizontal_dir': settings.horizontalDir,
             'vertical_dir': settings.verticalDir,
+            // 引擎随书设置：选了 PaddleOCR 的书，表格同样用 Paddle 读法
+            // （序列读语境增强 + 逐字读融合），不再固定 Kraken。
+            'engine': settings.engine,
+            if (settings.engine == 'paddle')
+              'paddle_model': settings.paddleModel,
+            // VL 书：解析配置与文本视图同源（共享同一个 VL 池，不会因
+            // 签名不同反复重建）；predict 参数沿用（Prompt 类型由后端
+            // spotting 强制覆盖）。
+            if (settings.engine == 'paddle' &&
+                settings.paddleModel.startsWith('PaddleOCR-VL')) ...{
+              'vl_config': settings.vlConfig,
+              'vl_predict': settings.vlPredict,
+            },
           }),
         ).timeout(
-          const Duration(minutes: 10),
-          onTimeout: () => throw TimeoutException('表格识别超时（10 分钟）'),
+          // VL 0.9B 首次推理含权重编译（与整页直读同口径放宽）。
+          Duration(minutes: _isVlModel(settings) ? 15 : 10),
+          onTimeout: () {
+            throw TimeoutException(
+              '表格识别超时——首次使用 VL 会先下载模型，显存紧张时首读'
+              '可达数分钟，请稍后重试',
+            );
+          },
         );
     if (r.statusCode == 422) {
       throw TableGridNotFoundException(_detailOf(r.body));
@@ -2981,6 +3098,165 @@ class PythonService {
       skipped: skipped,
       elapsedMs: elapsed,
       failedPages: failedPages,
+    );
+  }
+
+  /// 智能合并扫描：以一次手工合并的两框（[firstBox]/[secondBox]，合并
+  /// 前的原始矩形）为模板，在多页的同行相邻字框对中找同类墨迹（几何
+  /// 构型 + HOG 特征双门槛，后端 smart_merge.py）。已确认的框恒不参与；
+  /// 返回按 score 升序、同页互斥的匹配对。纯 CPU，不占识别门；大书由
+  /// 调用方分块调用（每块数十页），单块超时 5 分钟。
+  static Future<SmartMergeScanResult> smartMergeScan({
+    required String templateImagePath,
+    required Rect firstBox,
+    required Rect secondBox,
+    required String templateDir,
+    required List<SmartMergeScanPage> pages,
+    double threshold = 0.18,
+  }) async {
+    _addLog(
+      'http',
+      'POST /smart_merge_scan pages=${pages.length} dir=$templateDir '
+          'threshold=$threshold',
+    );
+    final r =
+        await _post(
+          Uri.parse('$_base/smart_merge_scan'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'template_image_path': templateImagePath,
+            'template_boxes': [
+              {
+                'x': firstBox.left.round(),
+                'y': firstBox.top.round(),
+                'w': firstBox.width.round(),
+                'h': firstBox.height.round(),
+              },
+              {
+                'x': secondBox.left.round(),
+                'y': secondBox.top.round(),
+                'w': secondBox.width.round(),
+                'h': secondBox.height.round(),
+              },
+            ],
+            'template_dir': templateDir,
+            'threshold': threshold,
+            'pages': [for (final p in pages) p.toMap()],
+          }),
+        ).timeout(
+          const Duration(minutes: 5),
+          onTimeout: () {
+            throw TimeoutException('智能合并扫描超时（页数过多时可稍后重试）');
+          },
+        );
+    if (r.statusCode != 200) {
+      _addLog(
+        'http',
+        'POST /smart_merge_scan failed status=${r.statusCode} '
+            'body=${r.body}',
+        isError: true,
+      );
+      throw Exception('smart_merge_scan failed: ${r.body}');
+    }
+    final data = jsonDecode(r.body) as Map<String, dynamic>;
+    final matches =
+        ((data['matches'] as List?) ?? const [])
+            .whereType<Map>()
+            .map(
+              (e) => SmartMergeScanMatch.fromMap(
+                Map<String, dynamic>.from(e),
+              ),
+            )
+            .toList();
+    final failedPageIds =
+        ((data['failed_pages'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => e['page_id']?.toString() ?? '')
+            .toList();
+    final elapsed = (data['elapsed_ms'] as num?)?.toDouble() ?? 0;
+    _addLog(
+      'http',
+      'POST /smart_merge_scan ok matches=${matches.length} '
+          'scanned=${data['scanned_pages']} failed=${failedPageIds.length} '
+          'elapsed=${elapsed.toStringAsFixed(0)}ms',
+    );
+    return SmartMergeScanResult(
+      matches: matches,
+      scannedPages: (data['scanned_pages'] as num?)?.toInt() ?? 0,
+      failedPageIds: failedPageIds,
+      elapsedMs: elapsed,
+    );
+  }
+
+  /// 智能分割扫描：以一次手工 Alt 拆分前的原框（[templateBox]）为模板，
+  /// 在多页字框中找同类墨迹的单框（HOG 含宽高比惩罚，后端
+  /// smart_merge.scan_smart_split）。已确认的框恒不参与；返回按 score
+  /// 升序的匹配。纯 CPU；大书由调用方分块调用，单块超时 5 分钟。
+  static Future<SmartSplitScanResult> smartSplitScan({
+    required String templateImagePath,
+    required Rect templateBox,
+    required List<SmartMergeScanPage> pages,
+    double threshold = 0.18,
+  }) async {
+    _addLog(
+      'http',
+      'POST /smart_split_scan pages=${pages.length} threshold=$threshold',
+    );
+    final r =
+        await _post(
+          Uri.parse('$_base/smart_split_scan'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'template_image_path': templateImagePath,
+            'template_box': {
+              'x': templateBox.left.round(),
+              'y': templateBox.top.round(),
+              'w': templateBox.width.round(),
+              'h': templateBox.height.round(),
+            },
+            'threshold': threshold,
+            'pages': [for (final p in pages) p.toMap()],
+          }),
+        ).timeout(
+          const Duration(minutes: 5),
+          onTimeout: () {
+            throw TimeoutException('智能分割扫描超时（页数过多时可稍后重试）');
+          },
+        );
+    if (r.statusCode != 200) {
+      _addLog(
+        'http',
+        'POST /smart_split_scan failed status=${r.statusCode} '
+            'body=${r.body}',
+        isError: true,
+      );
+      throw Exception('smart_split_scan failed: ${r.body}');
+    }
+    final data = jsonDecode(r.body) as Map<String, dynamic>;
+    final matches =
+        ((data['matches'] as List?) ?? const [])
+            .whereType<Map>()
+            .map(
+              (e) => SmartSplitScanMatch.fromMap(Map<String, dynamic>.from(e)),
+            )
+            .toList();
+    final failedPageIds =
+        ((data['failed_pages'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => e['page_id']?.toString() ?? '')
+            .toList();
+    final elapsed = (data['elapsed_ms'] as num?)?.toDouble() ?? 0;
+    _addLog(
+      'http',
+      'POST /smart_split_scan ok matches=${matches.length} '
+          'scanned=${data['scanned_pages']} failed=${failedPageIds.length} '
+          'elapsed=${elapsed.toStringAsFixed(0)}ms',
+    );
+    return SmartSplitScanResult(
+      matches: matches,
+      scannedPages: (data['scanned_pages'] as num?)?.toInt() ?? 0,
+      failedPageIds: failedPageIds,
+      elapsedMs: elapsed,
     );
   }
 
@@ -3882,6 +4158,36 @@ class PythonService {
     if (r.statusCode != 200) {
       throw Exception('train/stop failed: ${r.body}');
     }
+  }
+
+  /// 断点续训：从中断 run 的 last.pt 继续训练（总轮数/数据等沿用该次
+  /// 训练的原始设置，只有训练设备可指定）。
+  static Future<Map<String, dynamic>> resumeTraining({
+    required String layer,
+    required String runDir,
+    String device = 'auto',
+  }) async {
+    _addLog(
+      'http',
+      'POST /train/resume layer=$layer run_dir=$runDir device=$device',
+    );
+    final r = await _post(
+      Uri.parse('$_base/train/resume'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({
+        'layer': layer,
+        'run_dir': runDir,
+        'device': device,
+      }),
+    ).timeout(const Duration(seconds: 60));
+    if (r.statusCode != 200) {
+      final decoded = jsonDecode(r.body);
+      throw Exception(
+        (decoded is Map ? decoded['detail'] : null)?.toString() ??
+            'train/resume failed: ${r.body}',
+      );
+    }
+    return jsonDecode(r.body) as Map<String, dynamic>;
   }
 
   /// 训练曲线（/train/curve）：逐 epoch 指标/损失（results.csv）+ 已存

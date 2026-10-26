@@ -271,21 +271,42 @@ def read_page_text(
     orientation: str,
     horizontal_dir: str,
     vertical_dir: str = "ttb",
+    gate_regions: list[dict] | None = None,
+    progress_token: str | None = None,
 ) -> dict:
     """整页直读（kraken：blla 分行 + rpred 读字），不走标注切分管线。
 
-    worker 返回未排序行列表，阅读序由 page_text 按方向参数重排后拼接。"""
+    worker 返回未排序行列表，阅读序由 page_text 按方向参数重排后拼接。
+    gate_regions：排除类版面区（文本视图「排除页眉页脚」开关的输入，
+    由 /read_page_text 预先算好传入），拼接前整行剔除——行落在页眉/
+    页脚等区内的不再进直读文本；None/空 = 不过滤（历史行为）。
+    progress_token：进度登记（read_progress），准备引擎/读字/拼接各
+    阶段打点供客户端轮询；None = 不登记。"""
     from page_text import lines_to_page_text
 
+    def _stage(stage: str, detail: str) -> None:
+        from read_progress import set_stage
+
+        set_stage(progress_token, stage, detail)
+
+    _stage("preparing", "准备 Kraken 引擎池（daemon 冷启动加载模型，约 40s）")
     pool = _ensure_pool()
     # text_direction 同识别管线口径（竖排列旋转后进识别网络），blla 的
     # 行朝向判定与 rpred 的竖排处理都依赖它。
     direction = text_direction(orientation, horizontal_dir)
+    _stage("reading", "blla 分行 + 逐行读字中…")
     result = pool.request(
         "read_page",
         {"image_path": image_path, "text_direction": direction},
     )
     lines = result.get("lines", [])
+    excluded_lines = 0
+    if gate_regions:
+        _stage("gating", "按版面区剔除页眉页脚行…")
+        from seg_layout import filter_page_text_lines
+
+        lines, excluded_lines = filter_page_text_lines(lines, gate_regions)
+    _stage("assembling", "按阅读序拼接整页文本…")
     text, ordered = lines_to_page_text(
         lines, orientation, horizontal_dir, vertical_dir
     )
@@ -294,6 +315,7 @@ def read_page_text(
         "lines": ordered,
         "engine": "kraken",
         "ocr": "kraken+chat_rec",
+        "excluded_lines": excluded_lines,
     }
 
 

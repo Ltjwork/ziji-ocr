@@ -2,14 +2,15 @@ import 'dart:async';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:path/path.dart' as p;
 import 'pages/ai_box_test_page.dart';
 import 'pages/home_page.dart';
 import 'pages/setup_page.dart';
 import 'services/plugin_host/plugin_runtime.dart';
 import 'services/prefs_migration.dart';
 import 'services/python_service.dart';
+import 'services/service_dir.dart';
 import 'services/update_service.dart';
+import 'training_window_app.dart';
 import 'widgets/floating_monitor_window.dart';
 import 'widgets/startup_update_prompt.dart';
 
@@ -23,8 +24,19 @@ final String? _kAiBoxAutotestImage =
 final bool _kAiBoxAutotestPipeline =
     Platform.environment['OCR_AI_BOX_AUTOTEST_PIPELINE'] == '1';
 
-void main() async {
+void main(List<String> args) async {
   WidgetsFlutterBinding.ensureInitialized();
+  // 训练器独立窗口：同一 exe 的第二实例（主窗口「模型训练」页的独立
+  // 窗口按钮以 "training-window" 参数 + 环境变量启动，双保险）。只跑
+  // 训练相关界面：不启动更新检查/插件宿主/悬浮窗，后端走只连接模式
+  // （attach），生命周期仍归主实例——否则两个实例会互相掐对方的后端。
+  final trainingWindow = args.contains('training-window') ||
+      args.contains('--training-window') ||
+      Platform.environment['ZIJI_TRAINING_WINDOW'] == '1';
+  if (trainingWindow) {
+    runApp(const TrainingWindowApp());
+    return;
+  }
   // GitHub 更新检查不等待后端或首屏；用户可在「设置 → 关于 / 更新」查看结果。
   unawaited(UpdateService.instance.initializeAndCheck());
   // +103 更名（ProductName flutter_app → 字迹）把 SharedPreferences 的
@@ -80,46 +92,20 @@ class _AppState extends State<App> {
   }
 
   Future<void> _resolveServiceDir() async {
-    final candidates = _serviceDirCandidates();
-    for (final c in candidates) {
-      if (await File(p.join(c, 'main.py')).exists()) {
-        setState(() {
-          _serviceDir = p.canonicalize(c);
-          _resolving = false;
-        });
-        if (_kAiBoxAutotestImage != null) unawaited(_startService());
-        return;
-      }
+    final dir = await resolveServiceDir();
+    if (!mounted) return;
+    if (dir != null) {
+      setState(() {
+        _serviceDir = dir;
+        _resolving = false;
+      });
+      if (_kAiBoxAutotestImage != null) unawaited(_startService());
+      return;
     }
     setState(() {
       _error = 'python_service/main.py not found';
       _resolving = false;
     });
-  }
-
-  List<String> _serviceDirCandidates() {
-    final exeDir = File(Platform.resolvedExecutable).parent.path;
-    final roots = <String>{
-      Directory.current.path,
-      exeDir,
-      p.dirname(Platform.script.toFilePath(windows: Platform.isWindows)),
-    };
-
-    return roots
-        .expand(_ancestorDirectories)
-        .map((root) => p.join(root, 'python_service'))
-        .toSet()
-        .toList();
-  }
-
-  Iterable<String> _ancestorDirectories(String start) sync* {
-    var current = p.canonicalize(start);
-    while (true) {
-      yield current;
-      final parent = p.dirname(current);
-      if (parent == current) break;
-      current = parent;
-    }
   }
 
   Future<void> _startService() async {

@@ -80,9 +80,11 @@ LAYER_INFO = {
     # figure=插图区 / table=表格区（+83 表格识别）：暂无对应训练数据，
     # 旧模型不产出这两类；人工确认的框会进入 region_det 训练集，积累
     # 够了即可训出自动检测。
+    # hexagram=卦图区（易经卦图电子化插件）：用户在编辑器手画，插件按
+    # 划区识别（无整页自动检测）；确认框同样进入 region_det 训练集。
     "region_det": {"task": "detect",
                    "names": ["main_text", "header", "footer", "page_number",
-                             "margin_note", "figure", "table"],
+                             "margin_note", "figure", "table", "hexagram"],
                    "title": "版面区检测"},
     "char_cls": {"task": "classify", "names": [], "title": "单字候选分类"},
 }

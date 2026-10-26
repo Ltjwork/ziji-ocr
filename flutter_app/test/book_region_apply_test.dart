@@ -56,6 +56,37 @@ PageAnnotation _ann() => PageAnnotation(
 );
 
 void main() {
+  group('removeLinesInRect（表格区清场）', () {
+    test('删掉中心落在区内的行（含钉住行）、段引用与行号同步、区外不动', () {
+      final ann = _ann();
+      final removed = BookRegionApply.removeLinesInRect(
+        ann,
+        const Rect.fromLTWH(100, 100, 400, 800),
+      );
+      // 区内两条（普通 + manual 钉住）都清——表格区内容以表格标注为准。
+      expect(removed, 2);
+      expect(
+        ann.lines.map((l) => l.id).toList(),
+        ['l_out_normal', 'l_out_manual'],
+      );
+      // 段成员引用被同步清空（两条区内行都在 p_1 里）
+      expect(ann.paragraphs.single.lineIds, isEmpty);
+      // 行号重排
+      expect(ann.lines.first.lineNo, 0);
+      expect(ann.lines.last.lineNo, 1);
+    });
+
+    test('区内无行时是空操作', () {
+      final ann = _ann();
+      final removed = BookRegionApply.removeLinesInRect(
+        ann,
+        const Rect.fromLTWH(0, 0, 10, 10),
+      );
+      expect(removed, 0);
+      expect(ann.lines, hasLength(4));
+    });
+  });
+
   group('applyRegionOnly', () {
     test('替换主区几何并保留 id/uid/status/label，不动行/段/字', () {
       final ann = _ann();

@@ -220,21 +220,36 @@ class _KrakenTask:
         self.proc: subprocess.Popen | None = None
         self.result: dict[str, Any] = {}
 
-    def _progress(self) -> float:
-        """从 ketos 日志解析已完成的 epoch 数估算进度。"""
-        if self.status == "done":
-            return 1.0
+    def _epoch_done(self) -> int:
+        """从 ketos 日志解析已完成的最大 epoch 数。"""
         log_path = os.path.join(self.run_dir, "ketos_log.txt")
         if not os.path.exists(log_path):
-            return 0.0
+            return 0
         try:
             with open(log_path, encoding="utf-8", errors="replace") as f:
                 best = 0
                 for m in re.finditer(r"(?i)epoch\s+(\d+)", f.read()):
                     best = max(best, int(m.group(1)))
-            return min(1.0, best / max(1, self.epochs))
+            return best
         except Exception:
-            return 0.0
+            return 0
+
+    def _progress(self) -> float:
+        """从 ketos 日志解析已完成的 epoch 数估算进度。"""
+        if self.status == "done":
+            return 1.0
+        return min(1.0, self._epoch_done() / max(1, self.epochs))
+
+    def _eta_seconds(self) -> float | None:
+        """预计剩余秒数（按总耗时比例外推；ketos 日志只有轮界信息，
+        早期估算含装载开销、偏保守）。"""
+        if self.status not in ("starting", "training"):
+            return None
+        progress = self._progress()
+        if progress <= 0.005:
+            return None
+        elapsed = time.time() - self.started
+        return round(elapsed / progress * (1.0 - progress), 1)
 
     def to_dict(self) -> dict:
         return {
@@ -247,6 +262,8 @@ class _KrakenTask:
             "run_dir": self.run_dir,
             "status": self.status,
             "progress": round(self._progress(), 3),
+            "epoch": min(self._epoch_done(), self.epochs),
+            "eta_seconds": self._eta_seconds(),
             "generation": self.generation,
             "log_tail": self._log_tail(),
         }

@@ -122,18 +122,24 @@ class PluginPageContext {
     this.projectDir,
     this.projectName,
     this.pageIndex = 0,
+    this.pageId,
     this.entryId,
   });
 
   final String? projectDir;
   final String? projectName;
   final int pageIndex;
+
+  /// 打开入口所在页的真实页号（图片文件名 stem，pageIdAt(_pageIndex)）。
+  /// 插件直接用它读标注——删过页的书里页号与下标不一致。
+  final String? pageId;
   final String? entryId;
 
   Map<String, dynamic> toJson() => {
     if (projectDir != null) 'projectDir': projectDir,
     if (projectName != null) 'projectName': projectName,
     'pageIndex': pageIndex,
+    if (pageId != null) 'pageId': pageId,
     if (entryId != null) 'entryId': entryId,
   };
 }

@@ -2,6 +2,7 @@ import 'dart:ui';
 
 import '../models/models.dart';
 import 'python_service.dart';
+import 'reading_order.dart';
 
 /// 全书正文区批量应用（全书叠加页入口），也承载编辑器区域级联的
 /// 行合并规则——规则微妙（防"调好的框被级联重建洗掉"），只允许存在
@@ -292,6 +293,15 @@ class BookRegionApply {
       horizontalDir: settings.horizontalDir,
       verticalDir: settings.verticalDir,
     );
+    // 行列表按阅读序重排（手动段存在时段序优先）：与编辑器级联同口径，
+    // 保证行视图序号与序号校验一致（否则序号校验整页误报）。
+    ReadingOrderCalculator.sortLinesInPlace(
+      ann,
+      orientation: settings.orientation,
+      horizontalDir: settings.horizontalDir,
+      verticalDir: settings.verticalDir,
+    );
+    renumberLines(ann);
     ann.rebuildBlocks();
     return stats;
   }
@@ -389,6 +399,25 @@ class BookRegionApply {
       pinnedCount: pinnedLines.length,
       removedOutside: removedOutside,
     );
+  }
+
+  /// 表格区域清场：删除中心点落在 [rect] 内的全部行（含用户钉住行——
+  /// 表格区域的内容以 TableAnnotation 为准，通用行/字不再代表该区域，
+  /// 与后端区域门控"排除类区内不产出任何行/字"同一哲学，只是发生在
+  /// 标记/识别之后）。段落 lineIds 同步清理、行号重排；调用方负责
+  /// rebuildBlocks 与排序。返回删除的行数。
+  static int removeLinesInRect(PageAnnotation ann, Rect rect) {
+    final removedIds = ann.lines
+        .where((l) => centerInRect(l.x, l.y, l.w, l.h, rect))
+        .map((l) => l.id)
+        .toSet();
+    if (removedIds.isEmpty) return 0;
+    for (final paragraph in ann.paragraphs) {
+      paragraph.lineIds.removeWhere(removedIds.contains);
+    }
+    ann.lines.removeWhere((l) => removedIds.contains(l.id));
+    renumberLines(ann);
+    return removedIds.length;
   }
 
   static bool centerInRect(int x, int y, int w, int h, Rect outer) =>
